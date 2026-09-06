@@ -86,7 +86,7 @@ struct Pool {
     uint32_t structure_epoch;
     uint32_t used_bytes;       // sum of live block_size
     uint32_t free_bytes;
-    uint32_t fragment_bytes;   // sub-minimal gaps absorbed/slack
+    uint32_t fragment_bytes;   // unreachable slack (doc 8.2): neither used nor binned
     uint32_t live_objects;
     uint32_t objects_moved;    // last compaction statistics
     uint32_t bytes_moved;
@@ -129,8 +129,12 @@ FreeBlock* bins_find(TlsfBins& b, uint32_t need);
 inline uint8_t* seg_base(uint32_t first) {
     return g().zone + (uint64_t)first * g().segment_size;
 }
-inline uint32_t off_of(void* p) { return (uint32_t)((uint8_t*)p - g().zone); }
-inline FreeBlock* ptr_of(uint32_t off) { return (FreeBlock*)(g().zone + off); }
+inline uint32_t off_of(void const* p) {
+    return (uint32_t)((uint8_t const*)p - g().zone);
+}
+// All block starts are 8-byte aligned inside the zone; the reinterpret cast
+// below is the block-format boundary (cppcheck: dangerousTypeCast explained).
+inline FreeBlock* ptr_of(uint32_t off) { return reinterpret_cast<FreeBlock*>(g().zone + off); }
 
 } // namespace internal
 } // namespace pm

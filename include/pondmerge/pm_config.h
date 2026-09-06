@@ -43,6 +43,18 @@
 #define PM_DEBUG 1
 #endif
 
+// Compile-time configuration contract (task-book section 7).
+static_assert(PM_ALIGNMENT == 8, "v1 block format assumes 8-byte alignment");
+static_assert((PM_MIN_BLOCK & (PM_MIN_BLOCK - 1)) == 0 && PM_MIN_BLOCK >= 16,
+              "PM_MIN_BLOCK must be a power of two >= 16 (header + 2 links)");
+static_assert((PM_SL_COUNT & (PM_SL_COUNT - 1)) == 0 && PM_SL_COUNT >= 2 &&
+                  PM_SL_COUNT <= 32,
+              "PM_SL_COUNT must be a power of two in [2, 32]");
+static_assert(PM_MAX_OBJECTS < 0xFFFF,
+              "descriptor slot indices and NO_SLOT share a 16-bit space");
+static_assert(PM_MAX_POOLS >= 1 && PM_MAX_SEGMENTS >= 1, "degenerate limits");
+static_assert(PM_FL_MAX > 4, "no first-level range to search");
+
 #if PM_DEBUG
 #define PM_ASSERT(x) do { if (!(x)) pm_debug_abort(__FILE__, __LINE__); } while (0)
 #else

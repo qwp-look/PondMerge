@@ -6,6 +6,23 @@
 // caller-triggered operations.
 //
 // C++17 subset: no exceptions, no RTTI, no dynamic allocation.
+//
+// CONCURRENCY CONTRACT (task-book section 4): v1 is "single owner + quiescent
+// maintenance window".
+//   * Ordinary alloc/access/free run in ONE owner execution context (thread/
+//     task). PondMerge does not make them safe for concurrent callers.
+//   * borrow_begin/borrow_end and the pool state flips (pause/resume/compact
+//     entry) are internally synchronized, so pausing can never race a new
+//     borrow into existence.
+//   * Before compact/merge/split, the owner pauses the pool(s); all active
+//     borrows must have ended (borrow counters zero). DMA, ISRs and other
+//     threads holding raw pointers must be stopped and drained by the CALLER
+//     beforehand — PondMerge cannot discover external holders.
+//   * Constructors (pm_make) and destroy callbacks must not re-enter the
+//     allocator for the object being constructed/destroyed; re-entrancy for
+//     OTHER objects is allowed but ordering-sensitive.
+// What PondMerge guarantees and what the caller still owes are restated in
+// README.md.
 #pragma once
 
 #include "pm_config.h"
@@ -205,20 +222,36 @@ public:
 // ---------------------------------------------------------------------------
 // Logical pointer (doc section 5). local (pool_hint = owning pool) and cross
 // (pool_hint = CROSS_HINT) share the implementation but not the construction
-// path: only pm_as_cross() / pm_cross_ref() produce cross refs.
+// path: only pm_as_cross() / pm_cross_ref() produce cross refs, and a local
+// pointer can never be bootstrapped from a CROSS_HINT ref (the constructor
+// invalidates such refs; task-book 3.4).
+//
+// Performance model (task-book 5): there is NO address cache. Every
+// borrow/resolve performs the full validation (range, generation, state,
+// pool) plus exactly one descriptor read to fetch the current payload
+// address — a single indexed load, so caching would save nothing. The lazy
+// update of an object's address after compaction happens through the
+// descriptor on the next use, which is the "lazy re-resolution" the
+// architecture doc promises.
 // ---------------------------------------------------------------------------
 template <class T, bool Cross>
 class pm_ptr_impl {
     RawRef ref_{};
-    mutable T*     cached_address_ = nullptr;
-    mutable uint32_t cached_address_epoch_ = 0;
 
 public:
     pm_ptr_impl() = default;
-    explicit pm_ptr_impl(RawRef r) : ref_(r) {}
+    explicit pm_ptr_impl(RawRef r) : ref_(r) {
+        if constexpr (!Cross) {
+            // A local pointer must be bound to a concrete pool. A raw ref
+            // carrying CROSS_HINT cannot be trusted as a local binding
+            // (it would bypass the pool check at resolution time), so the
+            // constructed pointer is invalidated instead.
+            if (ref_.pool_hint == CROSS_HINT) ref_.generation = 0;
+        }
+    }
 
     bool valid() const { return ref_.generation != 0; }
-    RawRef raw() const { return ref_; }
+    RawRef raw() const { return ref_; }  // value copy; callers cannot mutate us
     PoolId pool_hint() const { return ref_.pool_hint; }
 
     // Safe path: validates, borrows, and reports errors.
@@ -226,7 +259,6 @@ public:
         void* addr = nullptr;
         Status st = borrow_begin(ref_, sizeof(T), alignof(T), addr);
         if (st != Status::Ok) return {st, pm_access<T>()};
-        cache_from(addr);
         return {Status::Ok, pm_access<T>(ref_, static_cast<T*>(addr))};
     }
 
@@ -235,7 +267,6 @@ public:
         void* addr = nullptr;
         Status st = resolve(ref_, sizeof(T), alignof(T), addr);
         if (st != Status::Ok) return {st, nullptr};
-        cache_from(addr);
         return {Status::Ok, static_cast<T*>(addr)};
     }
 
@@ -247,21 +278,15 @@ public:
         return pm_access_proxy<T>(std::move(r.value));
     }
 
-    // Typed view onto a sub-object at a byte offset (kept in the ref, so the
-    // bounds/alignment check happens at resolution time).
+    // Typed view onto a sub-object. The offset is ABSOLUTE from the object
+    // start (replace semantics, not cumulative): chaining at() calls keeps
+    // addressing relative to the root object (task-book 11). Bounds and
+    // alignment are re-checked at resolution time.
     template <class U>
     pm_ptr_impl<U, Cross> at(uint32_t byte_offset) const {
         RawRef r = ref_;
         r.offset = byte_offset;
         return pm_ptr_impl<U, Cross>(r);
-    }
-
-private:
-    void cache_from(void* addr) const {
-        // The epoch is read back through the descriptor on the next borrow;
-        // the cached pair is only used to skip the address re-read.
-        cached_address_ = static_cast<T*>(addr);
-        cached_address_epoch_ = 0;
     }
 };
 
@@ -284,12 +309,22 @@ pm_cross_ptr<T> pm_cross_ref(RawRef r) {
 }
 
 // ---------------------------------------------------------------------------
-// Relocatability trait: trivially copyable is necessary but NOT sufficient;
-// a type must also provably hold no Auto Zone raw addresses. Projects opt in
-// by specializing pm_is_relocatable (doc section 14).
+// Relocatability trait (task-book 3.5): OPT-IN ONLY.
+//
+// "Relocatable" is a PROJECT-defined contract: the object may be moved by a
+// plain byte-wise memmove and remains logically valid afterwards. It is NOT
+// implied by std::is_trivially_copyable — a trivially copyable struct can
+// still hold an Auto Zone raw address, a DMA/device register address, a
+// self-pointer, an external owner or a sync primitive, none of which survive
+// relocation. Types default to NOT relocatable; a project must explicitly
+// specialize pm_is_relocatable<T> as true after auditing T.
+//
+// Note: set_destroy_fn() only supplies destruction for pinned objects; it
+// never makes a type safe to relocate. Raw allocations with PM_MOVABLE
+// bypass this trait — callers of the low-level alloc() own that audit.
 // ---------------------------------------------------------------------------
 template <class T>
-struct pm_is_relocatable : std::is_trivially_copyable<T> {};
+struct pm_is_relocatable : std::false_type {};
 
 namespace detail {
 
@@ -325,7 +360,11 @@ Result<pm_local_ptr<T>> pm_make_pinned(PoolId pool, Args&&... args) {
     RawRef r{};
     Status st = alloc(pool, sizeof(T), alignof(T), flags, 0, r);
     if (st != Status::Ok) return {st, {}};
-    set_destroy_fn(r, &detail::destroy_thunk<T>);
+    st = set_destroy_fn(r, &detail::destroy_thunk<T>);
+    if (st != Status::Ok) {
+        free(r);
+        return {st, {}};
+    }
     T* p = nullptr;
     st = resolve(r, sizeof(T), alignof(T), reinterpret_cast<void*&>(p));
     if (st != Status::Ok) { free(r); return {st, {}}; }
@@ -333,10 +372,14 @@ Result<pm_local_ptr<T>> pm_make_pinned(PoolId pool, Args&&... args) {
     return {Status::Ok, pm_local_ptr<T>(r)};
 }
 
+// Destroys the referenced object. The pointer is cleared ONLY on success:
+// on Busy (active borrow), PoolChanged (a local pointer whose object moved
+// pools — the object still exists) or any other error the pointer is kept so
+// the caller can retry, rebind via pm_as_cross(), or report the error.
 template <class T, bool Cross>
 Status pm_destroy(pm_ptr_impl<T, Cross>& p) {
     Status st = free(p.raw());
-    p = pm_ptr_impl<T, Cross>();
+    if (st == Status::Ok) p = pm_ptr_impl<T, Cross>();
     return st;
 }
 

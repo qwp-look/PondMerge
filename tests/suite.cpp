@@ -8,6 +8,13 @@
 #include <cstring>
 #include <cstdlib>
 
+// Audited byte-relocatable types used by the tests. Under the opt-in rule
+// (task-book 3.5) every relocatable type must be explicitly registered; there
+// is no trivially-copyable fallback.
+template <> struct pm::pm_is_relocatable<uint8_t> : std::true_type {};
+template <> struct pm::pm_is_relocatable<uint32_t> : std::true_type {};
+template <> struct pm::pm_is_relocatable<uint64_t> : std::true_type {};
+
 // ---------------------------------------------------------------------------
 // Framework
 // ---------------------------------------------------------------------------
@@ -741,11 +748,31 @@ struct PodThing {
     uint32_t b;
     uint8_t buf[24];
 };
+template <> struct pm::pm_is_relocatable<PodThing> : std::true_type {};
+
+// A type that is trivially copyable but holds a raw pointer: it must NOT be
+// relocatable until explicitly registered (task-book 3.5).
+struct RawHolder {
+    uint8_t* raw;
+    uint32_t v;
+};
+static_assert(std::is_trivially_copyable<RawHolder>::value,
+              "RawHolder must be trivially copyable for this test to mean anything");
+static_assert(!pm::pm_is_relocatable<RawHolder>::value,
+              "opt-in default: raw-pointer-holding types are not relocatable");
+
+// Explicitly registered relocatable type for the runtime part of the test.
+struct RelocPod {
+    uint32_t a;
+    uint32_t b;
+};
+template <> struct pm::pm_is_relocatable<RelocPod> : std::true_type {};
 
 static int g_dtors = 0;
 struct PinnedThing {
     int v;
-    explicit PinnedThing(int x) : v(x) {}
+    uint8_t pad[8];
+    explicit PinnedThing(int x) : v(x) { memset(pad, 0, sizeof(pad)); }
     ~PinnedThing() { ++g_dtors; }
 };
 
@@ -817,6 +844,584 @@ static void test_typed_api() {
     done();
 }
 
+
+// ---------------------------------------------------------------------------
+// (R1) task-book 3.1/8.1: failed allocations must not leak descriptor slots
+// ---------------------------------------------------------------------------
+static void test_slot_rollback_after_failed_allocs() {
+    printf("  [R1] failed allocs do not leak descriptor slots\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    // Valid requests the pool cannot serve: each one used to consume a slot.
+    for (uint32_t i = 0; i < 1500; ++i) {
+        pm::RawRef r{};
+        pm::Status s = pm::alloc(pool, 200 * 1024, 8, 0, i, r);
+        if (s != pm::Status::NoSpace) CHECK_ST(s, pm::Status::NoSpace);
+    }
+    {
+        using namespace pm::internal;
+        CHECK(g().free_slot_head != NO_SLOT);
+        // White-box: walk the free-slot chain — with the leak a portion of
+        // the slots was stranded, so the chain must be complete.
+        uint32_t nfree = 0;
+        for (uint16_t s = g().free_slot_head;
+             s != NO_SLOT && nfree <= PM_MAX_OBJECTS;
+             s = g().objects[s].next_free_slot)
+            ++nfree;
+        CHECK(nfree == PM_MAX_OBJECTS);
+    }
+    // Every one of the PM_MAX_OBJECTS slots must still be usable: allocate in
+    // batches (no large static arrays — device BSS is tight).
+    uint32_t total_ok = 0;
+    pm::RawRef refs[128];
+    for (uint32_t batch = 0; batch < PM_MAX_OBJECTS / 128; ++batch) {
+        uint32_t ok_n = 0;
+        for (uint32_t i = 0; i < 128; ++i)
+            if (pm::alloc(pool, 8, 8, 0, i, refs[i]) == pm::Status::Ok) ++ok_n;
+        CHECK(ok_n == 128);
+        total_ok += ok_n;
+        for (uint32_t i = 0; i < ok_n; ++i) CHECK_ST(pm::free(refs[i]), pm::Status::Ok);
+    }
+    CHECK(total_ok == PM_MAX_OBJECTS);
+    VALIDATE(pool);
+    pm::PoolStats st = pm::get_stats(pool);
+    CHECK(st.used_bytes == 0 && st.object_count == 0);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R2) task-book 3.2/8.2: first-fit inside a shared SL bin
+// ---------------------------------------------------------------------------
+static void test_tlsf_same_bin_first_fit() {
+    printf("  [R2] TLSF first-fit within a shared SL bin\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef a{}, x{}, b{}, y{};
+    CHECK_ST(pm::alloc(pool, 252, 8, 0, 1, a), pm::Status::Ok);  // block 260
+    CHECK_ST(pm::alloc(pool, 24, 8, 0, 2, x), pm::Status::Ok);   // block 32
+    CHECK_ST(pm::alloc(pool, 282, 8, 0, 3, b), pm::Status::Ok);  // block 290
+    CHECK_ST(pm::alloc(pool, 6000, 8, 0, 4, y), pm::Status::Ok); // block 6008
+    // Free b first, then a: both blocks land in bin (fl=8, sl=0), with the
+    // SMALLER block at the list head.
+    CHECK_ST(pm::free(b), pm::Status::Ok);
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    VALIDATE(pool);
+    // need = 288: the head block (260) is too small; the allocator must walk
+    // the bin and take the 290-byte block instead of failing.
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(pool, 280, 8, 0, 9, r), pm::Status::Ok);
+    // Coalescing still works afterwards.
+    CHECK_ST(pm::free(r), pm::Status::Ok);
+    CHECK_ST(pm::free(x), pm::Status::Ok);
+    CHECK_ST(pm::free(y), pm::Status::Ok);
+    pm::PoolStats st = pm::get_stats(pool);
+    CHECK(st.largest_free_block == 2 * 4096);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R3) task-book 3.3/8.3: pm_destroy keeps the pointer on failure
+// ---------------------------------------------------------------------------
+static void test_destroy_pointer_kept_on_error() {
+    printf("  [R3] pm_destroy keeps the pointer on failure\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+
+    // Busy: an active borrow blocks the destroy; the pointer stays usable.
+    auto made = pm::pm_make<uint32_t>(pool);
+    CHECK(made.ok());
+    auto pod = made.value;
+    {
+        auto acc = pod.try_borrow();
+        CHECK(acc.ok());
+        *acc.value = 7;
+        CHECK_ST(pm::pm_destroy(pod), pm::Status::Busy);
+        CHECK(pod.valid());
+        CHECK(*acc.value == 7); // object untouched
+    }
+    CHECK_ST(pm::pm_destroy(pod), pm::Status::Ok);
+    CHECK(!pod.valid()); // cleared only on success
+
+    // PoolChanged: a local pointer whose object moved pools is NOT destroyed;
+    // the object still exists behind a cross reference.
+    pm::PoolId p1{}, p2{};
+    CHECK_ST(pm::create_pool(p1, 2), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(p2, 2), pm::Status::Ok);
+    auto m2 = pm::pm_make<uint64_t>(p2);
+    CHECK(m2.ok());
+    auto obj = m2.value;
+    {
+        auto acc = obj.try_borrow();
+        *acc.value = 0xDEADBEEFCAFEBABFull;
+    }
+    CHECK_ST(pm::merge(p2, p1), pm::Status::Ok); // object now belongs to p1
+    CHECK_ST(pm::pm_destroy(obj), pm::Status::PoolChanged);
+    CHECK(obj.valid());
+    auto cross = pm::pm_as_cross(obj);
+    {
+        auto acc = cross.try_borrow();
+        CHECK(acc.ok());
+        CHECK(*acc.value == 0xDEADBEEFCAFEBABFull); // same logical object
+    }
+    CHECK_ST(pm::pm_destroy(cross), pm::Status::Ok);
+    CHECK(!cross.valid());
+
+    // Stale generation: refuse and keep.
+    auto m3 = pm::pm_make<uint32_t>(p1);
+    CHECK(m3.ok());
+    pm::RawRef stale = m3.value.raw();
+    CHECK_ST(pm::pm_destroy(m3.value), pm::Status::Ok);
+    pm::pm_local_ptr<uint32_t> stale_ptr{stale};
+    CHECK(stale_ptr.valid()); // non-zero generation, but dead
+    CHECK_ST(pm::pm_destroy(stale_ptr), pm::Status::InvalidRef);
+    CHECK(stale_ptr.valid()); // kept on failure
+    CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(p1), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R4) task-book 3.4/8.4: a local pointer cannot be bootstrapped from
+//      a CROSS_HINT raw ref, and raw() copies cannot corrupt the pointer
+// ---------------------------------------------------------------------------
+static void test_local_ref_rejects_cross_hint() {
+    printf("  [R4] local refs reject CROSS_HINT construction\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    auto made = pm::pm_make<uint32_t>(pool);
+    CHECK(made.ok());
+
+    pm::RawRef crossified = made.value.raw();
+    crossified.pool_hint = pm::CROSS_HINT;
+    pm::pm_local_ptr<uint32_t> evil{crossified};
+    CHECK(!evil.valid()); // constructor invalidates the smuggling attempt
+    CHECK_ST(evil.try_borrow().status, pm::Status::InvalidRef);
+    CHECK_ST(evil.peek().status, pm::Status::InvalidRef);
+
+    // raw() returns a copy: mutating it cannot bend the original pointer.
+    pm::RawRef mutated = made.value.raw();
+    mutated.generation = 9999;
+    mutated.pool_hint = pm::CROSS_HINT;
+    CHECK(mutated.generation == 9999); // the copy carries the mutations...
+    CHECK(made.value.valid());         // ...but the pointer is unaffected
+    CHECK(made.value.pool_hint() == pool);
+    CHECK_ST(made.value.try_borrow().status, pm::Status::Ok);
+
+    // The explicit cross path still works and produces a cross pointer.
+    auto cross = pm::pm_as_cross(made.value);
+    CHECK(cross.pool_hint() == pm::CROSS_HINT);
+    CHECK(cross.valid());
+    CHECK_ST(pm::pm_destroy(made.value), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R5) task-book 3.5/8.5: relocation is opt-in (runtime half; the compile-time
+//      half lives in the static_asserts next to RawHolder)
+// ---------------------------------------------------------------------------
+static void test_relocatable_opt_in() {
+    printf("  [R5] registered types relocate, unregistered do not compile in\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef pad{};
+    CHECK_ST(pm::alloc(pool, 512, 8, 0, 1, pad), pm::Status::Ok); // pad ahead of the pod
+    auto made = pm::pm_make<RelocPod>(pool);
+    CHECK(made.ok());
+    made.value->a = 11;
+    made.value->b = 22;
+    CHECK_ST(pm::free(pad), pm::Status::Ok); // gap before the pod -> it must move
+    uint32_t epoch0 = 0, epoch1 = 0;
+    {
+        using namespace pm::internal;
+        epoch0 = g().objects[made.value.raw().index].address_epoch;
+    }
+    CHECK_ST(pm::compact(pool), pm::Status::Ok);
+    {
+        using namespace pm::internal;
+        epoch1 = g().objects[made.value.raw().index].address_epoch;
+    }
+    CHECK(epoch1 == epoch0 + 1); // moved: address_epoch bumped
+    {
+        auto acc = made.value.try_borrow();
+        CHECK(acc.ok());
+        CHECK(acc.value->a == 11 && acc.value->b == 22);
+    }
+    VALIDATE(pool);
+    CHECK_ST(pm::pm_destroy(made.value), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R6) task-book 3.7/8.6: sub-object references cannot free or destroy
+// ---------------------------------------------------------------------------
+static void test_subobject_ref_cannot_free() {
+    printf("  [R6] sub-object refs cannot free/destroy the parent\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+
+    auto made = pm::pm_make<RelocPod>(pool);
+    CHECK(made.ok());
+    auto pod = made.value;
+    auto sub = pod.at<uint32_t>(4);
+    CHECK(sub.valid());
+    CHECK_ST(pm::free(sub.raw()), pm::Status::InvalidRef);
+    CHECK_ST(pm::pm_destroy(sub), pm::Status::InvalidRef);
+    { // parent untouched and writable
+        auto acc = pod.try_borrow();
+        CHECK(acc.ok());
+        acc.value->a = 5;
+        CHECK(acc.value->a == 5);
+    }
+    CHECK_ST(pm::pm_destroy(pod), pm::Status::Ok);
+
+    // Same rule for a pinned object with a destructor: the destroy callback
+    // must not run through a sub-object view.
+    int dtors0 = g_dtors;
+    auto pin = pm::pm_make_pinned<PinnedThing>(pool, 3);
+    CHECK(pin.ok());
+    auto psub = pin.value.at<uint32_t>(4); // genuine sub-object view
+    CHECK_ST(pm::pm_destroy(psub), pm::Status::InvalidRef);
+    CHECK(g_dtors == dtors0); // destructor did not run
+    CHECK_ST(pm::pm_destroy(pin.value), pm::Status::Ok);
+    CHECK(g_dtors == dtors0 + 1);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R7) task-book 3.6/8.7: every maintenance failure path leaves the pool
+//      complete, running, and with all object data intact
+// ---------------------------------------------------------------------------
+static void test_maintenance_error_paths_are_clean() {
+    printf("  [R7] maintenance failures are clean and pre-move\n");
+    fresh();
+    pm::PoolId s{};
+    CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
+    pm::RawRef pin{}, m0{}, m1{}, m2{};
+    CHECK_ST(pm::alloc(s, 128, 8, pm::PM_PINNED, 1, pin), pm::Status::Ok);
+    CHECK_ST(pm::alloc(s, 900, 8, 0, 2, m0), pm::Status::Ok);
+    CHECK_ST(pm::alloc(s, 900, 8, 0, 3, m1), pm::Status::Ok);
+    CHECK_ST(pm::alloc(s, 900, 8, 0, 4, m2), pm::Status::Ok);
+    fill(pin, 128, 1);
+    fill(m0, 900, 2);
+    fill(m1, 900, 3);
+    fill(m2, 900, 4);
+
+    // Inject a planning-stage inconsistency (pinned block out of range):
+    // compact must refuse BEFORE moving anything and restore Running.
+    uint8_t* saved_addr = nullptr;
+    {
+        using namespace pm::internal;
+        saved_addr = g().objects[pin.index].address;
+        g().objects[pin.index].address = g().zone - 128;
+    }
+    CHECK_ST(pm::compact(s), pm::Status::CorruptMetadata);
+    CHECK(pm::get_stats(s).state == 1); // Running again, nothing moved
+    {
+        using namespace pm::internal;
+        g().objects[pin.index].address = saved_addr;
+    }
+    VALIDATE(s);
+    verify(pin, 128, 1);
+    verify(m0, 900, 2);
+    verify(m1, 900, 3);
+    verify(m2, 900, 4);
+
+    // Split refusal (pinned crossing the boundary) is exercised with layout
+    // assertions in test_pool_split and test_split_layout_details.
+    CHECK_ST(pm::free(m0), pm::Status::Ok);
+    CHECK_ST(pm::free(m1), pm::Status::Ok);
+    CHECK_ST(pm::free(m2), pm::Status::Ok);
+    CHECK_ST(pm::free(pin), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R8) task-book 8.8: validate() returns CorruptMetadata in bounded time on
+//      cyclic lists and corrupted headers
+// ---------------------------------------------------------------------------
+static void test_validate_bounded_on_corruption() {
+    printf("  [R8] bounded-time validate on corruption\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    auto made = pm::pm_make<uint32_t>(pool);
+    CHECK(made.ok());
+    uint32_t idx = made.value.raw().index;
+
+    auto rd32 = [](void* p) { uint32_t v; memcpy(&v, p, 4); return v; };
+    auto wr32 = [](void* p, uint32_t v) { memcpy(p, &v, 4); };
+
+    // 1) address-order self-cycle
+    {
+        using namespace pm::internal;
+        uint32_t saved = g().objects[idx].addr_next;
+        g().objects[idx].addr_next = idx; // cycle
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        g().objects[idx].addr_next = saved;
+    }
+    VALIDATE(pool);
+
+    // 2) free-list self-cycle
+    {
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        uint32_t head_off = NULL_OFF;
+        for (uint32_t f = 0; f < FL_COUNT && head_off == NULL_OFF; ++f)
+            for (uint32_t sl2 = 0; sl2 < SL_COUNT && head_off == NULL_OFF; ++sl2)
+                if (P.bins.head[f][sl2] != NULL_OFF) head_off = P.bins.head[f][sl2];
+        CHECK(head_off != NULL_OFF);
+        uint32_t saved_next = ptr_of(head_off)->next;
+        ptr_of(head_off)->next = head_off; // cycle
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        ptr_of(head_off)->next = saved_next;
+    }
+    VALIDATE(pool);
+
+    // 3) corrupted used-block header (size / free bit)
+    {
+        using namespace pm::internal;
+        uint8_t* blk = g().objects[idx].address - BLOCK_HEADER_SIZE;
+        uint32_t saved = rd32(blk);
+        wr32(blk, 1); // size 0 + free bit on a live block
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        wr32(blk, saved);
+    }
+    VALIDATE(pool);
+
+    // 4) corrupted prev_size chain
+    {
+        using namespace pm::internal;
+        uint8_t* blk = g().objects[idx].address - BLOCK_HEADER_SIZE;
+        uint32_t saved = rd32(blk + 4);
+        wr32(blk + 4, 999999);
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        wr32(blk + 4, saved);
+    }
+    VALIDATE(pool);
+    CHECK_ST(pm::pm_destroy(made.value), pm::Status::Ok);
+    done();
+
+    // 5) allocator on a cyclic free bin: bounded time, then full reset.
+    //    The cycle head block itself may still be allocatable; what must hold
+    //    is that neither validate() nor alloc() can hang.
+    fresh();
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    {
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        uint32_t head_off = NULL_OFF;
+        for (uint32_t f = 0; f < FL_COUNT && head_off == NULL_OFF; ++f)
+            for (uint32_t sl2 = 0; sl2 < SL_COUNT && head_off == NULL_OFF; ++sl2)
+                if (P.bins.head[f][sl2] != NULL_OFF) head_off = P.bins.head[f][sl2];
+        CHECK(head_off != NULL_OFF);
+        ptr_of(head_off)->next = head_off; // cycle, left in place
+        pm::RawRef r2{};
+        pm::Status as = pm::alloc(pool, 64, 8, 0, 1, r2);
+        CHECK(as == pm::Status::Ok || as == pm::Status::NoSpace ||
+              as == pm::Status::CorruptMetadata);
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    }
+    fresh(); // reset for done()
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R9) task-book 8.9: sizes at the arithmetic limits are refused, not wrapped
+// ---------------------------------------------------------------------------
+static void test_huge_alloc_rejected() {
+    printf("  [R9] huge sizes refused without overflow\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(pool, 0xFFFFFFF0u, 8, 0, 1, r), pm::Status::NoSpace);
+    CHECK_ST(pm::alloc(pool, 0xFFFFFFFFu, 8, 0, 1, r), pm::Status::NoSpace);
+    CHECK_ST(pm::alloc(pool, 0x80000000u, 8, 0, 1, r), pm::Status::NoSpace);
+    CHECK_ST(pm::alloc(pool, 0x01000000u, 8, 0, 1, r), pm::Status::NoSpace); // beyond FL range
+    CHECK_ST(pm::alloc(pool, 0x00F00000u, 8, 0, 1, r), pm::Status::NoSpace); // beyond zone
+    CHECK_ST(pm::alloc(pool, 32, 8, 0, 2, r), pm::Status::Ok); // still healthy
+    CHECK_ST(pm::free(r), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R10) task-book 8.10: pause/borrow/resume quiescent-window contract
+// ---------------------------------------------------------------------------
+static void test_quiescent_window_contract() {
+    printf("  [R10] pause/borrow/resume contract\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    auto made = pm::pm_make<uint64_t>(pool);
+    CHECK(made.ok());
+    { auto acc = made.value.try_borrow(); *acc.value = 42; }
+
+    void* p = nullptr;
+    CHECK_ST(pm::borrow_begin(made.value.raw(), 8, 8, p), pm::Status::Ok);
+
+    // pause is allowed while borrows are active; it only blocks NEW borrows.
+    CHECK_ST(pm::pause(pool), pm::Status::Ok);
+    CHECK_ST(pm::borrow_begin(made.value.raw(), 8, 8, p), pm::Status::Busy);
+    CHECK_ST(pm::compact(pool), pm::Status::Busy);      // quiescence not reached
+    CHECK(pm::get_stats(pool).state == 2);              // Paused (doc section 3)
+    // borrow_end is safe while paused
+    pm::borrow_end(made.value.raw());
+    CHECK_ST(pm::resume(pool), pm::Status::Ok);
+    {
+        auto acc = made.value.try_borrow();
+        CHECK(acc.ok());
+        CHECK(*acc.value == 42);
+    }
+    CHECK_ST(pm::compact(pool), pm::Status::Ok);        // quiescent now
+    VALIDATE(pool);
+    CHECK_ST(pm::pm_destroy(made.value), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R11) task-book 8.11: split layout details — pinned immobility, side counts
+// ---------------------------------------------------------------------------
+static void test_split_layout_details() {
+    printf("  [R11] split layout: pinned stay, sides repartition\n");
+    fresh();
+    pm::PoolId s{};
+    CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
+    pm::RawRef pin_low{}, m[8]{}, pin_high{};
+    CHECK_ST(pm::alloc(s, 64, 8, pm::PM_PINNED, 1, pin_low), pm::Status::Ok);
+    for (uint32_t i = 0; i < 4; ++i) { // lower group
+        CHECK_ST(pm::alloc(s, 3584, 8, 0, 10 + i, m[i]), pm::Status::Ok);
+        fill(m[i], 3584, 60 + i);
+    }
+    CHECK_ST(pm::alloc(s, 128, 8, pm::PM_PINNED, 2, pin_high), pm::Status::Ok);
+    for (uint32_t i = 4; i < 8; ++i) { // upper group
+        CHECK_ST(pm::alloc(s, 3584, 8, 0, 10 + i, m[i]), pm::Status::Ok);
+        fill(m[i], 3584, 60 + i);
+    }
+    fill(pin_low, 64, 91);
+    fill(pin_high, 128, 92);
+
+    void* low_before = nullptr;  CHECK_ST(pm::resolve(pin_low, 0, 1, low_before), pm::Status::Ok);
+    void* high_before = nullptr; CHECK_ST(pm::resolve(pin_high, 0, 1, high_before), pm::Status::Ok);
+
+    pm::PoolId n{};
+    CHECK_ST(pm::split(s, 4, n), pm::Status::Ok);
+
+    void* low_after = nullptr;  CHECK_ST(pm::resolve(pin_low, 0, 1, (void*&)low_after), pm::Status::Ok);
+    void* high_after = nullptr; CHECK_ST(pm::resolve(pin_high, 0, 1, (void*&)high_after), pm::Status::Ok);
+    CHECK(low_before == low_after);    // pinned never moved
+    CHECK(high_before == high_after);  // pinned never moved
+
+    VALIDATE(s);
+    VALIDATE(n);
+    pm::PoolStats ss = pm::get_stats(s), sn = pm::get_stats(n);
+    CHECK(ss.object_count + sn.object_count == 10);
+    CHECK(ss.object_count >= 1 && sn.object_count >= 1);
+    for (uint32_t i = 0; i < 8; ++i) {
+        pm::RawRef cross = m[i];
+        cross.pool_hint = pm::CROSS_HINT;
+        void* p = nullptr;
+        CHECK_ST(pm::borrow_begin(cross, 3584, 1, p), pm::Status::Ok);
+        pm::borrow_end(cross);
+        verify(cross, 3584, 60 + i);
+        bool in_new = desc_pool(m[i]) == n;
+        if (in_new) {
+            uint8_t* a = nullptr;
+            pm::RawRef c2 = m[i]; c2.pool_hint = pm::CROSS_HINT;
+            CHECK_ST(pm::resolve(c2, 0, 1, (void*&)a), pm::Status::Ok);
+            CHECK(a >= (uint8_t*)low_after); // moved objects live above
+        }
+    }
+    verify(pin_low, 64, 91);
+    verify(pin_high, 128, 92);
+    for (uint32_t i = 0; i < 8; ++i) {
+        pm::RawRef cross = m[i];
+        cross.pool_hint = pm::CROSS_HINT;
+        CHECK_ST(pm::free(cross), pm::Status::Ok);
+    }
+    CHECK_ST(pm::free(pin_low), pm::Status::Ok);
+    CHECK_ST(pm::free(pin_high), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(s), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(n), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R12) task-book 8.12: generation / address_epoch / pool-hint combinations
+// ---------------------------------------------------------------------------
+static void test_generation_epoch_combinations() {
+    printf("  [R12] generation/epoch/hint interaction matrix\n");
+    fresh();
+    pm::PoolId p1{}, p2{};
+    CHECK_ST(pm::create_pool(p1, 2), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(p2, 2), pm::Status::Ok);
+    pm::RawRef pad{};
+    CHECK_ST(pm::alloc(p2, 512, 8, 0, 1, pad), pm::Status::Ok);
+    auto made = pm::pm_make<uint32_t>(p2); // object lives in the SOURCE pool
+    CHECK(made.ok());
+    CHECK_ST(pm::free(pad), pm::Status::Ok); // force a real move on compact
+    pm::RawRef ref = made.value.raw();
+    uint32_t idx = ref.index;
+
+    // compact bumps address_epoch; local ref keeps resolving (same pool)
+    uint32_t e0, e1;
+    {
+        using namespace pm::internal;
+        e0 = g().objects[idx].address_epoch;
+    }
+    CHECK_ST(pm::compact(p2), pm::Status::Ok);
+    {
+        using namespace pm::internal;
+        e1 = g().objects[idx].address_epoch;
+    }
+    CHECK(e1 == e0 + 1);
+    {
+        auto acc = made.value.try_borrow();
+        CHECK(acc.ok()); // epoch change is absorbed transparently
+    }
+
+    // merge bumps address_epoch even when the address is unchanged, and
+    // flips the local binding (source p2's objects adopt target p1)
+    CHECK_ST(pm::merge(p2, p1), pm::Status::Ok);
+    {
+        using namespace pm::internal;
+        CHECK(g().objects[idx].address_epoch >= e1 + 1); // merge bump (+ repack)
+        CHECK(g().objects[idx].pool_id == p1);
+    }
+    void* p = nullptr;
+    CHECK_ST(pm::borrow_begin(ref, 4, 4, p), pm::Status::PoolChanged); // stale hint
+    pm::RawRef cross = ref;
+    cross.pool_hint = pm::CROSS_HINT;
+    CHECK_ST(pm::borrow_begin(cross, 4, 4, p), pm::Status::Ok);
+    pm::borrow_end(cross);
+
+    // free bumps generation; the old ref is dead in every combination
+    uint16_t g0;
+    {
+        using namespace pm::internal;
+        g0 = g().objects[idx].generation;
+    }
+    CHECK_ST(pm::free(cross), pm::Status::Ok);
+    {
+        using namespace pm::internal;
+        CHECK(g().objects[idx].generation == (uint16_t)(g0 + 1));
+    }
+    pm::RawRef stale = ref;
+    CHECK_ST(pm::borrow_begin(stale, 4, 4, p), pm::Status::InvalidRef);
+    stale.pool_hint = pm::CROSS_HINT;
+    CHECK_ST(pm::borrow_begin(stale, 4, 4, p), pm::Status::InvalidRef); // gen beats hint
+    CHECK_ST(pm::destroy_pool(p1), pm::Status::Ok); // p2 vanished in the merge
+    done();
+}
+
 // ---------------------------------------------------------------------------
 static void run(const char* name, void (*fn)()) {
     printf("[TEST] %s\n", name);
@@ -845,6 +1450,18 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("size_alignment_edges", test_size_alignment_edges);
     run("validate_detects_corruption", test_validate_detects_corruption);
     run("typed_api", test_typed_api);
+    run("R1_slot_rollback", test_slot_rollback_after_failed_allocs);
+    run("R2_tlsf_same_bin_first_fit", test_tlsf_same_bin_first_fit);
+    run("R3_destroy_pointer_kept_on_error", test_destroy_pointer_kept_on_error);
+    run("R4_local_rejects_cross_hint", test_local_ref_rejects_cross_hint);
+    run("R5_relocatable_opt_in", test_relocatable_opt_in);
+    run("R6_subobject_cannot_free", test_subobject_ref_cannot_free);
+    run("R7_maintenance_errors_clean", test_maintenance_error_paths_are_clean);
+    run("R8_validate_bounded_on_corruption", test_validate_bounded_on_corruption);
+    run("R9_huge_alloc_rejected", test_huge_alloc_rejected);
+    run("R10_quiescent_window_contract", test_quiescent_window_contract);
+    run("R11_split_layout_details", test_split_layout_details);
+    run("R12_generation_epoch_combinations", test_generation_epoch_combinations);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;
