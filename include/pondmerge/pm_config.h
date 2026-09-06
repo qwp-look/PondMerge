@@ -43,15 +43,26 @@
 #define PM_DEBUG 1
 #endif
 
+// internal.h defines MIN_FL = 4; keep the FL contract checkable here without
+// pulling internal headers into a public file.
+#ifndef MIN_FL_HINT
+#define MIN_FL_HINT 4
+#endif
+
 // Compile-time configuration contract (task-book section 7).
 static_assert(PM_ALIGNMENT == 8, "v1 block format assumes 8-byte alignment");
 static_assert((PM_MIN_BLOCK & (PM_MIN_BLOCK - 1)) == 0 && PM_MIN_BLOCK >= 16,
               "PM_MIN_BLOCK must be a power of two >= 16 (header + 2 links)");
 static_assert((PM_SL_COUNT & (PM_SL_COUNT - 1)) == 0 && PM_SL_COUNT >= 2 &&
-                  PM_SL_COUNT <= 32,
-              "PM_SL_COUNT must be a power of two in [2, 32]");
+                  PM_SL_COUNT <= 16,
+              "PM_SL_COUNT must be a power of two in [2, 16]: the second-level "
+              "bitmap is uint16_t, so 32 would silently truncate (task-book v2 7.1)");
 static_assert(PM_MAX_OBJECTS < 0xFFFF,
               "descriptor slot indices and NO_SLOT share a 16-bit space");
+static_assert(PM_FL_MAX > MIN_FL_HINT && PM_FL_MAX <= 31,
+              "1u << PM_FL_MAX must stay representable and FL needs a range");
+static_assert(PM_MAX_SEGMENTS <= 0xFFFF,
+              "Pool segment fields are 16-bit (task-book v2 7.2)");
 static_assert(PM_MAX_POOLS >= 1 && PM_MAX_SEGMENTS >= 1, "degenerate limits");
 static_assert(PM_FL_MAX > 4, "no first-level range to search");
 

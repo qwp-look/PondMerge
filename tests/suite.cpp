@@ -1073,6 +1073,8 @@ static void test_subobject_ref_cannot_free() {
     CHECK(sub.valid());
     CHECK_ST(pm::free(sub.raw()), pm::Status::InvalidRef);
     CHECK_ST(pm::pm_destroy(sub), pm::Status::InvalidRef);
+    // Movable objects must refuse destroy callbacks entirely (task-book v2 10).
+    CHECK_ST(pm::set_destroy_fn(pod.raw(), nullptr), pm::Status::NotRelocatable);
     { // parent untouched and writable
         auto acc = pod.try_borrow();
         CHECK(acc.ok());
@@ -1229,8 +1231,15 @@ static void test_validate_bounded_on_corruption() {
               as == pm::Status::CorruptMetadata);
         CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
     }
-    fresh(); // reset for done()
-    done();
+    // The system is left with deliberately corrupted metadata; a real product
+    // would treat this as a fatal state. Simulate a power cycle (white-box)
+    // instead of asking init() to wipe live state — re-init over a live
+    // system must and does refuse with Busy (see R14).
+    {
+        using namespace pm::internal;
+        memset(&g(), 0, sizeof(g()));
+    }
+    // g() is zeroed (uninitialized); nothing to deinit — return directly.
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,6 +1431,134 @@ static void test_generation_epoch_combinations() {
     done();
 }
 
+
+// ---------------------------------------------------------------------------
+// (R13) task-book v2 4.4: split with a boundary-crossing movable, a hole in
+// the upper region and two upper movables. With the old descending execution
+// the second upper move overwrote the not-yet-moved source tail of the first
+// upper object (16 bytes of payload corruption); ascending execution must
+// keep every payload intact.
+// ---------------------------------------------------------------------------
+static void test_split_crossing_order() {
+    printf("  [R13] split crossing + upper holes: no source clobbering\n");
+    fresh();
+    pm::PoolId s{};
+    CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
+
+    // Layout (pool = 32 KiB, boundary = 16 KiB):
+    //   L [0,16376) fills the lower region
+    //   C [16376,16484) crosses the boundary (x=8 below, y=92 above)
+    //   h [16484,16508) small block, freed to make a 24B upper hole
+    //   u1 [16508,20092)  u2 [20092,23676)
+    pm::RawRef L{}, C{}, h{}, u1{}, u2{};
+    CHECK_ST(pm::alloc(s, 16368, 8, 0, 1, L), pm::Status::Ok);
+    fill(L, 16368, 1);
+    CHECK_ST(pm::alloc(s, 100, 8, 0, 2, C), pm::Status::Ok);
+    fill(C, 100, 2);
+    CHECK_ST(pm::alloc(s, 16, 8, 0, 3, h), pm::Status::Ok);
+    CHECK_ST(pm::alloc(s, 3584, 8, 0, 4, u1), pm::Status::Ok);
+    fill(u1, 3584, 4);
+    CHECK_ST(pm::alloc(s, 3584, 8, 0, 5, u2), pm::Status::Ok);
+    fill(u2, 3584, 5);
+    CHECK_ST(pm::free(h), pm::Status::Ok); // 24B hole between C and u1
+    VALIDATE(s);
+
+    pm::PoolId n{};
+    CHECK_ST(pm::split(s, 4, n), pm::Status::Ok);
+    VALIDATE(s);
+    VALIDATE(n);
+
+    // Every object keeps its payload, pool identity follows the side it
+    // landed on, and generation/epoch stay sane.
+    auto vfy = [&](pm::RawRef r, uint32_t sz, uint32_t seed) {
+        pm::RawRef cross = r;
+        cross.pool_hint = pm::CROSS_HINT;
+        verify(cross, sz, seed);
+    };
+    vfy(L, 16368, 1);
+    vfy(C, 100, 2);
+    vfy(u1, 3584, 4);
+    vfy(u2, 3584, 5);
+    CHECK(desc_pool(L) == s);
+    CHECK(desc_pool(C) == n); // crossing object adopted the new pool
+    CHECK(desc_pool(u1) == n);
+    CHECK(desc_pool(u2) == n);
+    {
+        using namespace pm::internal;
+        CHECK(g().objects[C.index].generation != 0);
+        CHECK(g().objects[C.index].address_epoch >= 2); // moved at least once
+    }
+    // Upper objects must now live at their packed addresses (>= boundary).
+    {
+        using namespace pm::internal;
+        uint8_t* boundary = seg_base(g().pools[n].segment_first);
+        CHECK(g().objects[u1.index].address - BLOCK_HEADER_SIZE >= boundary);
+        CHECK(g().objects[u2.index].address - BLOCK_HEADER_SIZE >= boundary);
+        CHECK(g().objects[C.index].address - BLOCK_HEADER_SIZE ==
+              (uint8_t*)boundary);
+    }
+    for (uint32_t i = 0; i < 8; ++i) { /* quiet */ (void)i; }
+    pm::RawRef cL = L; cL.pool_hint = pm::CROSS_HINT;
+    pm::RawRef cC = C; cC.pool_hint = pm::CROSS_HINT;
+    pm::RawRef cu1 = u1; cu1.pool_hint = pm::CROSS_HINT;
+    pm::RawRef cu2 = u2; cu2.pool_hint = pm::CROSS_HINT;
+    CHECK_ST(pm::free(cL), pm::Status::Ok);
+    CHECK_ST(pm::free(cC), pm::Status::Ok);
+    CHECK_ST(pm::free(cu1), pm::Status::Ok);
+    CHECK_ST(pm::free(cu2), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(s), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(n), pm::Status::Ok);
+    done();
+}
+
+
+// ---------------------------------------------------------------------------
+// (R14) task-book v2 6.2: init() validates before touching global state
+// ---------------------------------------------------------------------------
+static void test_init_lifecycle() {
+    printf("  [R14] init validates first, never wipes live state\n");
+
+    // Uninitialized: every invalid config must be refused and must leave no
+    // half-initialized state behind (the following valid init succeeds).
+    pm::Config bad1{g_zone, sizeof(g_zone), 1024}; // 256 segments > PM_MAX_SEGMENTS
+    CHECK_ST(pm::init(bad1), pm::Status::NoSpace);
+    CHECK_ST(pm::init(pm::Config{nullptr, 4096, 4096}), pm::Status::InvalidAlignment);
+    CHECK_ST(pm::init(pm::Config{g_zone, 512, 4096}), pm::Status::InvalidAlignment);
+    CHECK_ST(pm::init(pm::Config{g_zone, sizeof(g_zone), 6144}), pm::Status::InvalidAlignment); // not a power of two
+    CHECK_ST(pm::init(pm::Config{g_zone, 2048, 4096}), pm::Status::InvalidAlignment);
+    pm::Config cfg{g_zone, sizeof(g_zone), 4096};
+    CHECK_ST(pm::init(cfg), pm::Status::Ok); // state was never touched above
+
+    // Initialized with a live object: any re-init is refused, state intact.
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    auto made = pm::pm_make<uint32_t>(pool);
+    CHECK(made.ok());
+    { auto acc = made.value.try_borrow(); *acc.value = 0x1234; }
+    CHECK_ST(pm::init(cfg), pm::Status::Busy);
+    {
+        auto acc = made.value.try_borrow();
+        CHECK(acc.ok());
+        CHECK(*acc.value == 0x1234); // object untouched
+    }
+    VALIDATE(pool);
+    CHECK_ST(pm::init(pm::Config{g_zone, sizeof(g_zone), 1024}), pm::Status::Busy);
+
+    // Clean shutdown + fresh start: brand-new generations, zeroed stats.
+    CHECK_ST(pm::pm_destroy(made.value), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+    CHECK_ST(pm::deinit(), pm::Status::Ok);
+    CHECK_ST(pm::init(cfg), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    auto again = pm::pm_make<uint32_t>(pool);
+    CHECK(again.ok());
+    CHECK(again.value.raw().generation == 1); // lifecycle restarted
+    CHECK(pm::global_stats().max_live_objects == 0 + 1);
+    CHECK_ST(pm::pm_destroy(again.value), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+    done();
+}
+
 // ---------------------------------------------------------------------------
 static void run(const char* name, void (*fn)()) {
     printf("[TEST] %s\n", name);
@@ -1462,6 +1599,8 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R10_quiescent_window_contract", test_quiescent_window_contract);
     run("R11_split_layout_details", test_split_layout_details);
     run("R12_generation_epoch_combinations", test_generation_epoch_combinations);
+    run("R13_split_crossing_order", test_split_crossing_order);
+    run("R14_init_lifecycle", test_init_lifecycle);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

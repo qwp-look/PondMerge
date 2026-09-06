@@ -232,6 +232,59 @@ Status check_ref(RawRef const& ref, uint32_t access_size, uint32_t access_align,
     return Status::Ok;
 }
 
+// --- maintenance pre-check (task-book v2 section 8) --------------------------
+// Full descriptor audit before ANY maintenance planning. Plan A's "execution
+// cannot fail" rests on this function: order list, descriptor fields and
+// physical block relationships are all verified here, with bounded walks so
+// corrupted (cyclic) metadata is refused instead of hanging. Runs in Release
+// too -- its verdict gates every memmove. All range math uses zone offsets,
+// never raw pointer differences on possibly-corrupted values. The prev_size
+// chain is deliberately NOT checked: after a pool merge the physical
+// predecessor of a block may come from the other pool until the post-merge
+// compaction rewrites all headers (validate() enforces the chain on settled
+// layouts).
+Status precheck_pool(Pool const& P, PoolId pid, uint8_t const* start, uint8_t const* end) {
+    GlobalState const& G = g();
+    const uint64_t zone_base = (uint64_t)(uintptr_t)G.zone;
+    const uint64_t start_off = (uint64_t)(uintptr_t)start - zone_base;
+    const uint64_t end_off = (uint64_t)(uintptr_t)end - zone_base;
+    const uint32_t max_steps = PM_MAX_OBJECTS + 1;
+
+    uint32_t count = 0, used = 0;
+    uint32_t prev_idx = NO_ORDER;
+    uint64_t prev_end = start_off;
+
+    for (uint32_t idx = P.order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
+        if (++count > max_steps) return Status::CorruptMetadata; // cycle/overrun
+        if (idx >= PM_MAX_OBJECTS) return Status::CorruptMetadata;
+        ObjectDesc const& d = G.objects[idx];
+        if (d.state != ObjState::Live || d.pool_id != pid || d.generation == 0)
+            return Status::CorruptMetadata;
+        if (d.addr_prev != prev_idx) return Status::CorruptMetadata;
+        if (d.block_size < PM_MIN_BLOCK || (d.block_size & (PM_ALIGNMENT - 1)) != 0)
+            return Status::CorruptMetadata;
+        if (d.size > d.block_size - BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
+        uint64_t aabs = (uint64_t)(uintptr_t)d.address;
+        if (aabs < zone_base + BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
+        uint64_t aoff = aabs - zone_base;         // payload offset in zone
+        uint64_t boff = aoff - BLOCK_HEADER_SIZE; // block start, zone offset
+        if (boff < start_off || aoff + d.size > end_off) return Status::CorruptMetadata;
+        if (boff < prev_end) return Status::CorruptMetadata; // order + overlap
+        // Physical header must already agree with the descriptor.
+        uint32_t own = load32(G.zone + boff);
+        if ((own & BLOCK_FREE_BIT) != 0 || (own & ~BLOCK_FREE_BIT) != d.block_size)
+            return Status::CorruptMetadata;
+        prev_end = boff + d.block_size;
+        used += d.block_size;
+        prev_idx = idx;
+    }
+    if (prev_idx != NO_ORDER && G.objects[prev_idx].addr_next != NO_ORDER)
+        return Status::CorruptMetadata;
+    if (count != P.live_objects || used != P.used_bytes) return Status::CorruptMetadata;
+    if (P.free_bytes != (uint32_t)(end_off - start_off) - used) return Status::CorruptMetadata;
+    return Status::Ok;
+}
+
 // --- layout finalization -----------------------------------------------------
 // Rebuild block headers, free blocks and TLSF bins for the physical range
 // [start, end) from the pool's address-ordered live blocks. Shared by
@@ -315,11 +368,16 @@ uint8_t* s_barriers[PM_MAX_OBJECTS]; // pinned block starts (address order)
 // move (doc sections 8.1-8.3).
 Status compact_impl(Pool& P) {
     GlobalState& G = g();
+    if (P.borrow_count != 0) return Status::Busy;
     uint64_t t0 = pm_port_ticks_us();
     uint8_t* start = pool_start(P);
     uint8_t* end = pool_end(P);
     Status st = Status::Ok;
     uint32_t nbar = 0, nplan = 0;
+
+    // Gate every memmove on a full descriptor audit (bounded walks).
+    st = precheck_pool(P, (PoolId)(&P - G.pools), start, end);
+    if (st != Status::Ok) goto fail;
 
     for (uint32_t idx = P.order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
         ObjectDesc& d = G.objects[idx];
@@ -423,17 +481,28 @@ void pm_debug_abort(const char* file, int line) {
 // ---------------------------------------------------------------------------
 Status init(Config const& cfg) {
     GlobalState& G = g();
-    if (!cfg.zone || cfg.segment_size < 1024 || cfg.zone_size < cfg.segment_size)
-        return Status::InvalidAlignment;
-    if (cfg.segment_size & (cfg.segment_size - 1)) return Status::InvalidAlignment;
-    if (((uintptr_t)cfg.zone & (PM_ALIGNMENT - 1)) != 0) return Status::InvalidAlignment;
+    // Lifecycle (task-book v2 section 6): validate EVERYTHING before touching
+    // global state. A repeated or failed init must never wipe a live system.
+    if (G.initialized != 0) return Status::Busy;
 
+    if (!cfg.zone) return Status::InvalidAlignment;
+    if (cfg.segment_size < 1024) return Status::InvalidAlignment;
+    if (cfg.segment_size & (cfg.segment_size - 1)) return Status::InvalidAlignment;
+    if (cfg.zone_size < cfg.segment_size) return Status::InvalidAlignment;
+    if (((uintptr_t)cfg.zone & (PM_ALIGNMENT - 1)) != 0) return Status::InvalidAlignment;
+    if (cfg.zone_size / cfg.segment_size > PM_MAX_SEGMENTS) return Status::NoSpace;
+
+    uint32_t seg_count = cfg.zone_size / cfg.segment_size;
+    if (seg_count == 0) return Status::NoSpace;
+    // Overflow check on the rounded zone size (task-book v2 section 6.1).
+    if (seg_count > UINT32_MAX / cfg.segment_size) return Status::NoSpace;
+
+    // All checks passed: only now may global state be (re)initialized.
     memset(&G, 0, sizeof(G));
     G.zone = cfg.zone;
     G.segment_size = cfg.segment_size;
-    G.segment_count = cfg.zone_size / cfg.segment_size;
-    G.zone_size = G.segment_count * cfg.segment_size;
-    if (G.segment_count > PM_MAX_SEGMENTS) return Status::NoSpace;
+    G.segment_count = seg_count;
+    G.zone_size = seg_count * cfg.segment_size;
     for (uint32_t i = 0; i < PM_MAX_OBJECTS; ++i) {
         G.objects[i].addr_prev = G.objects[i].addr_next = NO_ORDER;
         G.objects[i].next_free_slot = (uint16_t)((i + 1 < PM_MAX_OBJECTS) ? i + 1 : NO_SLOT);
@@ -570,9 +639,17 @@ PoolStats get_stats(PoolId id) {
     s.bytes_moved = P->bytes_moved;
     s.compact_time_us = P->compact_time_us;
     uint32_t largest = 0;
+    // Bounded walk: get_stats must terminate on a corrupted free list
+    // (task-book v2 section 9.2) instead of looping forever.
+    const uint32_t max_steps =
+        (g().segment_size ? g().segment_size : 1) * PM_MAX_SEGMENTS / PM_MIN_BLOCK + 1;
     for (uint32_t f = 0; f < FL_COUNT; ++f)
         for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
-            for (uint32_t off = P->bins.head[f][sl]; off != NULL_OFF;) {
+            for (uint32_t off = P->bins.head[f][sl], steps = 0; off != NULL_OFF;) {
+                if (++steps > max_steps) {
+                    s.largest_free_block = 0;
+                    return s; // corrupted; refuse to report
+                }
                 FreeBlock* b = ptr_of(off);
                 if (blk_size_of(b) > largest) largest = blk_size_of(b);
                 off = b->next;
@@ -756,6 +833,10 @@ Status set_destroy_fn(RawRef const& ref, void (*fn)(void*)) {
     RefCheck rc{};
     Status st = check_ref(ref, 0, 1, rc, /*require_running=*/false, nullptr);
     if (st != Status::Ok) return st;
+    // Destroy callbacks exist for pinned non-trivial objects only; a movable
+    // object would have its destructor run after an unchecked memmove
+    // (task-book v2 section 10). Completed as part of the wrap-up.
+    if (!(rc.desc->flags & PM_PINNED)) return Status::NotRelocatable;
     rc.desc->destroy_fn = fn;
     return Status::Ok;
 }
@@ -852,19 +933,36 @@ Status compact(PoolId id) {
 Status merge(PoolId source_id, PoolId target_id) {
     GlobalState& G = g();
     if (!G.initialized) return Status::CorruptMetadata;
-    if (source_id == target_id) return Status::InvalidPool;
+
+    // Arming (validity, adjacency, state, borrows) happens under the same
+    // lock borrow_begin uses, so no new borrow can slip in between the check
+    // and the Merging state (task-book v2 section 5). Planning here is the
+    // adjacency check itself; the heavy work runs unlocked inside the
+    // quiescent window, and the final commit locks again.
     Pool* S = pool_at(source_id);
     Pool* T = pool_at(target_id);
-    if (!S || !T) return Status::InvalidPool;
-    if (S->state != PoolState::Running || T->state != PoolState::Running) return Status::Busy;
-    if (S->borrow_count != 0 || T->borrow_count != 0) return Status::Busy;
-
-    bool source_above = (S->segment_first == (uint32_t)T->segment_first + T->segment_count);
-    bool source_below = (T->segment_first == (uint32_t)S->segment_first + S->segment_count);
-    if (!source_above && !source_below) return Status::NoSpace;
-
-    S->state = PoolState::Merging;
-    T->state = PoolState::Merging;
+    bool source_above, source_below;
+    {
+        PM_LOCK();
+        if (source_id == target_id) { PM_UNLOCK(); return Status::InvalidPool; }
+        S = pool_at(source_id);
+        T = pool_at(target_id);
+        if (!S || !T) { PM_UNLOCK(); return Status::InvalidPool; }
+        if (S->state != PoolState::Running || T->state != PoolState::Running) {
+            PM_UNLOCK();
+            return Status::Busy;
+        }
+        if (S->borrow_count != 0 || T->borrow_count != 0) {
+            PM_UNLOCK();
+            return Status::Busy;
+        }
+        source_above = (S->segment_first == (uint32_t)T->segment_first + T->segment_count);
+        source_below = (T->segment_first == (uint32_t)S->segment_first + S->segment_count);
+        if (!source_above && !source_below) { PM_UNLOCK(); return Status::NoSpace; }
+        S->state = PoolState::Merging;
+        T->state = PoolState::Merging;
+        PM_UNLOCK();
+    }
 
     uint16_t first = source_below ? S->segment_first : T->segment_first;
     uint16_t count = (uint16_t)(S->segment_count + T->segment_count);
@@ -884,6 +982,8 @@ Status merge(PoolId source_id, PoolId target_id) {
     T->segment_first = first;
     T->segment_count = count;
     T->live_objects += S->live_objects;
+    T->used_bytes += S->used_bytes; // precheck (inside compact) audits these
+    T->free_bytes += S->free_bytes; // the combined range holds both free sets
     S->segment_first = 0;
     S->segment_count = 0;
     S->live_objects = 0;
@@ -897,12 +997,16 @@ Status merge(PoolId source_id, PoolId target_id) {
     // defensive branch below stays for Debug assertion coverage.
     Status st = compact_impl(*T);
     if (st != Status::Ok) {
+        PM_LOCK();
         S->state = PoolState::Paused;
         T->state = PoolState::Paused;
+        PM_UNLOCK();
         return st;
     }
     T->structure_epoch++;
+    PM_LOCK();
     memset(&G.pools[source_id], 0, sizeof(Pool)); // source becomes Empty
+    PM_UNLOCK();
     return Status::Ok;
 }
 
@@ -920,26 +1024,45 @@ Status merge(PoolId source_id, PoolId target_id) {
 Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
     GlobalState& G = g();
     if (!G.initialized) return Status::CorruptMetadata;
-    Pool* S = pool_at(source_id);
-    if (!S) return Status::InvalidPool;
-    if (S->state != PoolState::Running) return Status::Busy;
-    if (S->borrow_count != 0) return Status::Busy;
-    if (new_pool_segments == 0 || new_pool_segments >= S->segment_count) return Status::NoSpace;
 
-    // A free pool slot is part of the pre-check: fail before moving anything.
+    // Arming under the borrow lock (task-book v2 section 5): state, borrow
+    // count, segment math and pool-table capacity are all checked before the
+    // pool leaves Running.
+    {
+        PM_LOCK();
+        Pool* Sc = pool_at(source_id);
+        if (!Sc) { PM_UNLOCK(); return Status::InvalidPool; }
+        if (Sc->state != PoolState::Running) { PM_UNLOCK(); return Status::Busy; }
+        if (Sc->borrow_count != 0) { PM_UNLOCK(); return Status::Busy; }
+        if (new_pool_segments == 0 || new_pool_segments >= Sc->segment_count) {
+            PM_UNLOCK();
+            return Status::NoSpace;
+        }
+        Sc->state = PoolState::Splitting;
+        PM_UNLOCK();
+    }
+    Pool* S = pool_at(source_id);
     PoolId nid = PM_MAX_POOLS;
     for (uint32_t i = 0; i < PM_MAX_POOLS; ++i)
         if (G.pools[i].state == PoolState::Empty) { nid = (PoolId)i; break; }
-    if (nid == PM_MAX_POOLS) return Status::NoSpace;
-
-    S->state = PoolState::Splitting;
+    if (nid == PM_MAX_POOLS) {
+        PM_LOCK();
+        S->state = PoolState::Running;
+        PM_UNLOCK();
+        return Status::NoSpace;
+    }
 
     uint8_t* start = pool_start(*S);
     uint8_t* end = pool_end(*S);
     uint32_t keep = S->segment_count - new_pool_segments;
     uint8_t* boundary = seg_base(S->segment_first + keep);
     Status st = Status::Ok;
-    uint32_t nbar = 0, nlow = 0, nup = 0;
+    uint32_t nbar = 0, nlow = 0, nup = 0, n_right = 0;
+
+    // Gate every memmove on a full descriptor audit (bounded walks); a
+    // pre-check failure restores Running with zero side effects.
+    st = precheck_pool(*S, source_id, start, end);
+    if (st != Status::Ok) goto fail_restore;
 
     // Collect pinned barriers (address order).
     for (uint32_t idx = S->order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
@@ -996,16 +1119,47 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
                 s_upper[nup].slot = idx;
                 s_upper[nup].dst_off = off_of(up_cursor);
                 s_upper[nup].size = bsize;
+                // Rightward entries (source below packed destination) form a
+                // prefix of the address-ordered plan: up_cursor - bstart only
+                // ever grows by accumulated holes, so once an entry packs
+                // left of its source every later entry does too. Counting
+                // them here avoids storing per-entry source offsets.
+                if (bstart < up_cursor) n_right++;
                 nup++;
                 up_cursor += bsize;
             }
         }
     }
 
-    // Execution: upper side first, descending address order (dst >= every
-    // not-yet-moved src end), then lower side ascending (dst <= src).
+    // Execution (task-book v2 section 4.2, corrected order). With packing
+    // from the boundary, entry i (address order) satisfies
+    //   dst_i - src_i = x - sum(holes before i),  x = crossing bytes below
+    // the boundary. Rightward entries (dst > src) are therefore a PREFIX of
+    // the plan; leftward entries (dst <= src) are the suffix.
+    //
+    // Safe order, proved against not-yet-moved sources:
+    //   1. rightward prefix in DESCENDING source order: dst_i > src_i >=
+    //      src_j + size_j for every lower-index j still unmoved, so the write
+    //      range never reaches a live source below it;
+    //   2. leftward suffix in ASCENDING source order: writes span
+    //      [dst_i, dst_{i+1}) and dst_{i+1} <= src_{i+1}, so later sources
+    //      are never touched;
+    //   3. the rightward group's topmost write end equals the leftward
+    //      group's first destination, which is <= its source (packing is
+    //      contiguous), so the groups cannot clobber each other.
+    // The crossing object (exactly one, by address order) is the first plan
+    // entry and always rightward; it runs last in pass 1.
     {
-        for (uint32_t i = nup; i-- > 0;) {
+        for (uint32_t i = n_right; i-- > 0;) { // pass 1: rightward, descending
+            ObjectDesc& d = G.objects[s_upper[i].slot];
+            uint8_t* src = d.address - BLOCK_HEADER_SIZE;
+            uint8_t* dst = G.zone + s_upper[i].dst_off;
+            PM_ASSERT(i < n_right ? dst >= src : dst <= src);
+            if (dst != src) memmove(dst, src, s_upper[i].size);
+            d.address = dst + BLOCK_HEADER_SIZE;
+            bump_epoch(d.address_epoch);
+        }
+        for (uint32_t i = n_right; i < nup; ++i) { // pass 2: leftward, ascending
             ObjectDesc& d = G.objects[s_upper[i].slot];
             uint8_t* src = d.address - BLOCK_HEADER_SIZE;
             uint8_t* dst = G.zone + s_upper[i].dst_off;
@@ -1013,6 +1167,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
             d.address = dst + BLOCK_HEADER_SIZE;
             bump_epoch(d.address_epoch);
         }
+        // Lower side: ascending, dst <= src, region below the boundary.
         for (uint32_t i = 0; i < nlow; ++i) {
             ObjectDesc& d = G.objects[s_plan[i].slot];
             uint8_t* src = d.address - BLOCK_HEADER_SIZE;
@@ -1056,15 +1211,19 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
         finalize_layout(N, boundary, end);
 
         S->structure_epoch++;
+        PM_LOCK();
         S->state = PoolState::Running;
         N.state = PoolState::Running;
+        PM_UNLOCK();
         out_new = nid;
         return Status::Ok;
     }
 
 fail_restore:
     // Plan failure: nothing was moved; restore the original state.
+    PM_LOCK();
     S->state = PoolState::Running;
+    PM_UNLOCK();
     return st;
 }
 

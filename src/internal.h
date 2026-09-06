@@ -32,6 +32,7 @@ static_assert(sizeof(FreeBlock) <= PM_MIN_BLOCK, "min block too small for links"
 // --- TLSF bins --------------------------------------------------------------
 static constexpr uint32_t SL_COUNT = PM_SL_COUNT;
 static constexpr uint32_t MIN_FL   = 4; // floor(log2(PM_MIN_BLOCK)) = log2(16)
+static_assert(MIN_FL == MIN_FL_HINT, "pm_config.h FL contract is out of sync");
 static constexpr uint32_t FL_COUNT = PM_FL_MAX - MIN_FL;
 static_assert(FL_COUNT <= 32, "enlarge fl_bitmap for larger zones");
 
