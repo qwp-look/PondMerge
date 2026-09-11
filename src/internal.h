@@ -121,17 +121,28 @@ GlobalState& g();
 uint32_t metadata_scratch_bytes(); // compaction plan scratch size
 
 // --- helpers implemented in core.cpp ----------------------------------------
+// fl_index() saturates at PM_FL_MAX-1 and is therefore only valid for sizes
+// below 2^PM_FL_MAX; callers must reject larger requests (alloc does, and
+// init() refuses a zone whose largest possible block would exceed the range).
 uint32_t fl_index(uint32_t size);
 uint32_t sl_index(uint32_t size, uint32_t fl);
 void bins_insert(TlsfBins& b, FreeBlock* blk);
 void bins_remove(TlsfBins& b, FreeBlock* blk);
-FreeBlock* bins_find(TlsfBins& b, uint32_t need);
+FreeBlock* bins_find(TlsfBins const& b, uint32_t need);
 
 inline uint8_t* seg_base(uint32_t first) {
     return g().zone + (uint64_t)first * g().segment_size;
 }
 inline uint32_t off_of(void const* p) {
-    return (uint32_t)((uint8_t const*)p - g().zone);
+    return (uint32_t)(static_cast<uint8_t const*>(p) - g().zone);
+}
+// True when the zone offset `off` can be dereferenced as a block header.
+// Free-list cursors come from metadata that an external writer may have
+// damaged, so every traversal must screen the offset BEFORE forming a pointer
+// (task-book v2 section 9.2): a bogus offset must be refused, not dereferenced.
+inline bool zone_off_readable(uint32_t off) {
+    uint32_t zs = g().zone_size;
+    return off <= zs && (uint64_t)off + BLOCK_HEADER_SIZE <= zs;
 }
 // All block starts are 8-byte aligned inside the zone; the reinterpret cast
 // below is the block-format boundary (cppcheck: dangerousTypeCast explained).

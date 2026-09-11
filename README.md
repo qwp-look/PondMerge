@@ -18,10 +18,14 @@ src/
     core.cpp        核心实现（单一翻译单元）
 tests/
     suite.cpp       验收测试套件（与平台无关，host 与 ESP32 共用）
-    main.cpp        主机 runner
-    run_host.sh     构建 + 运行（--release / --san / --cppcheck）
+    model.cpp       参考模型对拍测试（固定 seed，不使用内部结构；host）
+    main.cpp        主机 runner（套件 + 模型）
+    config_smoke.cpp    每个 TLSF 配置编译一次的冒烟测试
+    config_limits.cpp   FL 容量契约（zone 上限拒绝 / 上限以下接受）
+    run_host.sh     构建 + 运行（--release / --san / --cppcheck / --configs）
+    config_matrix.sh    配置矩阵（SL 2/4/8/16、FL 31、非法配置编译期拒绝）
 esp32/             ESP32-S3 (n16r8) IDF 工程（v6.0.2，组件强制 gnu++17）
-docs/              设计文档与修复任务书
+docs/              架构说明、代码指导书、各轮修复任务书与交接文档
 ```
 
 ## 内存布局（文档 §2）
@@ -62,6 +66,21 @@ docs/              设计文档与修复任务书
    只有根引用（offset == 0）可以释放对象；`pm_ptr::at()` 子对象视图的
    free/destroy 一律拒绝（`pm_destroy` 失败时不清空指针，`PoolChanged` 表示
    对象仍存活、只是 local 绑定失效）。
+
+### 复杂度（最坏情形，修复任务书 v2 §7.3）
+
+| 操作 | 最坏复杂度 | 说明 |
+|---|---|---|
+| `alloc` | O(该 SL bin 内链长)，上界 O(zone_size / PM_MIN_BLOCK) | TLSF 位图只定位到 bin；同一 bin 内块大小不一，需链内 first-fit 遍历（R2）。**不是严格 O(1)**。 |
+| `free` | O(1) | 与物理前后邻块合并，均为常数次操作（前提：块头与空闲链未被破坏）。 |
+| `pause` / `resume` | O(1) | 单次状态翻转。 |
+| `compact` / `merge` / `split` | O(object_count + moved_bytes) | 一次地址序遍历完成只读规划，随后按序搬移与重建。 |
+| `validate` | O(live_objects × free_blocks) | live 块与 binned 空闲块两两做重叠检查与 gap 归账；所有遍历均有步数上限。 |
+| `get_stats` | O(free_blocks) | 有步数上限；损坏链表下有限返回（`largest_free_block = 0`）。 |
+| `borrow_begin` / `resolve` / `borrow_end` | O(1) | 描述符字段校验 + 一次描述符读取，无地址缓存（见上文第 3 条）。 |
+
+若产品必须保证严格 O(1) 分配，需要改变 bin 内组织方式（例如按块大小的固定容量
+结构）。v1 不做，文档也不再声明 `alloc` 为 O(1)。
 
 ### 并发契约：单所有者 + 静默维护期（修复任务书 §4）
 
@@ -111,8 +130,11 @@ tests/run_host.sh              # Host Debug（默认，-O1 -g，PM_DEBUG=1）
 tests/run_host.sh 10000        # 指定压力次数
 tests/run_host.sh --release    # Host Release（-O3 -DNDEBUG -DPM_DEBUG=0）
 tests/run_host.sh --san        # ASan + UBSan
-tests/run_host.sh --cppcheck   # cppcheck 静态检查
+tests/run_host.sh --cppcheck   # cppcheck 静态检查（core + suite + model）
+tests/run_host.sh --configs    # 配置矩阵（等价于 tests/config_matrix.sh）
 ```
+
+每个模式都会同时运行 `tests/suite.cpp` 与 `tests/model.cpp`（参考模型对拍）。
 
 基础测试组与《指导书》§18 对应：[1] 连续分配释放复用 · [2] 随机 10000 次 + 整理 ·
 [3] 整理后逻辑引用不变 · [4] 活跃借用使整理返回 Busy · [5] generation / double
@@ -121,15 +143,53 @@ free / 越界捕获 · [6] pinned 屏障 · [7] DMA / 外部对象不搬迁 · [
 对齐边界 · [12] `pm_validate()` 与损坏注入 · [13] 类型化 C++ API（`pm_make` /
 `pm_make_pinned` / `pm_as_cross` / 偏移子对象视图）。
 
-修复回归组（`docs/PondMerge_v1_repair_task.md` §8）：R1 失败分配槽位回滚 ·
-R2 TLSF 同 bin first-fit · R3 `pm_destroy` 失败保留指针 · R4 CROSS_HINT 构造
-local 拒绝 · R5 可搬移 opt-in（编译期 + 运行期） · R6 子对象不可释放 ·
-R7 维护失败路径零改动 · R8 validate 环/损坏有限时返回 · R9 整数上限拒绝 ·
-R10 静默期契约 · R11 拆分布局（pinned 不动 + 两侧重排） · R12
-generation/epoch/hint 组合矩阵。
+修复回归组（第一轮任务书 §8）：R1 失败分配槽位回滚 · R2 TLSF 同 bin first-fit ·
+R3 `pm_destroy` 失败保留指针 · R4 CROSS_HINT 构造 local 拒绝 · R5 可搬移 opt-in
+（编译期 + 运行期） · R6 子对象不可释放 · R7 维护失败路径零改动 · R8 validate
+环/损坏有限时返回 · R9 整数上限拒绝 · R10 静默期契约 · R11 拆分布局（pinned
+不动 + 两侧重排） · R12 generation/epoch/hint 组合矩阵。
 
-验收结果（全部 0 failures）：Host Debug `5,271,298` 项检查 · Host Release 同
-套件 · ASan/UBSan 干净 · cppcheck 0 告警。
+v2 修复轮新增回归组（`docs/PondMerge_v2_repair_task.md` §11.1）：
+R13 拆分跨界搬移顺序（无源覆盖） · R14 `init()` 先校验后清理 ·
+R15 拆分歧界几何（整体右移的前缀计划、完美铺满、贴近池尾） ·
+R16 维护状态/借用矩阵（Running/Paused × borrow × compact/merge/split） ·
+R17 描述符-块一致性在 validate/resolve/borrow/free 处处拒绝 ·
+R18 `get_stats` 损坏链表有限返回且越界游标不解引用 ·
+R19 销毁回调仅限 pinned 且恰好执行一次 ·
+R20 compact 故障注入（越界/未对齐/size 与 block 不一致，搬移前中止） ·
+R21 统计/顺序链/位图/块头/prev_size 逐域损坏检测 ·
+**参考模型对拍**（固定 seed 随机 alloc/free/compact/merge/split，独立校验
+live 数、payload、池归属、字节账目与可分配性；失败打印 seed 与操作轨迹）。
+
+验收结果（v2 修复轮，提交见 `docs/HANDOVER_v3.md`，全部 0 failures）：
+Host Debug（10000 op）`5,391,417` 项检查 · Host Release（10000 op）同套件 ·
+ASan/UBSan（3000 op）`1,490,428` 项检查 · 参考模型对拍 `466,859` 项检查 ·
+cppcheck 退出码 0（0 告警）· 配置矩阵（含 FL 容量上限契约）全部通过。
+
+## v2 修复轮要点（详见 `docs/HANDOVER_v3.md`）
+
+- **split 搬移顺序**：上半区计划按地址序切分为「右移前缀」与「左移后缀」，前者按
+  源降序、后者按源升序执行；跨界对象恰为前缀首元素，因此最后执行。v2 任务书
+  §4.2 伪代码的「上半区全部升序」在其自身前提下不成立，实际以 `split()` 执行段
+  注释中的证明为准。
+- **维护入口契约统一**：compact/merge/split 一律接受 `Running` 或 `Paused`，规划
+  失败恢复入口状态；compact 因借用被拒时按文档 §8 保持 `Paused`，由调用方
+  `resume()`。完整规则写在 `pondmerge.hpp` 的维护契约段。
+- **`validate()` 整数化 + 覆盖审计**：所有范围运算改为 zone 偏移（uint64），bins
+  游标在解引用前判界；新增两条独立审计——「live + binned free + slack == capacity」
+  与「blocks 并集中每个未覆盖间隙必小于 `PM_MIN_BLOCK`」。注意：朴素表述「每个空闲
+  块恰好填满一个块间空隙」是**错的**——`free()` 只合并物理相邻块，slack 会把两个
+  空闲块隔开；正确不变量见 `validate()` 注释。
+- **`free()` 池尾陈旧字节缺陷（本轮修出）**：`finalize_layout` 原本只对块间小间隙
+  写 poison，池尾 slack 未写，于是 `free()` 的前向合并会读到陈旧字节、可能误判为
+  空闲块并破坏 bins。现在池尾 slack 同样写 poison（R15(c) 覆盖该路径）。
+- **`get_stats()` / `bins_find()` 越界游标**：损坏的 bin 头或链指针被拒绝而不是被
+  解引用（此前只有步数上限，能防环但不能防越界读）。
+- **`precheck_pool()` 补对齐校验**：整理前的全量审计现在也验证 descriptor 地址对齐。
+- **`init()` FL 容量契约**：声明的 zone 若其最大块达到 `2^PM_FL_MAX`，init 直接
+  拒绝（`NoSpace`），不再把超出表示范围的大块静默 clamp 进最高 bin；配置矩阵覆盖。
+- **ESP32 设备未重烧**：手上没有可用开发板（无 `/dev/ttyACM*`），本轮只做了固件
+  编译验证，见下文的诚实性说明。
 
 ## ESP32-S3（n16r8）上机
 
@@ -151,6 +211,15 @@ chip: model=9 rev=0.2 cores=2
 830,988 checks, 0 failures
 === suite PASSED (rc=0) ===
 ```
+
+> **注意（诚实性要求，修复任务书 v2 §3.1）**：上面的设备结果是**第一轮固件**的
+> 记录。v2 修复轮（split 搬移顺序、锁边界、init 生命周期、TLSF 配置契约、
+> 维护前预检、validate 整数化、覆盖审计）**尚未重烧到设备**，因此不构成 v2 的实机
+> 验证。v2 在设备侧目前只有**编译证据**：`idf.py -B build build` 成功、产物
+> 233,280 B（sha256 前 16 位 `e0fc7f7a7bfd8d63`）、编译单元已包含含 R1–R21 的
+> `tests/suite.cpp`。重烧后必须核对启动日志里的 `App version` 与提交号一致，再采信
+> 串口 PASS。在此之前，v2 的可信度来自 Host Debug / Release / ASan / UBSan /
+> cppcheck / 配置矩阵 / 参考模型对拍。
 
 压力统计（设备）：`max_compact_us=1176`，元数据 27 KB。
 

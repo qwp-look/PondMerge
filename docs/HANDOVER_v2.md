@@ -5,6 +5,11 @@
 收口提交：见 git log（本文档同提交入库）
 依据文档：`docs/PondMerge_v1_repair_task.md`（第一轮）、第二轮修复指南（v2，未入库，见 §6）
 
+> **续轮说明（2026-09-11）**：本文档 §2 的未完成项已在 v2 续轮处理完毕，v2 任务书
+> 也已入库为 `docs/PondMerge_v2_repair_task.md`。续轮的完整报告、调用方可见的语义
+> 变更、以及本轮新修出的 4 个缺陷见 `docs/HANDOVER_v3.md`。以下 §2 保留为收口当时
+> 的历史快照。
+
 ## 1. 本轮（v2）已完成并验证的修复
 
 以下各项均已实施，且在 Host Debug / Release（-O3 -DNDEBUG -DPM_DEBUG=0）下

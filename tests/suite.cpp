@@ -68,7 +68,8 @@ static void fill(pm::RawRef ref, uint32_t size, uint32_t seed) {
         CHECK_ST(s, pm::Status::Ok);
         return;
     }
-    for (uint32_t i = 0; i < size; ++i) ((uint8_t*)p)[i] = pat(seed, i);
+    uint8_t* bytes = static_cast<uint8_t*>(p);
+    for (uint32_t i = 0; i < size; ++i) bytes[i] = pat(seed, i);
     pm::borrow_end(ref);
 }
 static void verify(pm::RawRef ref, uint32_t size, uint32_t seed) {
@@ -78,9 +79,10 @@ static void verify(pm::RawRef ref, uint32_t size, uint32_t seed) {
         CHECK_ST(s, pm::Status::Ok);
         return;
     }
+    uint8_t const* bytes = static_cast<uint8_t const*>(p);
     for (uint32_t i = 0; i < size; ++i) {
         ++g_checks;
-        if (((uint8_t*)p)[i] != pat(seed, i)) {
+        if (bytes[i] != pat(seed, i)) {
             printf("    payload mismatch %s:%d (ref %u byte %u)\n", __FILE__, __LINE__,
                    (unsigned)ref.index, (unsigned)i);
             ++g_fails;
@@ -99,6 +101,26 @@ static uint32_t xorshift(uint32_t& s) {
 
 static uint8_t get_stats_state(pm::PoolId id) { return pm::get_stats(id).state; }
 static uint16_t desc_pool(pm::RawRef r) { return pm::internal::g().objects[r.index].pool_id; }
+
+// Typed resolve helpers. They keep the tests free of C-style casts and give
+// one place to assert that resolution succeeded before a pointer is used.
+template <class T>
+static T* resolve_as(pm::RawRef ref) {
+    void* raw = nullptr;
+    CHECK_ST(pm::resolve(ref, 0, 1, raw), pm::Status::Ok);
+    return static_cast<T*>(raw);
+}
+static void* resolve_void(pm::RawRef ref) {
+    void* raw = nullptr;
+    CHECK_ST(pm::resolve(ref, 0, 1, raw), pm::Status::Ok);
+    return raw;
+}
+// Bounds of a block in the zone, derived from its descriptor.
+static uint64_t desc_block_start_off(pm::RawRef r) {
+    using namespace pm::internal;
+    return (uint64_t)(uintptr_t)g().objects[r.index].address -
+           (uint64_t)(uintptr_t)g().zone - BLOCK_HEADER_SIZE;
+}
 
 // ---------------------------------------------------------------------------
 // 1. 连续分配、释放、重复利用
@@ -378,13 +400,11 @@ static void test_pinned_barriers() {
     CHECK_ST(pm::free(m[1]), pm::Status::Ok);
     CHECK_ST(pm::free(m[4]), pm::Status::Ok);
 
-    void* before = nullptr;
-    CHECK_ST(pm::resolve(pin, 0, 1, before), pm::Status::Ok);
+    void const* before = resolve_void(pin);
 
     CHECK_ST(pm::compact(pool), pm::Status::Ok);
 
-    void* after = nullptr;
-    CHECK_ST(pm::resolve(pin, 0, 1, (void*&)after), pm::Status::Ok);
+    void const* after = resolve_void(pin);
     CHECK(before == after); // pinned object never moves
     verify(pin, 256, 999);
     verify(m[0], 128, 500);
@@ -393,15 +413,12 @@ static void test_pinned_barriers() {
     verify(m[5], 128, 505);
 
     // Packing respects the barrier: m2 stays below the pin, m3/m5 above it.
-    uint8_t* pin_addr = (uint8_t*)after;
-    uint8_t* m2_addr = nullptr;
-    CHECK_ST(pm::resolve(m[2], 0, 1, (void*&)m2_addr), pm::Status::Ok);
+    uint8_t const* pin_addr = static_cast<uint8_t const*>(after);
+    uint8_t const* m2_addr = resolve_as<uint8_t>(m[2]);
     CHECK(m2_addr < pin_addr);
-    uint8_t* m3_addr = nullptr;
-    CHECK_ST(pm::resolve(m[3], 0, 1, (void*&)m3_addr), pm::Status::Ok);
+    uint8_t const* m3_addr = resolve_as<uint8_t>(m[3]);
     CHECK(m3_addr > pin_addr);
-    uint8_t* m5_addr = nullptr;
-    CHECK_ST(pm::resolve(m[5], 0, 1, (void*&)m5_addr), pm::Status::Ok);
+    uint8_t const* m5_addr = resolve_as<uint8_t>(m[5]);
     CHECK(m5_addr > pin_addr);
     pm::PoolStats st = pm::get_stats(pool);
     CHECK(st.fragment_bytes < 4096);
@@ -434,9 +451,9 @@ static void test_non_relocatable_flags() {
         CHECK((g().objects[ext.index].flags & pm::PM_PINNED) != 0);
     }
 
-    void* a0 = nullptr; CHECK_ST(pm::resolve(dma, 0, 1, a0), pm::Status::Ok);
-    void* e0 = nullptr; CHECK_ST(pm::resolve(ext, 0, 1, e0), pm::Status::Ok);
-    void* p0 = nullptr; CHECK_ST(pm::resolve(pinned, 0, 1, p0), pm::Status::Ok);
+    void const* a0 = resolve_void(dma);
+    void const* e0 = resolve_void(ext);
+    void const* p0 = resolve_void(pinned);
 
     // Fragment then compact; movables shift, pinned classes stay.
     pm::RawRef pad{};
@@ -446,9 +463,9 @@ static void test_non_relocatable_flags() {
     CHECK_ST(pm::free(pad), pm::Status::Ok);
     CHECK_ST(pm::compact(pool), pm::Status::Ok);
 
-    void* a1 = nullptr; CHECK_ST(pm::resolve(dma, 0, 1, (void*&)a1), pm::Status::Ok);
-    void* e1 = nullptr; CHECK_ST(pm::resolve(ext, 0, 1, (void*&)e1), pm::Status::Ok);
-    void* p1 = nullptr; CHECK_ST(pm::resolve(pinned, 0, 1, (void*&)p1), pm::Status::Ok);
+    void const* a1 = resolve_void(dma);
+    void const* e1 = resolve_void(ext);
+    void const* p1 = resolve_void(pinned);
     CHECK(a0 == a1);
     CHECK(e0 == e1);
     CHECK(p0 == p1);
@@ -1007,8 +1024,9 @@ static void test_local_ref_rejects_cross_hint() {
     pm::RawRef mutated = made.value.raw();
     mutated.generation = 9999;
     mutated.pool_hint = pm::CROSS_HINT;
-    CHECK(mutated.generation == 9999); // the copy carries the mutations...
-    CHECK(made.value.valid());         // ...but the pointer is unaffected
+    CHECK(mutated.generation == 9999);          // the copy carries the mutations...
+    CHECK(mutated.pool_hint == pm::CROSS_HINT); // ...including the pool hint
+    CHECK(made.value.valid());                  // ...but the pointer is unaffected
     CHECK(made.value.pool_hint() == pool);
     CHECK_ST(made.value.try_borrow().status, pm::Status::Ok);
 
@@ -1158,7 +1176,7 @@ static void test_validate_bounded_on_corruption() {
     CHECK(made.ok());
     uint32_t idx = made.value.raw().index;
 
-    auto rd32 = [](void* p) { uint32_t v; memcpy(&v, p, 4); return v; };
+    auto rd32 = [](void const* p) { uint32_t v; memcpy(&v, p, 4); return v; };
     auto wr32 = [](void* p, uint32_t v) { memcpy(p, &v, 4); };
 
     // 1) address-order self-cycle
@@ -1174,7 +1192,7 @@ static void test_validate_bounded_on_corruption() {
     // 2) free-list self-cycle
     {
         using namespace pm::internal;
-        Pool& P = g().pools[pool];
+        Pool const& P = g().pools[pool];
         uint32_t head_off = NULL_OFF;
         for (uint32_t f = 0; f < FL_COUNT && head_off == NULL_OFF; ++f)
             for (uint32_t sl2 = 0; sl2 < SL_COUNT && head_off == NULL_OFF; ++sl2)
@@ -1218,7 +1236,7 @@ static void test_validate_bounded_on_corruption() {
     CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
     {
         using namespace pm::internal;
-        Pool& P = g().pools[pool];
+        Pool const& P = g().pools[pool];
         uint32_t head_off = NULL_OFF;
         for (uint32_t f = 0; f < FL_COUNT && head_off == NULL_OFF; ++f)
             for (uint32_t sl2 = 0; sl2 < SL_COUNT && head_off == NULL_OFF; ++sl2)
@@ -1237,7 +1255,8 @@ static void test_validate_bounded_on_corruption() {
     // system must and does refuse with Busy (see R14).
     {
         using namespace pm::internal;
-        memset(&g(), 0, sizeof(g()));
+        GlobalState& G = g();
+        memset(&G, 0, sizeof(G));
     }
     // g() is zeroed (uninitialized); nothing to deinit — return directly.
 }
@@ -1318,14 +1337,14 @@ static void test_split_layout_details() {
     fill(pin_low, 64, 91);
     fill(pin_high, 128, 92);
 
-    void* low_before = nullptr;  CHECK_ST(pm::resolve(pin_low, 0, 1, low_before), pm::Status::Ok);
-    void* high_before = nullptr; CHECK_ST(pm::resolve(pin_high, 0, 1, high_before), pm::Status::Ok);
+    void const* low_before = resolve_void(pin_low);
+    void const* high_before = resolve_void(pin_high);
 
     pm::PoolId n{};
     CHECK_ST(pm::split(s, 4, n), pm::Status::Ok);
 
-    void* low_after = nullptr;  CHECK_ST(pm::resolve(pin_low, 0, 1, (void*&)low_after), pm::Status::Ok);
-    void* high_after = nullptr; CHECK_ST(pm::resolve(pin_high, 0, 1, (void*&)high_after), pm::Status::Ok);
+    void const* low_after = resolve_void(pin_low);
+    void const* high_after = resolve_void(pin_high);
     CHECK(low_before == low_after);    // pinned never moved
     CHECK(high_before == high_after);  // pinned never moved
 
@@ -1343,10 +1362,9 @@ static void test_split_layout_details() {
         verify(cross, 3584, 60 + i);
         bool in_new = desc_pool(m[i]) == n;
         if (in_new) {
-            uint8_t* a = nullptr;
             pm::RawRef c2 = m[i]; c2.pool_hint = pm::CROSS_HINT;
-            CHECK_ST(pm::resolve(c2, 0, 1, (void*&)a), pm::Status::Ok);
-            CHECK(a >= (uint8_t*)low_after); // moved objects live above
+            uint8_t const* a = resolve_as<uint8_t>(c2);
+            CHECK(a >= static_cast<uint8_t const*>(low_after)); // above the pin
         }
     }
     verify(pin_low, 64, 91);
@@ -1491,13 +1509,11 @@ static void test_split_crossing_order() {
     // Upper objects must now live at their packed addresses (>= boundary).
     {
         using namespace pm::internal;
-        uint8_t* boundary = seg_base(g().pools[n].segment_first);
+        uint8_t const* boundary = seg_base(g().pools[n].segment_first);
         CHECK(g().objects[u1.index].address - BLOCK_HEADER_SIZE >= boundary);
         CHECK(g().objects[u2.index].address - BLOCK_HEADER_SIZE >= boundary);
-        CHECK(g().objects[C.index].address - BLOCK_HEADER_SIZE ==
-              (uint8_t*)boundary);
+        CHECK(g().objects[C.index].address - BLOCK_HEADER_SIZE == boundary);
     }
-    for (uint32_t i = 0; i < 8; ++i) { /* quiet */ (void)i; }
     pm::RawRef cL = L; cL.pool_hint = pm::CROSS_HINT;
     pm::RawRef cC = C; cC.pool_hint = pm::CROSS_HINT;
     pm::RawRef cu1 = u1; cu1.pool_hint = pm::CROSS_HINT;
@@ -1560,10 +1576,613 @@ static void test_init_lifecycle() {
 }
 
 // ---------------------------------------------------------------------------
+// (R15) task-book v2 11.1 item 2: split boundary geometries.
+//   (a) a crossing object 16 B past the boundary shifts EVERY upper object
+//       right by 8, so the whole upper plan is a rightward prefix -- the case
+//       the v2 pseudo-code's "ascending upper" rule does not cover. A wrong
+//       order clobbers u1's source here.
+//   (b) perfect tiling: the lower region ends exactly at the boundary, the
+//       first upper object starts exactly on it, the last object ends exactly
+//       at the pool end. Nothing moves and no free block exists.
+//   (c) one huge crossing object ending 8 B before the pool end: it moves
+//       right by 8 and leaves 8 B of tail slack in BOTH pools.
+// ---------------------------------------------------------------------------
+static void test_split_boundary_geometries() {
+    printf("  [R15] split boundary geometries\n");
+
+    // (a) crossing by 16 B: entire upper plan moves right
+    {
+        fresh();
+        pm::PoolId s{};
+        CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok); // 32 KiB, boundary 16 KiB
+        pm::RawRef L{}, X{}, u1{}, u2{};
+        CHECK_ST(pm::alloc(s, 16368, 8, 0, 1, L), pm::Status::Ok);  // [0,16376)
+        CHECK_ST(pm::alloc(s, 16, 8, 0, 2, X), pm::Status::Ok);     // [16376,16400)
+        CHECK_ST(pm::alloc(s, 3584, 8, 0, 3, u1), pm::Status::Ok);  // [16400,19992)
+        CHECK_ST(pm::alloc(s, 3584, 8, 0, 4, u2), pm::Status::Ok);  // [19992,23584)
+        fill(L, 16368, 11);
+        fill(X, 16, 22);
+        fill(u1, 3584, 33);
+        fill(u2, 3584, 44);
+        VALIDATE(s);
+
+        pm::PoolId n{};
+        CHECK_ST(pm::split(s, 4, n), pm::Status::Ok);
+        VALIDATE(s);
+        VALIDATE(n);
+
+        pm::RawRef cL = L; cL.pool_hint = pm::CROSS_HINT;
+        pm::RawRef cX = X; cX.pool_hint = pm::CROSS_HINT;
+        pm::RawRef c1 = u1; c1.pool_hint = pm::CROSS_HINT;
+        pm::RawRef c2 = u2; c2.pool_hint = pm::CROSS_HINT;
+        verify(cL, 16368, 11);
+        verify(cX, 16, 22);
+        verify(c1, 3584, 33);
+        verify(c2, 3584, 44);
+        CHECK(desc_pool(L) == s);
+        CHECK(desc_pool(X) == n && desc_pool(u1) == n && desc_pool(u2) == n);
+        // Packed from the boundary in address order, with no holes.
+        CHECK(desc_block_start_off(X) == 16384);
+        CHECK(desc_block_start_off(u1) == 16384 + 24);
+        CHECK(desc_block_start_off(u2) == 16384 + 24 + 3592);
+        CHECK_ST(pm::free(cL), pm::Status::Ok);
+        CHECK_ST(pm::free(cX), pm::Status::Ok);
+        CHECK_ST(pm::free(c1), pm::Status::Ok);
+        CHECK_ST(pm::free(c2), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(s), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(n), pm::Status::Ok);
+        done();
+    }
+
+    // (b) perfect tiling: nothing moves, nothing is free
+    {
+        fresh();
+        pm::PoolId s{};
+        CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
+        pm::RawRef o[4];
+        uint64_t off0[4];
+        for (uint32_t i = 0; i < 4; ++i) {
+            CHECK_ST(pm::alloc(s, 8184, 8, 0, i, o[i]), pm::Status::Ok); // block 8192
+            fill(o[i], 8184, 100 + i);
+            off0[i] = desc_block_start_off(o[i]);
+        }
+        CHECK(off0[0] == 0 && off0[1] == 8192 && off0[2] == 16384 && off0[3] == 24576);
+        VALIDATE(s);
+
+        pm::PoolId n{};
+        CHECK_ST(pm::split(s, 4, n), pm::Status::Ok);
+        VALIDATE(s);
+        VALIDATE(n);
+        for (uint32_t i = 0; i < 4; ++i) {
+            pm::RawRef c = o[i]; c.pool_hint = pm::CROSS_HINT;
+            verify(c, 8184, 100 + i);
+            CHECK(desc_block_start_off(o[i]) == off0[i]); // already packed
+        }
+        CHECK(desc_pool(o[0]) == s && desc_pool(o[1]) == s);
+        CHECK(desc_pool(o[2]) == n && desc_pool(o[3]) == n);
+        pm::PoolStats ss = pm::get_stats(s), sn = pm::get_stats(n);
+        CHECK(ss.free_bytes == 0 && sn.free_bytes == 0);
+        CHECK(ss.largest_free_block == 0 && sn.largest_free_block == 0);
+        for (uint32_t i = 0; i < 4; ++i) {
+            pm::RawRef c = o[i]; c.pool_hint = pm::CROSS_HINT;
+            CHECK_ST(pm::free(c), pm::Status::Ok);
+        }
+        CHECK_ST(pm::destroy_pool(s), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(n), pm::Status::Ok);
+        done();
+    }
+
+    // (c) a single huge crossing object ending 8 B before the pool end
+    {
+        fresh();
+        pm::PoolId s{};
+        CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
+        pm::RawRef L{}, X{};
+        CHECK_ST(pm::alloc(s, 16368, 8, 0, 1, L), pm::Status::Ok); // [0,16376)
+        CHECK_ST(pm::alloc(s, 16368, 8, 0, 2, X), pm::Status::Ok); // [16376,32752)
+        fill(L, 16368, 55);
+        fill(X, 16368, 66);
+        VALIDATE(s);
+
+        pm::PoolId n{};
+        CHECK_ST(pm::split(s, 4, n), pm::Status::Ok);
+        VALIDATE(s);
+        VALIDATE(n);
+        pm::RawRef cL = L; cL.pool_hint = pm::CROSS_HINT;
+        pm::RawRef cX = X; cX.pool_hint = pm::CROSS_HINT;
+        verify(cL, 16368, 55);
+        verify(cX, 16368, 66);
+        CHECK(desc_pool(X) == n);
+        CHECK(desc_block_start_off(X) == 16384); // moved right by one header
+        // 8 B of tail slack in each pool; validate() must accept both.
+        pm::PoolStats ss = pm::get_stats(s), sn = pm::get_stats(n);
+        CHECK(ss.fragment_bytes == 8 && ss.free_bytes == 8);
+        CHECK(sn.fragment_bytes == 8 && sn.free_bytes == 8);
+        // Freeing the objects leaves a free block separated from the tail
+        // slack: the second half of the R13 lesson -- validate() must still
+        // accept it, which it does via the "gaps are sub-minimal" invariant.
+        CHECK_ST(pm::free(cL), pm::Status::Ok);
+        VALIDATE(s);
+        CHECK_ST(pm::free(cX), pm::Status::Ok);
+        VALIDATE(n);
+        CHECK_ST(pm::destroy_pool(s), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(n), pm::Status::Ok);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (R16) task-book v2 11.1 items 3-4: the state/borrow decision matrix for
+//       compact, merge and split, plus the borrow counters underneath it.
+// ---------------------------------------------------------------------------
+static void test_maintenance_state_matrix() {
+    printf("  [R16] maintenance state/borrow matrix\n");
+
+    // ---- (A) compact: Running and Paused accepted, borrows refused ----
+    {
+        fresh();
+        pm::PoolId c{};
+        CHECK_ST(pm::create_pool(c, 2), pm::Status::Ok);
+        pm::RawRef o{}, o2{};
+        CHECK_ST(pm::alloc(c, 256, 8, 0, 1, o), pm::Status::Ok);
+        CHECK_ST(pm::alloc(c, 256, 8, 0, 2, o2), pm::Status::Ok);
+        fill(o, 256, 1);
+        fill(o2, 256, 2);
+
+        CHECK_ST(pm::compact(c), pm::Status::Ok); // entry Running
+        CHECK(get_stats_state(c) == 1);           // success returns to service
+        CHECK_ST(pm::pause(c), pm::Status::Ok);
+        CHECK_ST(pm::compact(c), pm::Status::Ok); // entry Paused
+        CHECK(get_stats_state(c) == 1);
+
+        // Running + active borrow: Busy. Doc section 8's flow leaves it
+        // Paused (compact enters Paused before checking borrows).
+        void* p = nullptr;
+        CHECK_ST(pm::borrow_begin(o, 256, 1, p), pm::Status::Ok);
+        {
+            using namespace pm::internal;
+            CHECK(g().pools[c].borrow_count == 1);
+            CHECK(g().objects[o.index].active_borrows == 1);
+        }
+        CHECK_ST(pm::compact(c), pm::Status::Busy);
+        CHECK(get_stats_state(c) == 2);
+        // Paused + active borrow: still Busy, still Paused.
+        CHECK_ST(pm::compact(c), pm::Status::Busy);
+        CHECK(get_stats_state(c) == 2);
+        pm::borrow_end(o);
+        {
+            using namespace pm::internal;
+            CHECK(g().pools[c].borrow_count == 0);
+            CHECK(g().objects[o.index].active_borrows == 0);
+        }
+        CHECK_ST(pm::resume(c), pm::Status::Ok);
+        CHECK_ST(pm::compact(c), pm::Status::Ok);
+        verify(o, 256, 1);
+        verify(o2, 256, 2);
+        CHECK_ST(pm::free(o), pm::Status::Ok);
+        CHECK_ST(pm::free(o2), pm::Status::Ok);
+        VALIDATE(c);
+        CHECK_ST(pm::destroy_pool(c), pm::Status::Ok);
+        done();
+    }
+
+    // ---- (B) merge: Running and Paused accepted, borrows refused ----
+    {
+        fresh();
+        pm::PoolId c{}, t{};
+        CHECK_ST(pm::create_pool(c, 2), pm::Status::Ok); // segs 0-1
+        CHECK_ST(pm::create_pool(t, 2), pm::Status::Ok); // segs 2-3
+        pm::RawRef oc{}, ot{};
+        CHECK_ST(pm::alloc(c, 256, 8, 0, 1, oc), pm::Status::Ok);
+        CHECK_ST(pm::alloc(t, 256, 8, 0, 2, ot), pm::Status::Ok);
+        fill(oc, 256, 1);
+        fill(ot, 256, 2);
+
+        // Active borrow: Busy, and NEITHER pool is flipped (merge returns in
+        // the arming block, before any state write).
+        void* p = nullptr;
+        CHECK_ST(pm::borrow_begin(ot, 256, 1, p), pm::Status::Ok);
+        CHECK_ST(pm::merge(t, c), pm::Status::Busy);
+        CHECK(get_stats_state(t) == 1 && get_stats_state(c) == 1);
+        pm::borrow_end(ot);
+
+        // Both pools Paused: accepted (v2 section 5.1 uniformity).
+        CHECK_ST(pm::pause(t), pm::Status::Ok);
+        CHECK_ST(pm::pause(c), pm::Status::Ok);
+        CHECK_ST(pm::merge(t, c), pm::Status::Ok);
+        CHECK(get_stats_state(c) == 1); // result returns to service
+        CHECK(get_stats_state(t) == 0); // source became Empty
+        VALIDATE(c);
+        pm::RawRef cross_oc = oc; cross_oc.pool_hint = pm::CROSS_HINT;
+        pm::RawRef cross_ot = ot; cross_ot.pool_hint = pm::CROSS_HINT;
+        verify(cross_oc, 256, 1);
+        verify(cross_ot, 256, 2);
+        CHECK_ST(pm::free(cross_oc), pm::Status::Ok);
+        CHECK_ST(pm::free(cross_ot), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(c), pm::Status::Ok);
+        done();
+    }
+
+    // ---- (C) split: Running and Paused accepted, borrows refused ----
+    {
+        fresh();
+        pm::PoolId s{};
+        CHECK_ST(pm::create_pool(s, 4), pm::Status::Ok); // segs 0-3
+        pm::RawRef o{};
+        CHECK_ST(pm::alloc(s, 256, 8, 0, 1, o), pm::Status::Ok);
+        fill(o, 256, 3);
+
+        void* p = nullptr;
+        CHECK_ST(pm::borrow_begin(o, 256, 1, p), pm::Status::Ok);
+        pm::PoolId n{};
+        CHECK_ST(pm::split(s, 2, n), pm::Status::Busy);
+        CHECK(get_stats_state(s) == 1); // source untouched, still Running
+        pm::borrow_end(o);
+
+        CHECK_ST(pm::pause(s), pm::Status::Ok);
+        CHECK_ST(pm::split(s, 2, n), pm::Status::Ok); // entry Paused
+        CHECK(get_stats_state(s) == 1 && get_stats_state(n) == 1);
+        VALIDATE(s);
+        VALIDATE(n);
+        pm::RawRef cross_o = o; cross_o.pool_hint = pm::CROSS_HINT;
+        verify(cross_o, 256, 3);
+        CHECK(desc_block_start_off(o) < 2u * 4096u); // stayed below the boundary
+        CHECK_ST(pm::destroy_pool(n), pm::Status::Ok); // new pool is empty
+        CHECK_ST(pm::free(cross_o), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(s), pm::Status::Ok);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (R17) task-book v2 11.1 item 8: a descriptor that cannot describe a real
+//       block is refused by validate, resolve, borrow_begin AND free -- the
+//       address derived from it must never be handed out.
+// ---------------------------------------------------------------------------
+static void test_desc_block_consistency_rejected() {
+    printf("  [R17] descriptor/block inconsistency refused everywhere\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef a{};
+    CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+    fill(a, 128, 7);
+
+    auto expect_rejected = [&]() {
+        void* p = nullptr;
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        CHECK_ST(pm::resolve(a, 128, 1, p), pm::Status::CorruptMetadata);
+        CHECK_ST(pm::borrow_begin(a, 128, 1, p), pm::Status::CorruptMetadata);
+        CHECK_ST(pm::free(a), pm::Status::CorruptMetadata); // no side effects
+    };
+    auto expect_accepted = [&]() {
+        void* p = nullptr;
+        CHECK_ST(pm::validate(pool), pm::Status::Ok);
+        CHECK_ST(pm::resolve(a, 128, 1, p), pm::Status::Ok);
+        CHECK_ST(pm::borrow_begin(a, 128, 1, p), pm::Status::Ok);
+        pm::borrow_end(a);
+    };
+
+    using namespace pm::internal;
+    ObjectDesc& d = g().objects[a.index];
+    uint32_t const saved_bs = d.block_size;
+    uint8_t* const saved_addr = d.address;
+    CHECK(saved_bs == 136); // 128 payload + 8 header
+
+    d.size = saved_bs; // payload claims one header too many
+    expect_rejected();
+    d.size = 128;
+
+    d.block_size = PM_MIN_BLOCK - 8; // below the minimum block
+    expect_rejected();
+    d.block_size = saved_bs;
+
+    d.block_size = saved_bs + 4; // not PM_ALIGNMENT aligned
+    expect_rejected();
+    d.block_size = saved_bs;
+
+    d.address = saved_addr + 4; // unaligned payload
+    expect_rejected();
+    d.address = saved_addr;
+
+    d.size = 0; // a live object always has a payload
+    expect_rejected();
+    d.size = 128;
+
+    expect_accepted();
+    verify(a, 128, 7);
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R18) task-book v2 11.1 item 9: get_stats() must return in bounded time on
+//       a corrupted free list and must not dereference an out-of-range cursor.
+// ---------------------------------------------------------------------------
+static void test_get_stats_bounded_on_corruption() {
+    printf("  [R18] get_stats bounded and range-checked on corruption\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef a{};
+    CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+    fill(a, 128, 7);
+    CHECK(pm::get_stats(pool).largest_free_block > 0);
+
+    using namespace pm::internal;
+    Pool& P = g().pools[pool];
+    uint32_t hf = FL_COUNT, hs = SL_COUNT;
+    for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
+        for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+            if (P.bins.head[f][sl] != NULL_OFF) { hf = f; hs = sl; break; }
+    CHECK(hf < FL_COUNT);
+    uint32_t const real_head = P.bins.head[hf][hs];
+    uint32_t const real_next = ptr_of(real_head)->next;
+
+    // (a) self-cycle: bounded, refuses to report.
+    ptr_of(real_head)->next = real_head;
+    CHECK(pm::get_stats(pool).largest_free_block == 0);
+    ptr_of(real_head)->next = real_next;
+    CHECK(pm::get_stats(pool).largest_free_block > 0);
+
+    // (b) cursor outside the zone: refused BEFORE dereferencing -- a wild read
+    //     here would be an out-of-bounds access that ASan would trap.
+    P.bins.head[hf][hs] = 0xFFFFFFF0u;
+    CHECK(pm::get_stats(pool).largest_free_block == 0);
+    P.bins.head[hf][hs] = 64u * 1024u * 1024u;
+    CHECK(pm::get_stats(pool).largest_free_block == 0);
+    P.bins.head[hf][hs] = real_head;
+    CHECK(pm::get_stats(pool).largest_free_block > 0);
+
+    // (c) the allocator refuses the same corruption instead of following it.
+    P.bins.head[hf][hs] = 0xFFFFFFF0u;
+    pm::RawRef r{};
+    pm::Status as = pm::alloc(pool, 64, 8, 0, 2, r);
+    CHECK(as == pm::Status::NoSpace);
+    P.bins.head[hf][hs] = real_head;
+    VALIDATE(pool);
+
+    verify(a, 128, 7);
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R19) task-book v2 11.1 item 10: destroy callbacks exist for pinned objects
+//       only, and the callback receives the object's payload address.
+// ---------------------------------------------------------------------------
+static int g_destroy_calls = 0;
+static uint8_t const* g_destroy_last = nullptr;
+// The signature must stay void(*)(void*): it is stored in pm::ObjectDesc and
+// called by the library with a non-const payload pointer, so the callback
+// cannot take a const pointer here (cppcheck's suggestion would need a cast
+// at the assignment site and would weaken the contract).
+// cppcheck-suppress constParameterCallback
+static void counting_destroy(void* p) {
+    ++g_destroy_calls;
+    g_destroy_last = static_cast<uint8_t const*>(p);
+}
+
+static void test_destroy_fn_semantics() {
+    printf("  [R19] destroy callback: pinned only, runs exactly once\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+
+    // Movable: refused, and the refusal must not store the callback.
+    pm::RawRef mov{};
+    CHECK_ST(pm::alloc(pool, 64, 8, pm::PM_MOVABLE, 1, mov), pm::Status::Ok);
+    CHECK_ST(pm::set_destroy_fn(mov, &counting_destroy), pm::Status::NotRelocatable);
+    {
+        using namespace pm::internal;
+        CHECK(g().objects[mov.index].destroy_fn == nullptr);
+    }
+    // DMA/external imply pinned, so they may carry a callback.
+    pm::RawRef ext{};
+    CHECK_ST(pm::alloc(pool, 64, 8, pm::PM_EXTERNAL, 2, ext), pm::Status::Ok);
+    CHECK_ST(pm::set_destroy_fn(ext, &counting_destroy), pm::Status::Ok);
+
+    pm::RawRef pin{};
+    CHECK_ST(pm::alloc(pool, 64, 8, pm::PM_PINNED, 3, pin), pm::Status::Ok);
+    CHECK_ST(pm::set_destroy_fn(pin, &counting_destroy), pm::Status::Ok);
+
+    void const* addr_pin = resolve_void(pin);
+    g_destroy_calls = 0;
+    g_destroy_last = nullptr;
+    CHECK_ST(pm::free(pin), pm::Status::Ok);
+    CHECK(g_destroy_calls == 1);
+    CHECK(g_destroy_last == static_cast<uint8_t const*>(addr_pin));
+    CHECK_ST(pm::free(ext), pm::Status::Ok);
+    CHECK(g_destroy_calls == 2);
+    CHECK_ST(pm::free(mov), pm::Status::Ok);
+    CHECK(g_destroy_calls == 2); // movable object never had a callback
+
+    // A dead reference can no longer install one.
+    CHECK_ST(pm::set_destroy_fn(mov, &counting_destroy), pm::Status::InvalidRef);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R20) task-book v2 11.1 item 11: compact fault injection -- a damaged
+//       descriptor must abort the maintenance BEFORE any memmove and leave
+//       the pool Running with every payload intact.
+// ---------------------------------------------------------------------------
+static void test_compact_fault_injection() {
+    printf("  [R20] compact refuses damaged descriptors pre-move\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef m[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+        CHECK_ST(pm::alloc(pool, 512, 8, 0, i, m[i]), pm::Status::Ok);
+        fill(m[i], 512, 900 + i);
+    }
+    CHECK_ST(pm::free(m[1]), pm::Status::Ok); // a hole, so compact would move
+
+    using namespace pm::internal;
+    ObjectDesc& d = g().objects[m[2].index];
+    uint32_t const sb = d.block_size;
+    uint8_t* const sa = d.address;
+    uint32_t const ss = d.size;
+
+    auto refuse_and_stay_put = [&]() {
+        CHECK_ST(pm::compact(pool), pm::Status::CorruptMetadata);
+        CHECK(get_stats_state(pool) == 1); // Running again, nothing moved
+    };
+    auto surviving_payloads = [&]() {
+        verify(m[0], 512, 900);
+        verify(m[2], 512, 902);
+    };
+
+    d.address = sa + 4; // unaligned block start
+    refuse_and_stay_put();
+    d.address = sa;
+    surviving_payloads();
+
+    d.block_size = 4096; // overlaps the neighbouring block
+    refuse_and_stay_put();
+    d.block_size = sb;
+    surviving_payloads();
+
+    d.size = sb; // payload no longer fits its block
+    refuse_and_stay_put();
+    d.size = ss;
+    surviving_payloads();
+
+    d.block_size = PM_MIN_BLOCK - 8; // below the minimum block
+    refuse_and_stay_put();
+    d.block_size = sb;
+    surviving_payloads();
+
+    CHECK_ST(pm::validate(pool), pm::Status::Ok);
+    CHECK_ST(pm::compact(pool), pm::Status::Ok); // healthy again
+    surviving_payloads();
+    CHECK_ST(pm::free(m[0]), pm::Status::Ok);
+    CHECK_ST(pm::free(m[2]), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R21) task-book v2 11.1 item 12: every metadata domain is independently
+//       audited -- statistics, order links, bitmaps, physical headers and the
+//       prev_size chain each have to be caught on their own.
+// ---------------------------------------------------------------------------
+static void test_metadata_domain_corruption() {
+    printf("  [R21] per-domain metadata corruption detection\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef a{}, b{};
+    CHECK_ST(pm::alloc(pool, 256, 8, 0, 1, a), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 256, 8, 0, 2, b), pm::Status::Ok);
+    fill(a, 256, 3);
+    fill(b, 256, 4);
+
+    using namespace pm::internal;
+    Pool& P = g().pools[pool];
+    uint8_t* const blk_a = g().objects[a.index].address - BLOCK_HEADER_SIZE;
+    auto rd32 = [](void const* p) { uint32_t v; memcpy(&v, p, 4); return v; };
+    auto wr32 = [](void* p, uint32_t v) { memcpy(p, &v, 4); };
+
+    // (1) used_bytes
+    uint32_t const saved_used = P.used_bytes;
+    P.used_bytes += 8;
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    P.used_bytes = saved_used;
+    VALIDATE(pool);
+
+    // (2) free_bytes
+    uint32_t const saved_free = P.free_bytes;
+    P.free_bytes += 8;
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    P.free_bytes = saved_free;
+    VALIDATE(pool);
+
+    // (3) fragment_bytes
+    uint32_t const saved_frag = P.fragment_bytes;
+    P.fragment_bytes += 8;
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    P.fragment_bytes = saved_frag;
+    VALIDATE(pool);
+
+    // (4) live object count
+    uint32_t const saved_live = P.live_objects;
+    P.live_objects += 1;
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    P.live_objects = saved_live;
+    VALIDATE(pool);
+
+    // (5) address-order link hiding the second object
+    uint32_t const saved_next = g().objects[a.index].addr_next;
+    g().objects[a.index].addr_next = NO_ORDER;
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    g().objects[a.index].addr_next = saved_next;
+    VALIDATE(pool);
+
+    // (6) sl_bitmap bit with no list behind it
+    uint32_t ef = FL_COUNT, es = SL_COUNT;
+    for (uint32_t f = 0; f < FL_COUNT && ef == FL_COUNT; ++f)
+        for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+            if (P.bins.head[f][sl] == NULL_OFF) { ef = f; es = sl; break; }
+    CHECK(ef < FL_COUNT);
+    uint16_t const saved_sl = P.bins.sl_bitmap[ef];
+    P.bins.sl_bitmap[ef] = (uint16_t)(saved_sl | (1u << es));
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    P.bins.sl_bitmap[ef] = saved_sl;
+    VALIDATE(pool);
+
+    // (7) fl_bitmap bit with no level behind it
+    uint32_t const saved_fl = P.bins.fl_bitmap;
+    P.bins.fl_bitmap |= 1u << (FL_COUNT - 1);
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    P.bins.fl_bitmap = saved_fl;
+    VALIDATE(pool);
+
+    // (8) physical header of a live block disagreeing with its descriptor
+    uint32_t const saved_hdr = rd32(blk_a);
+    wr32(blk_a, saved_hdr + 8);
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    wr32(blk_a, saved_hdr);
+    VALIDATE(pool);
+
+    // (9) free-list head pushed outside the pool
+    uint32_t hf = FL_COUNT, hs = SL_COUNT;
+    for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
+        for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+            if (P.bins.head[f][sl] != NULL_OFF) { hf = f; hs = sl; break; }
+    CHECK(hf < FL_COUNT);
+    uint32_t const real_head = P.bins.head[hf][hs];
+    P.bins.head[hf][hs] = 0xFFFFFFF0u;
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    P.bins.head[hf][hs] = real_head;
+    VALIDATE(pool);
+
+    // (10) prev_size of the first block (must be 0 at the pool start)
+    uint32_t const saved_prev = rd32(blk_a + 4);
+    wr32(blk_a + 4, 24);
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    wr32(blk_a + 4, saved_prev);
+    VALIDATE(pool);
+
+    verify(a, 256, 3);
+    verify(b, 256, 4);
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    CHECK_ST(pm::free(b), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
 static void run(const char* name, void (*fn)()) {
     printf("[TEST] %s\n", name);
-    uint32_t f0 = g_fails;
+    uint32_t const f0 = g_fails;
     fn();
+    // cppcheck-suppress knownConditionTrueFalse ; fn() bumps g_fails through
+    // the CHECK macro, which cppcheck cannot follow across the call.
     if (g_fails == f0) printf("  PASS\n");
     else printf("  FAIL (%u new failed checks)\n", (unsigned)(g_fails - f0));
 }
@@ -1601,6 +2220,13 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R12_generation_epoch_combinations", test_generation_epoch_combinations);
     run("R13_split_crossing_order", test_split_crossing_order);
     run("R14_init_lifecycle", test_init_lifecycle);
+    run("R15_split_boundary_geometries", test_split_boundary_geometries);
+    run("R16_maintenance_state_matrix", test_maintenance_state_matrix);
+    run("R17_desc_block_consistency_rejected", test_desc_block_consistency_rejected);
+    run("R18_get_stats_bounded_on_corruption", test_get_stats_bounded_on_corruption);
+    run("R19_destroy_fn_semantics", test_destroy_fn_semantics);
+    run("R20_compact_fault_injection", test_compact_fault_injection);
+    run("R21_metadata_domain_corruption", test_metadata_domain_corruption);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

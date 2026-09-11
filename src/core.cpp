@@ -93,7 +93,7 @@ void bins_remove(TlsfBins& b, FreeBlock* blk) {
     blk->prev = blk->next = NULL_OFF;
 }
 
-FreeBlock* bins_find(TlsfBins& b, uint32_t need) {
+FreeBlock* bins_find(TlsfBins const& b, uint32_t need) {
     // Sizes beyond the representable FL range are refused by the caller; a
     // defensive check here keeps the search from wrapping into low bins.
     if (need >= (1u << PM_FL_MAX)) return nullptr;
@@ -117,6 +117,9 @@ FreeBlock* bins_find(TlsfBins& b, uint32_t need) {
             // (never wider than the bin itself) for a real fit.
             for (uint32_t off = b.head[fli][s]; off != NULL_OFF; off = ptr_of(off)->next) {
                 if (++hops > max_hops) return nullptr; // corrupt list guard
+                // Screen the offset before dereferencing (task-book v2 section
+                // 9.2): a damaged head/link must be refused, not followed.
+                if (!zone_off_readable(off)) return nullptr;
                 FreeBlock* cand = ptr_of(off);
                 if (blk_size_of(cand) >= need) return cand;
             }
@@ -152,9 +155,11 @@ Pool* pool_at(PoolId id) {
 }
 
 inline void bump_epoch(uint32_t& epoch) {
-    // Wrap-around guard: 0 is reserved (doc section 4). For uint32 epochs
-    // this only fires at 0xFFFFFFFF; cppcheck-style "always false" notes are
-    // wrong for the uint16 generation counterpart below.
+    // Wrap-around guard: 0 is reserved (doc section 4). Only reachable after
+    // 2^32 bumps; it is kept because the counter is a public diagnostic and
+    // a zero epoch would read as "no address change" to a caller.
+    // cppcheck-suppress knownConditionTrueFalse ; the wrap from 0xFFFFFFFF is
+    // real, cppcheck's value-range analysis cannot see the counter's history.
     if (++epoch == 0) epoch = 1;
 }
 
@@ -197,8 +202,13 @@ void slot_release(uint16_t s) {
     G.free_slot_head = s;
 }
 
-uint16_t next_generation(uint16_t gen) {
+// uint16 generation bump. 0xFFFF -> 0 would collide with the "invalid"
+// generation, so it is remapped to 1. This is a real wrap-around, not a
+// dead branch: a slot reused 65535 times reaches it.
+inline uint16_t next_generation(uint16_t gen) {
     uint16_t n = (uint16_t)(gen + 1); // wraps at 0xFFFF -> 0
+    // cppcheck-suppress knownConditionTrueFalse ; the wrap is real, cppcheck
+    // cannot prove the incoming value's range.
     return n == 0 ? 1 : n;            // 0 reserved as invalid (doc section 4)
 }
 
@@ -208,6 +218,19 @@ struct RefCheck {
     ObjectDesc* desc;
 };
 
+// Descriptor <-> block relationship, descriptor-only (no zone dereference so
+// it stays O(1) on every borrow/resolve). A descriptor that cannot describe a
+// real block means the metadata is corrupt: the address derived from it must
+// never be handed out (task-book v2 section 9.1 / 11.1 item 8).
+inline bool desc_block_consistent(ObjectDesc const& d) {
+    if (d.block_size < PM_MIN_BLOCK) return false;
+    if ((d.block_size & (PM_ALIGNMENT - 1)) != 0) return false;
+    if (d.size > d.block_size - BLOCK_HEADER_SIZE) return false;
+    if (d.size == 0) return false;
+    if (((uintptr_t)d.address & (PM_ALIGNMENT - 1)) != 0) return false;
+    return true;
+}
+
 Status check_ref(RawRef const& ref, uint32_t access_size, uint32_t access_align,
                  RefCheck& rc, bool require_running, void** out_addr) {
     GlobalState& G = g();
@@ -216,6 +239,7 @@ Status check_ref(RawRef const& ref, uint32_t access_size, uint32_t access_align,
     ObjectDesc& d = G.objects[ref.index];
     if (d.state != ObjState::Live) return Status::InvalidRef;
     if (d.generation != ref.generation) return Status::InvalidRef;
+    if (!desc_block_consistent(d)) return Status::CorruptMetadata;
     Pool* P = pool_at((PoolId)d.pool_id);
     if (!P) return Status::CorruptMetadata;
     if (ref.pool_hint != CROSS_HINT && ref.pool_hint != d.pool_id) return Status::PoolChanged;
@@ -230,6 +254,16 @@ Status check_ref(RawRef const& ref, uint32_t access_size, uint32_t access_align,
     rc.desc = &d;
     if (out_addr) *out_addr = addr;
     return Status::Ok;
+}
+
+// Maintenance entry contract (task-book v2 section 5.1). All three maintenance
+// operations accept a pool in Running OR Paused, so a caller may either pause
+// explicitly (doc section 8's quiescent window) or let the operation do it.
+// A pool already inside a maintenance state, or one with live borrows, is
+// refused. On a planning failure the entry state is restored, so a caller that
+// paused stays paused.
+inline bool pool_maintainable(Pool const& P) {
+    return P.state == PoolState::Running || P.state == PoolState::Paused;
 }
 
 // --- maintenance pre-check (task-book v2 section 8) --------------------------
@@ -266,9 +300,11 @@ Status precheck_pool(Pool const& P, PoolId pid, uint8_t const* start, uint8_t co
         if (d.size > d.block_size - BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
         uint64_t aabs = (uint64_t)(uintptr_t)d.address;
         if (aabs < zone_base + BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
+        if ((aabs & (PM_ALIGNMENT - 1)) != 0) return Status::CorruptMetadata;
         uint64_t aoff = aabs - zone_base;         // payload offset in zone
         uint64_t boff = aoff - BLOCK_HEADER_SIZE; // block start, zone offset
         if (boff < start_off || aoff + d.size > end_off) return Status::CorruptMetadata;
+        if (boff + d.block_size > end_off) return Status::CorruptMetadata;
         if (boff < prev_end) return Status::CorruptMetadata; // order + overlap
         // Physical header must already agree with the descriptor.
         uint32_t own = load32(G.zone + boff);
@@ -296,7 +332,7 @@ Status precheck_pool(Pool const& P, PoolId pid, uint8_t const* start, uint8_t co
 // placement, pinned barriers, alignment and range bounds. It only writes
 // already-validated metadata, so it cannot fail; the internal checks are
 // debug assertions. No maintenance op may move data and then report an error.
-void finalize_layout(Pool& P, uint8_t* start, uint8_t* end) {
+void finalize_layout(Pool& P, uint8_t* start, uint8_t const* end) {
     P.bins.reset();
     uint32_t capacity = (uint32_t)(end - start);
     uint8_t* prev_end = start;
@@ -304,7 +340,7 @@ void finalize_layout(Pool& P, uint8_t* start, uint8_t* end) {
     uint32_t used = 0, fragment = 0, count = 0;
 
     for (uint32_t idx = P.order_head; idx != NO_ORDER; idx = g().objects[idx].addr_next) {
-        ObjectDesc& d = g().objects[idx];
+        ObjectDesc const& d = g().objects[idx];
         uint8_t* bstart = d.address - BLOCK_HEADER_SIZE;
         uint32_t bsize = d.block_size;
         // Invariants guaranteed by planning; a violation here is a bug, not
@@ -344,6 +380,13 @@ void finalize_layout(Pool& P, uint8_t* start, uint8_t* end) {
         bins_insert(P.bins, fb);
     } else if (tail > 0) {
         fragment += tail;
+        // Poison the TAIL slack as well. free()'s forward merge tests the word
+        // at `block + block_size` for a free bit; when the last block is
+        // followed by tail slack that test would otherwise read stale bytes
+        // and could mistake them for a free block, corrupting the bins. The
+        // word was previously left untouched here, which made a freed
+        // last block able to "merge" with garbage.
+        store32(prev_end, 0);
     }
 
     P.used_bytes = used;
@@ -380,7 +423,7 @@ Status compact_impl(Pool& P) {
     if (st != Status::Ok) goto fail;
 
     for (uint32_t idx = P.order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
-        ObjectDesc& d = G.objects[idx];
+        ObjectDesc const& d = G.objects[idx];
         if (!(d.flags & PM_PINNED)) continue;
         if (d.address - BLOCK_HEADER_SIZE < start || d.address + d.size > end) {
             st = Status::CorruptMetadata;
@@ -393,7 +436,7 @@ Status compact_impl(Pool& P) {
         uint8_t* cursor = start;
         uint32_t bar = 0;
         for (uint32_t idx = P.order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
-            ObjectDesc& d = G.objects[idx];
+            ObjectDesc const& d = G.objects[idx];
             uint8_t* bstart = d.address - BLOCK_HEADER_SIZE;
             uint32_t bsize = d.block_size;
             if (d.flags & PM_PINNED) {
@@ -402,7 +445,7 @@ Status compact_impl(Pool& P) {
                 bar++;
                 continue;
             }
-            uint8_t* barrier = (bar < nbar) ? s_barriers[bar] : end;
+            uint8_t const* barrier = (bar < nbar) ? s_barriers[bar] : end;
             if (cursor + bsize > barrier) {
                 st = (bar < nbar) ? Status::PinnedConflict : Status::NoSpace;
                 goto fail;
@@ -496,6 +539,12 @@ Status init(Config const& cfg) {
     if (seg_count == 0) return Status::NoSpace;
     // Overflow check on the rounded zone size (task-book v2 section 6.1).
     if (seg_count > UINT32_MAX / cfg.segment_size) return Status::NoSpace;
+    // FL ceiling (task-book v2 section 7.2). A single pool may own the whole
+    // zone, so the largest block the bins could ever see is the rounded zone
+    // size. fl_index() saturates at PM_FL_MAX-1, so a zone at or above
+    // 2^PM_FL_MAX would be clamped into the top bin and corrupt the bin
+    // accounting. Refuse the configuration instead of degrading silently.
+    if (seg_count * cfg.segment_size >= (1u << PM_FL_MAX)) return Status::NoSpace;
 
     // All checks passed: only now may global state be (re)initialized.
     memset(&G, 0, sizeof(G));
@@ -524,7 +573,7 @@ Status deinit() {
 }
 
 GlobalStats global_stats() {
-    GlobalState& G = g();
+    GlobalState const& G = g();
     GlobalStats s{};
     s.max_live_objects = G.max_live_objects;
     s.max_borrow_count = G.max_borrow_count;
@@ -624,7 +673,7 @@ Status resume(PoolId id) {
 
 PoolStats get_stats(PoolId id) {
     PoolStats s{};
-    Pool* P = pool_at(id);
+    Pool const* P = pool_at(id);
     if (!P) return s;
     s.state = (uint8_t)P->state;
     s.segment_first = P->segment_first;
@@ -640,20 +689,31 @@ PoolStats get_stats(PoolId id) {
     s.compact_time_us = P->compact_time_us;
     uint32_t largest = 0;
     // Bounded walk: get_stats must terminate on a corrupted free list
-    // (task-book v2 section 9.2) instead of looping forever.
-    const uint32_t max_steps =
-        (g().segment_size ? g().segment_size : 1) * PM_MAX_SEGMENTS / PM_MIN_BLOCK + 1;
+    // (task-book v2 section 9.2) instead of looping forever, and it must
+    // refuse out-of-range cursors instead of dereferencing them. No bin can
+    // hold more blocks than the pool has room for at minimum block size.
+    const uint64_t zbase = (uint64_t)(uintptr_t)g().zone;
+    const uint64_t start_off = (uint64_t)(uintptr_t)pool_start(*P) - zbase;
+    const uint64_t end_off = start_off + pool_capacity(*P);
+    const uint32_t max_steps = pool_capacity(*P) / PM_MIN_BLOCK + 1;
     for (uint32_t f = 0; f < FL_COUNT; ++f)
-        for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
-            for (uint32_t off = P->bins.head[f][sl], steps = 0; off != NULL_OFF;) {
-                if (++steps > max_steps) {
+        for (uint32_t sl = 0; sl < SL_COUNT; ++sl) {
+            uint32_t off = P->bins.head[f][sl];
+            for (uint32_t steps = 0; off != NULL_OFF; ++steps) {
+                if (steps > max_steps) {
                     s.largest_free_block = 0;
-                    return s; // corrupted; refuse to report
+                    return s; // cyclic list; refuse to report
                 }
-                FreeBlock* b = ptr_of(off);
+                if ((uint64_t)off < start_off ||
+                    (uint64_t)off + BLOCK_HEADER_SIZE > end_off) {
+                    s.largest_free_block = 0;
+                    return s; // cursor outside the pool
+                }
+                FreeBlock const* b = ptr_of(off);
                 if (blk_size_of(b) > largest) largest = blk_size_of(b);
                 off = b->next;
             }
+        }
     s.largest_free_block = largest;
     return s;
 }
@@ -901,7 +961,7 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align, v
 // Compaction (doc section 8)
 // ---------------------------------------------------------------------------
 Status compact(PoolId id) {
-    GlobalState& G = g();
+    GlobalState const& G = g();
     Pool* P = pool_at(id);
     if (!G.initialized || !P) return Status::InvalidPool;
     // Decide the whole state transition under the same lock borrow_begin
@@ -909,12 +969,15 @@ Status compact(PoolId id) {
     // lock during the quiescent window.
     PM_LOCK();
     Status st;
+    bool was_paused = false;
     if (P->state == PoolState::Compacting || P->state == PoolState::Merging ||
         P->state == PoolState::Splitting) {
         st = Status::Busy;
     } else {
         // Doc section 8: pause first, then check borrows. A refused compact
-        // leaves the pool Paused; the caller resumes explicitly.
+        // leaves the pool Paused; the caller resumes explicitly. A pool that
+        // arrives already Paused takes the same path (pool_maintainable).
+        was_paused = (P->state == PoolState::Paused);
         if (P->state == PoolState::Running) P->state = PoolState::Paused;
         if (P->state != PoolState::Paused) st = Status::Busy;
         else if (P->borrow_count != 0) st = Status::Busy;
@@ -922,7 +985,15 @@ Status compact(PoolId id) {
     }
     PM_UNLOCK();
     if (st != Status::Ok) return st;
-    return compact_impl(*P);
+    Status r = compact_impl(*P);
+    if (r != Status::Ok && was_paused) {
+        // Planning failed and the caller had paused the pool: leave it paused
+        // rather than silently putting it back into service.
+        PM_LOCK();
+        P->state = PoolState::Paused;
+        PM_UNLOCK();
+    }
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -939,16 +1010,18 @@ Status merge(PoolId source_id, PoolId target_id) {
     // and the Merging state (task-book v2 section 5). Planning here is the
     // adjacency check itself; the heavy work runs unlocked inside the
     // quiescent window, and the final commit locks again.
-    Pool* S = pool_at(source_id);
-    Pool* T = pool_at(target_id);
-    bool source_above, source_below;
+    if (source_id == target_id) return Status::InvalidPool;
+    Pool* S;
+    Pool* T;
+    bool source_below;
+    bool s_paused;
+    bool t_paused;
     {
         PM_LOCK();
-        if (source_id == target_id) { PM_UNLOCK(); return Status::InvalidPool; }
         S = pool_at(source_id);
         T = pool_at(target_id);
         if (!S || !T) { PM_UNLOCK(); return Status::InvalidPool; }
-        if (S->state != PoolState::Running || T->state != PoolState::Running) {
+        if (!pool_maintainable(*S) || !pool_maintainable(*T)) {
             PM_UNLOCK();
             return Status::Busy;
         }
@@ -956,7 +1029,9 @@ Status merge(PoolId source_id, PoolId target_id) {
             PM_UNLOCK();
             return Status::Busy;
         }
-        source_above = (S->segment_first == (uint32_t)T->segment_first + T->segment_count);
+        s_paused = (S->state == PoolState::Paused);
+        t_paused = (T->state == PoolState::Paused);
+        bool source_above = (S->segment_first == (uint32_t)T->segment_first + T->segment_count);
         source_below = (T->segment_first == (uint32_t)S->segment_first + S->segment_count);
         if (!source_above && !source_below) { PM_UNLOCK(); return Status::NoSpace; }
         S->state = PoolState::Merging;
@@ -997,9 +1072,11 @@ Status merge(PoolId source_id, PoolId target_id) {
     // defensive branch below stays for Debug assertion coverage.
     Status st = compact_impl(*T);
     if (st != Status::Ok) {
+        // Planning failed before any move: hand both pools back in the state
+        // the caller left them in.
         PM_LOCK();
-        S->state = PoolState::Paused;
-        T->state = PoolState::Paused;
+        S->state = s_paused ? PoolState::Paused : PoolState::Running;
+        T->state = t_paused ? PoolState::Paused : PoolState::Running;
         PM_UNLOCK();
         return st;
     }
@@ -1027,17 +1104,20 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
 
     // Arming under the borrow lock (task-book v2 section 5): state, borrow
     // count, segment math and pool-table capacity are all checked before the
-    // pool leaves Running.
+    // pool leaves Running. A Paused source is accepted (see pool_maintainable)
+    // and remembered so a failed split restores it.
+    bool was_paused;
     {
         PM_LOCK();
         Pool* Sc = pool_at(source_id);
         if (!Sc) { PM_UNLOCK(); return Status::InvalidPool; }
-        if (Sc->state != PoolState::Running) { PM_UNLOCK(); return Status::Busy; }
+        if (!pool_maintainable(*Sc)) { PM_UNLOCK(); return Status::Busy; }
         if (Sc->borrow_count != 0) { PM_UNLOCK(); return Status::Busy; }
         if (new_pool_segments == 0 || new_pool_segments >= Sc->segment_count) {
             PM_UNLOCK();
             return Status::NoSpace;
         }
+        was_paused = (Sc->state == PoolState::Paused);
         Sc->state = PoolState::Splitting;
         PM_UNLOCK();
     }
@@ -1047,7 +1127,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
         if (G.pools[i].state == PoolState::Empty) { nid = (PoolId)i; break; }
     if (nid == PM_MAX_POOLS) {
         PM_LOCK();
-        S->state = PoolState::Running;
+        S->state = was_paused ? PoolState::Paused : PoolState::Running;
         PM_UNLOCK();
         return Status::NoSpace;
     }
@@ -1066,7 +1146,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
 
     // Collect pinned barriers (address order).
     for (uint32_t idx = S->order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
-        ObjectDesc& d = G.objects[idx];
+        ObjectDesc const& d = G.objects[idx];
         if (!(d.flags & PM_PINNED)) continue;
         s_barriers[nbar++] = d.address - BLOCK_HEADER_SIZE;
     }
@@ -1077,7 +1157,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
         uint8_t* up_cursor = boundary;
         uint32_t bar = 0;
         for (uint32_t idx = S->order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
-            ObjectDesc& d = G.objects[idx];
+            ObjectDesc const& d = G.objects[idx];
             uint8_t* bstart = d.address - BLOCK_HEADER_SIZE;
             uint32_t bsize = d.block_size;
             bool upper = (bstart >= boundary) || (bstart + bsize > boundary); // crossing or above
@@ -1086,7 +1166,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
                     st = Status::PinnedConflict;
                     goto fail_restore;
                 }
-                uint8_t* cur = upper ? up_cursor : low_cursor;
+                uint8_t const* cur = upper ? up_cursor : low_cursor;
                 if (cur > bstart) { st = Status::PinnedConflict; goto fail_restore; }
                 if (upper) up_cursor = bstart + bsize;
                 else low_cursor = bstart + bsize;
@@ -1096,7 +1176,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
             if (!upper) {
                 // Pack toward the pool start; never cross the boundary or a
                 // pinned barrier below it.
-                uint8_t* barrier = boundary;
+                uint8_t const* barrier = boundary;
                 if (bar < nbar && s_barriers[bar] < boundary) barrier = s_barriers[bar];
                 if (low_cursor + bsize > barrier) {
                     st = (bar < nbar && s_barriers[bar] < boundary) ? Status::PinnedConflict
@@ -1111,7 +1191,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
             } else {
                 // Pack from the boundary upward; barriers are pinned objects
                 // above the boundary and the pool end.
-                uint8_t* barrier = (bar < nbar) ? s_barriers[bar] : end;
+                uint8_t const* barrier = (bar < nbar) ? s_barriers[bar] : end;
                 if (up_cursor + bsize > barrier) {
                     st = (bar < nbar) ? Status::PinnedConflict : Status::NoSpace;
                     goto fail_restore;
@@ -1220,39 +1300,72 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
     }
 
 fail_restore:
-    // Plan failure: nothing was moved; restore the original state.
+    // Plan failure: nothing was moved; restore the entry state (a caller that
+    // paused the source stays paused).
     PM_LOCK();
-    S->state = PoolState::Running;
+    S->state = was_paused ? PoolState::Paused : PoolState::Running;
     PM_UNLOCK();
     return st;
 }
 
 // ---------------------------------------------------------------------------
-// Validation (doc section 15, task-book section 6).
-// Every linked walk is step-limited so corrupted (cyclic) metadata returns
-// CorruptMetadata in bounded time instead of hanging. The checker never
-// assumes the lists are well-formed.
+// Validation (doc section 15, task-book section 6, v2 section 9).
+//
+// Every walk is step-limited so corrupted (cyclic) metadata returns
+// CorruptMetadata in bounded time instead of hanging, and every range is
+// checked as a uint64 ZONE OFFSET before a pointer is formed -- a corrupted
+// pointer field must never reach pointer arithmetic, which would be undefined
+// behaviour rather than a clean rejection (task-book v2 section 9.1).
+//
+// Three independent audits, all rooted at the pool's address-ordered live
+// list (the only trusted ordering):
+//   1) live list: descriptor/block agreement, alignment, bounds and the
+//      prev_size chain;
+//   2) bins: free-list structure, bitmap agreement, bounds, prev_size chain;
+//   3) coverage over the UNION of live and free blocks: no overlaps, and every
+//      uncovered byte run must be shorter than PM_MIN_BLOCK (a longer run
+//      would have to be a binned free block). Together with the byte sum
+//      `live + binned_free + gaps == capacity` this proves the pool has no
+//      hidden hole and no double-counted region -- a tampered statistic cannot
+//      mask either (v2 section 9.3).
+//
+// The gap invariant deserves a note, because the naive "every free block
+// exactly fills an inter-live gap" formulation is WRONG: free() merges only
+// physically adjacent free blocks, so a sub-minimal slack run survives between
+// a freed block and its former neighbour, producing two free blocks separated
+// by slack. What always holds is the weaker, checkable statement above.
 // ---------------------------------------------------------------------------
 Status validate(PoolId id) {
-    GlobalState& G = g();
+    GlobalState const& G = g();
     if (!G.initialized) return Status::CorruptMetadata;
-    Pool* P = pool_at(id);
+    Pool const* P = pool_at(id);
     if (!P) return Status::InvalidPool;
-    uint8_t* start = pool_start(*P);
-    uint8_t* end = pool_end(*P);
-    uint32_t capacity = (uint32_t)(end - start);
+
+    const uint64_t zbase = (uint64_t)(uintptr_t)G.zone;
+    const uint32_t capacity = pool_capacity(*P);
+    const uint64_t start_off = (uint64_t)(uintptr_t)pool_start(*P) - zbase;
+    const uint64_t end_off = start_off + capacity;
     const uint32_t max_order_steps = PM_MAX_OBJECTS + 1;
     const uint32_t max_free_steps = capacity / PM_MIN_BLOCK + 1;
 
+    // [off, off+len) lies inside the pool byte range. len is added in 64-bit
+    // so a hostile offset cannot wrap.
+    auto in_pool = [&](uint64_t off, uint64_t len) -> bool {
+        return off >= start_off && off <= end_off && len <= end_off - off;
+    };
+    // A block header can be read at `off`.
+    auto head_ok = [&](uint64_t off) -> bool { return in_pool(off, BLOCK_HEADER_SIZE); };
+
     // prev_size chain: a block's prev_size must match the physical
     // predecessor's own size, or be 0 (pool start / poisoned slack).
-    auto check_prev = [&](uint8_t* bstart) -> Status {
-        uint32_t psize = load32(bstart + 4);
+    // `boff` must already have passed head_ok().
+    auto check_prev = [&](uint64_t boff) -> Status {
+        uint32_t psize = load32(G.zone + boff + 4);
         if (psize == 0) return Status::Ok;
-        if (psize > (uint32_t)(bstart - start) || psize < PM_MIN_BLOCK)
+        if (psize < PM_MIN_BLOCK || (uint64_t)psize > boff - start_off)
             return Status::CorruptMetadata;
-        uint8_t* prevb = bstart - psize;
-        if (blk_size_of(prevb) != psize) return Status::CorruptMetadata;
+        uint64_t poff = boff - psize;
+        if (blk_size_of(G.zone + poff) != psize) return Status::CorruptMetadata;
         return Status::Ok;
     };
 
@@ -1260,22 +1373,28 @@ Status validate(PoolId id) {
     //    increasing non-overlapping blocks, header and prev_size agreement.
     uint32_t count = 0, used = 0;
     uint32_t prev_idx = NO_ORDER;
-    uint8_t* prev_end = nullptr;
+    uint64_t prev_end = start_off;
     for (uint32_t idx = P->order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
         if (++count > max_order_steps) return Status::CorruptMetadata;
         if (idx >= PM_MAX_OBJECTS) return Status::CorruptMetadata;
-        ObjectDesc& d = G.objects[idx];
+        ObjectDesc const& d = G.objects[idx];
         if (d.state != ObjState::Live || d.pool_id != id || d.generation == 0)
             return Status::CorruptMetadata;
         if (d.addr_prev != prev_idx) return Status::CorruptMetadata;
-        uint8_t* bstart = d.address - BLOCK_HEADER_SIZE;
-        if (bstart < start || d.address + d.size > end) return Status::CorruptMetadata;
-        if (((uintptr_t)d.address & (PM_ALIGNMENT - 1)) != 0) return Status::CorruptMetadata;
-        if (prev_end && bstart < prev_end) return Status::CorruptMetadata; // order/overlap
-        if (blk_is_free(bstart) || blk_size_of(bstart) != d.block_size)
+        if (!desc_block_consistent(d)) return Status::CorruptMetadata;
+
+        uint64_t aabs = (uint64_t)(uintptr_t)d.address;
+        if (aabs < zbase + BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
+        uint64_t aoff = aabs - zbase;
+        uint64_t boff = aoff - BLOCK_HEADER_SIZE;
+        if (!in_pool(boff, d.block_size) || !in_pool(aoff, d.size))
+            return Status::CorruptMetadata;
+        if (boff < prev_end) return Status::CorruptMetadata; // order/overlap
+
+        if (blk_is_free(G.zone + boff) || blk_size_of(G.zone + boff) != d.block_size)
             return Status::CorruptMetadata; // used block header must agree
-        if (check_prev(bstart) != Status::Ok) return Status::CorruptMetadata;
-        prev_end = bstart + d.block_size;
+        if (check_prev(boff) != Status::Ok) return Status::CorruptMetadata;
+        prev_end = boff + d.block_size;
         used += d.block_size;
         prev_idx = idx;
     }
@@ -1285,10 +1404,10 @@ Status validate(PoolId id) {
     if (P->free_bytes != capacity - used) return Status::CorruptMetadata;
 
     // 2) bins: non-empty list <=> bitmap bit; bounded walks; every free block
-    //    sane, linked consistently, chained to its physical predecessor, and
-    //    not overlapping any live block. The size total must reconcile with
-    //    the pool's byte accounting: a duplicated or missing free block (e.g.
-    //    the same block inserted into two bins) breaks the total.
+    //    sane, linked consistently and chained to its physical predecessor.
+    //    The size total must reconcile with the pool's byte accounting: a
+    //    duplicated or missing free block (e.g. the same block inserted into
+    //    two bins) breaks the total.
     uint64_t free_total = 0;
     for (uint32_t f = 0; f < FL_COUNT; ++f) {
         for (uint32_t sl = 0; sl < SL_COUNT; ++sl) {
@@ -1299,29 +1418,111 @@ Status validate(PoolId id) {
             uint32_t steps = 0;
             for (; off != NULL_OFF; off = ptr_of(off)->next) {
                 if (++steps > max_free_steps) return Status::CorruptMetadata;
+                // The cursor must be a readable block start before it is
+                // dereferenced (v2 section 9.2); `off` is the ONLY value in
+                // this loop that comes from untrusted metadata.
+                if (!head_ok(off)) return Status::CorruptMetadata;
                 FreeBlock* b = ptr_of(off);
-                uint8_t* baddr = reinterpret_cast<uint8_t*>(b);
-                if (baddr < start || baddr + blk_size_of(b) > end) return Status::CorruptMetadata;
-                if (blk_size_of(b) < PM_MIN_BLOCK) return Status::CorruptMetadata;
-                if (!blk_is_free(baddr)) return Status::CorruptMetadata;
-                if (fl_index(blk_size_of(b)) - MIN_FL != f ||
-                    sl_index(blk_size_of(b), fl_index(blk_size_of(b))) != sl)
+                uint32_t bsize = blk_size_of(b);
+                if (bsize < PM_MIN_BLOCK || (bsize & (PM_ALIGNMENT - 1)) != 0)
                     return Status::CorruptMetadata;
-                if (b->next != NULL_OFF && ptr_of(b->next)->prev != off)
+                if (!in_pool(off, bsize)) return Status::CorruptMetadata;
+                if (!blk_is_free(b)) return Status::CorruptMetadata;
+                if (fl_index(bsize) - MIN_FL != f ||
+                    sl_index(bsize, fl_index(bsize)) != sl)
                     return Status::CorruptMetadata;
-                if (check_prev(baddr) != Status::Ok) return Status::CorruptMetadata;
-                free_total += blk_size_of(b);
-                uint8_t* fend = baddr + blk_size_of(b);
-                for (uint32_t idx = P->order_head; idx != NO_ORDER;
-                     idx = G.objects[idx].addr_next) {
-                    ObjectDesc& d = G.objects[idx];
-                    uint8_t* ls = d.address - BLOCK_HEADER_SIZE;
-                    if (ls < fend && baddr < ls + d.block_size)
-                        return Status::CorruptMetadata;
+                // Neighbour links must point at readable block starts too.
+                if (b->next != NULL_OFF) {
+                    if (!head_ok(b->next)) return Status::CorruptMetadata;
+                    if (ptr_of(b->next)->prev != off) return Status::CorruptMetadata;
                 }
+                if (b->prev != NULL_OFF) {
+                    if (!head_ok(b->prev)) return Status::CorruptMetadata;
+                    if (ptr_of(b->prev)->next != off) return Status::CorruptMetadata;
+                }
+                if (check_prev(off) != Status::Ok) return Status::CorruptMetadata;
+                free_total += bsize;
             }
         }
     }
+
+    // Enumerate the binned free blocks. Safe to dereference: phase 2 proved
+    // every list node readable and inside the pool.
+    auto for_each_free = [&](auto&& fn) {
+        for (uint32_t f = 0; f < FL_COUNT; ++f)
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+                for (uint32_t o = P->bins.head[f][sl]; o != NULL_OFF;
+                     o = ptr_of(o)->next)
+                    fn((uint64_t)o, (uint64_t)blk_size_of(ptr_of(o)));
+    };
+
+    // 3) Coverage audit over the union. For a block starting at `s`, `prev` is
+    //    the highest end address among all blocks that end at or before `s`,
+    //    i.e. the byte before the gap that precedes it. `overlap` reports a
+    //    block straddling `s`, which would make that value meaningless.
+    auto gap_before = [&](uint64_t s, bool& overlap) -> uint64_t {
+        uint64_t prev = start_off;
+        for (uint32_t idx = P->order_head; idx != NO_ORDER;
+             idx = G.objects[idx].addr_next) {
+            ObjectDesc const& d = G.objects[idx];
+            uint64_t ls = ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
+            uint64_t le = ls + d.block_size;
+            if (ls < s && le > s) {
+                overlap = true;
+                return prev;
+            }
+            if (le <= s && le > prev) prev = le;
+        }
+        for_each_free([&](uint64_t f0, uint64_t bsize) {
+            uint64_t fe = f0 + bsize;
+            if (f0 < s && fe > s) overlap = true;
+            else if (fe <= s && fe > prev) prev = fe;
+        });
+        return prev;
+    };
+
+    uint64_t slack = 0, max_end = start_off;
+    auto audit_block = [&](uint64_t s, uint64_t e) -> Status {
+        bool overlap = false;
+        uint64_t prev = gap_before(s, overlap);
+        if (overlap) return Status::CorruptMetadata;
+        if (s < prev) return Status::CorruptMetadata; // defensive
+        uint64_t gap = s - prev;
+        if (gap >= PM_MIN_BLOCK) return Status::CorruptMetadata; // hole
+        slack += gap;
+        if (e > max_end) max_end = e;
+        return Status::Ok;
+    };
+
+    for (uint32_t idx = P->order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
+        ObjectDesc const& d = G.objects[idx];
+        uint64_t ls = ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
+        if (audit_block(ls, ls + d.block_size) != Status::Ok)
+            return Status::CorruptMetadata;
+    }
+    Status st = Status::Ok;
+    for_each_free([&](uint64_t f0, uint64_t bsize) {
+        if (st != Status::Ok) return;
+        // Two distinct free blocks may never start at the same address: an
+        // exact duplicate would otherwise slip through as a zero-length gap.
+        uint32_t same_start = 0;
+        for_each_free([&](uint64_t g0, uint64_t) { if (g0 == f0) ++same_start; });
+        if (same_start != 1) {
+            st = Status::CorruptMetadata;
+            return;
+        }
+        st = audit_block(f0, f0 + bsize);
+    });
+    if (st != Status::Ok) return st;
+    // Tail: whatever follows the last block must also be sub-minimal slack.
+    if (end_off - max_end >= PM_MIN_BLOCK) return Status::CorruptMetadata;
+    slack += end_off - max_end;
+
+    // Whole-pool reconciliation: live bytes + binned free bytes + slack must
+    // be exactly the capacity. `used` comes from the live descriptors and
+    // `free_bytes` from the live walk, so tampering with either statistic, the
+    // bitmap or a block header breaks this identity.
+    if (used + free_total + slack != (uint64_t)capacity) return Status::CorruptMetadata;
     if (free_total != (uint64_t)P->free_bytes - (uint64_t)P->fragment_bytes)
         return Status::CorruptMetadata;
 

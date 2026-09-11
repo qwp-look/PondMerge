@@ -135,10 +135,16 @@ PoolStats get_stats(PoolId pool);
 Status validate(PoolId pool);
 
 // --- objects ----------------------------------------------------------------
+// alloc: first-fit inside the bin the TLSF bitmap selects, so it is
+// O(bin chain length) -- see the complexity note in the maintenance section.
+// Requests at or above 2^PM_FL_MAX are refused with NoSpace rather than being
+// clamped into the top bin.
 Status alloc(PoolId pool, uint32_t size, uint32_t alignment, uint16_t flags,
              uint32_t user_tag, RawRef& out);
 Status free(RawRef const& ref);
-// Sets destroy_fn for a live object (used for pinned non-trivial types).
+// Sets destroy_fn for a live object. Pinned objects only: a movable object
+// would have its destructor run at a moved address after a byte-wise memmove,
+// so movable refs are refused with NotRelocatable (task-book v2 section 10).
 Status set_destroy_fn(RawRef const& ref, void (*destroy_fn)(void*));
 
 // --- borrow accounting ------------------------------------------------------
@@ -153,11 +159,36 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align,
                void*& out_addr);
 
 // --- maintenance (doc sections 8, 10, 11) -----------------------------------
+//
+// MAINTAINABILITY CONTRACT (task-book v2 section 5.1). All three operations
+// take the same entry states and follow the same rules, so a caller may either
+// open a quiescent window explicitly (pause -> operate -> resume) or just call
+// the operation:
+//
+//   entry state    Running or Paused both accepted. A pool already inside
+//                  Compacting/Merging/Splitting is refused with Busy.
+//   borrows        any non-zero borrow counter -> Busy, before anything moves.
+//                  The library cannot see DMA/ISR/other-thread holders; the
+//                  caller must stop those first.
+//   plan failure   the ENTRY state is restored and nothing was moved. The one
+//                  exception is compact()'s borrow refusal: doc section 8 makes
+//                  compact enter Paused before checking borrows, so a refused
+//                  compact leaves the pool Paused for the caller to resume().
+//   success        the resulting pool(s) end up Running (merge: the target is
+//                  Running and the source becomes Empty).
+//
+// COMPLEXITY (task-book v2 section 7.3; worst case, not amortised). alloc is
+// NOT O(1): the TLSF bitmap locates a bin, and several block sizes share one
+// SL bin, so the allocator walks that bin for a first fit. The honest bounds
+// are: alloc O(bin chain length), upper bound O(zone_size / PM_MIN_BLOCK);
+// free O(1); pause/resume O(1); compact/merge/split O(objects + moved bytes);
+// validate O((live + free)^2); get_stats O(free_blocks) with a step cap.
 Status compact(PoolId pool);
 Status merge(PoolId source, PoolId target);
 // Splits `source` after `new_pool_segments` segments; the new pool owns the
 // upper range. Crossing movable objects are relocated; crossing pinned objects
-// fail with PinnedConflict before anything changes.
+// fail with PinnedConflict before anything changes. A side that cannot hold
+// its objects fails with NoSpace, also before anything changes.
 Status split(PoolId source, uint32_t new_pool_segments, PoolId& out_new);
 
 // Debug hook used by PM_ASSERT.
@@ -203,7 +234,13 @@ public:
     ~pm_access() {
         if (ptr_) borrow_end(ref_);
     }
+    // PM_ASSERT documents the contract: a null access only exists inside a
+    // failed Result (see the default constructor above), and dereferencing one
+    // is a programming error. In Release the assert compiles out, so the null
+    // dereference is deliberate, not redundant.
+    // cppcheck-suppress nullPointerRedundantCheck
     T* operator->() const { PM_ASSERT(ptr_); return ptr_; }
+    // cppcheck-suppress nullPointerRedundantCheck
     T& operator*()  const { PM_ASSERT(ptr_); return *ptr_; }
     T* get()        const { return ptr_; }
 };
