@@ -118,7 +118,10 @@ void borrower_task(void* arg) {
         } else {
             note_status_bad(st, is_a ? "borrower A" : "borrower B");
         }
+        // Yield to the co-resident maintainer, and once in a while block a
+        // tick so the IDLE task (task watchdog) gets CPU as well.
         if ((++iters & 63) == 0) taskYIELD();
+        if ((iters & 511) == 0) vTaskDelay(1);
     }
     if (is_a) c.a_done = true;
     else c.b_done = true;
@@ -174,12 +177,21 @@ int pondmerge_run_concurrency_tests(void) {
 
     TaskHandle_t ha = nullptr, hb = nullptr, hm = nullptr;
     // A and the maintainer share core 0 (they must timeshare), B pins core 1.
+    // All three are created at app_main's OWN priority first: the first task
+    // created at a higher priority would preempt app_main immediately and the
+    // remaining xTaskCreate calls would never run (observed on device as an
+    // eternal pm_borrow_a with IDLE1 on core 1 and no verdict). Only after
+    // all three exist are they raised to their stress priority.
+    const UBaseType_t stress_prio = 5;
     CCHECK(xTaskCreatePinnedToCore(borrower_task, "pm_borrow_a", 3072,
-                                   (void*)1, 5, &ha, 0) == pdPASS);
+                                   (void*)1, 1, &ha, 0) == pdPASS);
     CCHECK(xTaskCreatePinnedToCore(maintainer_task, "pm_maint", 3072,
-                                   nullptr, 5, &hm, 0) == pdPASS);
+                                   nullptr, 1, &hm, 0) == pdPASS);
     CCHECK(xTaskCreatePinnedToCore(borrower_task, "pm_borrow_b", 3072,
-                                   nullptr, 5, &hb, 1) == pdPASS);
+                                   nullptr, 1, &hb, 1) == pdPASS);
+    vTaskPrioritySet(ha, stress_prio);
+    vTaskPrioritySet(hm, stress_prio);
+    vTaskPrioritySet(hb, stress_prio);
 
     // The maintainer stops after 200 rounds; wait (bounded) for both
     // borrowers to observe the stop flag and exit.

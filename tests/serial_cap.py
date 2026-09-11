@@ -71,7 +71,10 @@ discard = drain(1.5)
 # 2) the boot we record
 reset()
 
-# 3) capture until the suite reports its verdict
+# 3) capture until the app reports its FINAL verdict. Since the round-3
+#    firmware runs the dual-core concurrency test AFTER the main suite, the
+#    last verdict line is the concurrency one; the suite verdict appears
+#    earlier and must not stop the capture.
 buf = b""
 t0 = time.time()
 while time.time() - t0 < seconds:
@@ -80,7 +83,7 @@ while time.time() - t0 < seconds:
         buf += chunk
         sys.stdout.write(chunk.decode("utf-8", "replace"))
         sys.stdout.flush()
-        if b"=== suite PASSED" in buf or b"=== suite FAILED" in buf:
+        if b"=== concurrency PASSED" in buf or b"=== concurrency FAILED" in buf:
             break
 time.sleep(0.3)
 s.close()
@@ -89,6 +92,7 @@ sys.stdout.write(
     "\n[serial_cap] %u bytes captured in %.1fs (%u bytes discarded before reset)\n"
     % (len(buf), time.time() - t0, discard)
 )
-if b"=== suite PASSED" not in buf and b"=== suite FAILED" not in buf:
-    sys.stdout.write("[serial_cap] WARNING: no suite verdict found in the capture\n")
+if b"=== concurrency PASSED" not in buf and b"=== concurrency FAILED" not in buf:
+    sys.stdout.write(
+        "[serial_cap] WARNING: no concurrency verdict found in the capture\n")
     sys.exit(1)
