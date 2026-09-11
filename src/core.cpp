@@ -172,11 +172,22 @@ void order_unlink(Pool& P, uint32_t idx) {
     D.addr_prev = D.addr_next = NO_ORDER;
 }
 
-void order_insert_sorted(Pool& P, uint32_t idx) {
+// Bounded address-order insertion (round-4 task book section 7: validate's
+// cycle guard cannot substitute alloc's own). Returns false when the walk
+// trips the step cap -- the list is cyclic/corrupted and NOTHING has been
+// linked yet, so the caller can fail without undoing link changes. On a
+// healthy list the walk length is bounded by the live-object count, which
+// is part of alloc's documented O(bin chain + live objects) bound.
+bool order_insert_sorted(Pool& P, uint32_t idx) {
     ObjectDesc* D = g().objects;
     uint32_t cur = P.order_head;
     uint32_t prev = NO_ORDER;
+    uint32_t steps = 0;
     while (cur != NO_ORDER && D[cur].address < D[idx].address) {
+        if (++steps > PM_MAX_OBJECTS + 1) {
+            D[idx].addr_prev = D[idx].addr_next = NO_ORDER;
+            return false; // cyclic order list: refuse, nothing linked
+        }
         prev = cur;
         cur = D[cur].addr_next;
     }
@@ -185,6 +196,7 @@ void order_insert_sorted(Pool& P, uint32_t idx) {
     if (prev != NO_ORDER) D[prev].addr_next = idx;
     else P.order_head = idx;
     if (cur != NO_ORDER) D[cur].addr_prev = idx;
+    return true;
 }
 
 // --- descriptor slots --------------------------------------------------------
@@ -504,7 +516,13 @@ void finalize_layout(Pool& P, uint8_t* start, uint8_t const* end) {
     uint32_t prev_own = 0; // predecessor's own size, 0 = none/slack
     uint32_t used = 0, fragment = 0, count = 0;
 
+    uint32_t steps = 0;
     for (uint32_t idx = P.order_head; idx != NO_ORDER; idx = g().objects[idx].addr_next) {
+        // The list was audited (precheck) or rebuilt from the plan arrays
+        // before this EXECUTION-phase walk, so the cap cannot trip in healthy
+        // operation; it is a debug guard over an impossibility, not an error
+        // path (plan A has no failure branch here).
+        PM_ASSERT(++steps <= PM_MAX_OBJECTS + 1);
         ObjectDesc const& d = g().objects[idx];
         uint8_t* bstart = d.address - BLOCK_HEADER_SIZE;
         uint32_t bsize = d.block_size;
@@ -835,6 +853,7 @@ PoolStats get_stats(PoolId id) {
     PoolStats s{};
     Pool const* P = pool_at(id);
     if (!P) return s;
+    s.valid = 1; // unless a refusal path below says otherwise
     s.state = (uint8_t)P->state;
     s.segment_first = P->segment_first;
     s.segment_count = P->segment_count;
@@ -862,11 +881,13 @@ PoolStats get_stats(PoolId id) {
             for (uint32_t steps = 0; off != NULL_OFF; ++steps) {
                 if (steps > max_steps) {
                     s.largest_free_block = 0;
+                    s.valid = 0;
                     return s; // cyclic list; refuse to report
                 }
                 if ((uint64_t)off < start_off ||
                     (uint64_t)off + BLOCK_HEADER_SIZE > end_off) {
                     s.largest_free_block = 0;
+                    s.valid = 0;
                     return s; // cursor outside the pool
                 }
                 FreeBlock const* b = ptr_of(off);
@@ -914,9 +935,34 @@ Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
     if (slot == NO_SLOT) return Status::NoSpace;
 
     FreeBlock* blk = bins_find(P->bins, need);
-    if (!blk || blk_size_of(blk) < need) {
+    if (!blk) {
+        // The bitmap is a hint only -- but a refusal must be DISTINGUISHABLE
+        // (round-4 task book section 11): a damaged free list is
+        // CorruptMetadata, genuine exhaustion is NoSpace. The audit runs
+        // only on this failure path, O(free blocks).
+        Status st = audit_pool_bins(*P, nullptr);
         slot_release(slot);
-        return Status::NoSpace; // bitmap is a hint only
+        return st == Status::Ok ? Status::NoSpace : Status::CorruptMetadata;
+    }
+    if (blk_size_of(blk) < need) {
+        slot_release(slot);
+        return Status::NoSpace; // first-fit exhausted the bin: a real hint miss
+    }
+
+    // Preserve the slot's lifecycle generation across reuse (ABA guard);
+    // free() already bumped it.
+    uint16_t gen = next_generation(G.objects[slot].generation);
+    ObjectDesc& d = G.objects[slot];
+    memset(&d, 0, sizeof(d));
+    // The payload address is final already (a later split only moves the
+    // remainder), so the address-order link happens BEFORE any block byte or
+    // bin membership changes: if the order list is corrupt, alloc fails here
+    // with an exact rollback -- only the slot needs to be released (round-4
+    // task book section 7). After the link there is no failure path left.
+    d.address = reinterpret_cast<uint8_t*>(blk) + BLOCK_HEADER_SIZE;
+    if (!order_insert_sorted(*P, slot)) {
+        slot_release(slot);
+        return Status::CorruptMetadata;
     }
     bins_remove(P->bins, blk);
 
@@ -948,13 +994,6 @@ Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
     store32(blkaddr, blksize);
     store32(blkaddr + 4, old_prev);
 
-    // Preserve the slot's lifecycle generation across reuse (ABA guard);
-    // free() already bumped it.
-    uint16_t gen = next_generation(G.objects[slot].generation);
-
-    ObjectDesc& d = G.objects[slot];
-    memset(&d, 0, sizeof(d));
-    d.address = blkaddr + BLOCK_HEADER_SIZE;
     d.size = size;
     d.block_size = blksize;
     d.user_tag = user_tag;
@@ -962,11 +1001,9 @@ Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
     d.flags = flags;
     d.generation = gen;
     d.address_epoch = 1;
-    d.addr_prev = d.addr_next = NO_ORDER;
     d.state = ObjState::Live;
     if (flags & PM_ZERO_INIT) memset(d.address, 0, size);
 
-    order_insert_sorted(*P, slot);
     P->used_bytes += blksize;
     P->free_bytes = pool_capacity(*P) - P->used_bytes;
     P->live_objects++;

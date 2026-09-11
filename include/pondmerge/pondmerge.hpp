@@ -102,6 +102,10 @@ struct Config {
 
 struct PoolStats {
     uint8_t  state;
+    uint8_t  valid;            // 1 = free-list walk completed; 0 = a corrupted
+                               // list was refused, largest_free_block is then
+                               // meaningless (0) -- the two "zero" cases are
+                               // distinguishable (round-4 task book section 11)
     uint16_t segment_first;
     uint16_t segment_count;
     uint32_t used_bytes;
@@ -191,14 +195,17 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align,
 // COMPLEXITY (task-book v2 section 7.3; worst case, not amortised). alloc is
 // NOT O(1): the TLSF bitmap locates a bin, and several block sizes share one
 // SL bin, so the allocator walks that bin for a first fit. The honest bounds
-// are: alloc O(bin chain length), upper bound O(zone_size / PM_MIN_BLOCK);
+// are: alloc O(bin chain length + live objects) -- the TLSF bitmap locates a
+// bin and walks it first-fit, then the descriptor is linked into the
+// address-order list (bounded walk, round-4 task book section 7);
 // free O(1 + the bin chain lengths of its free neighbours), upper bound
 // O(zone_size / PM_MIN_BLOCK) -- free proves the neighbours' free-list
 // membership before merging instead of trusting their headers (round-3
 // guide 6.2); pause/resume O(1); compact/merge/split O(objects + moved
 // bytes) plus the read-only audits (merge audits both pools' order lists,
 // descriptors, statistics and bins: O(objects + free blocks)); validate
-// O((live + free)^2); get_stats O(free_blocks) with a step cap.
+// O((live + free)^2); get_stats O(free_blocks) with a step cap (a refused
+// walk on a corrupted list is reported via PoolStats::valid == 0).
 Status compact(PoolId pool);
 Status merge(PoolId source, PoolId target);
 // Splits `source` after `new_pool_segments` segments; the new pool owns the

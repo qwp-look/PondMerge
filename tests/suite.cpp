@@ -1911,6 +1911,7 @@ static void test_get_stats_bounded_on_corruption() {
     CHECK(pm::get_stats(pool).largest_free_block > 0);
 
     using namespace pm::internal;
+    CHECK(pm::get_stats(pool).valid == 1); // healthy walk is reported as such
     Pool& P = g().pools[pool];
     uint32_t hf = FL_COUNT, hs = SL_COUNT;
     for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
@@ -1920,11 +1921,19 @@ static void test_get_stats_bounded_on_corruption() {
     uint32_t const real_head = P.bins.head[hf][hs];
     uint32_t const real_next = ptr_of(real_head)->next;
 
-    // (a) self-cycle: bounded, refuses to report.
+    // (a) self-cycle: bounded, refuses to report, and SAYS so (valid == 0):
+    // the "zero" of a refused walk is distinguishable from a pool without
+    // free blocks (round-4 task book section 11).
     ptr_of(real_head)->next = real_head;
-    CHECK(pm::get_stats(pool).largest_free_block == 0);
+    {
+        pm::PoolStats st = pm::get_stats(pool);
+        CHECK(st.largest_free_block == 0 && st.valid == 0);
+    }
     ptr_of(real_head)->next = real_next;
-    CHECK(pm::get_stats(pool).largest_free_block > 0);
+    {
+        pm::PoolStats st = pm::get_stats(pool);
+        CHECK(st.largest_free_block > 0 && st.valid == 1);
+    }
 
     // (b) cursor outside the zone: refused BEFORE dereferencing -- a wild read
     //     here would be an out-of-bounds access that ASan would trap.
@@ -1935,11 +1944,17 @@ static void test_get_stats_bounded_on_corruption() {
     P.bins.head[hf][hs] = real_head;
     CHECK(pm::get_stats(pool).largest_free_block > 0);
 
-    // (c) the allocator refuses the same corruption instead of following it.
+    // (c) the allocator refuses the same corruption instead of following it,
+    //     and since the round-4 task book (section 11) it reports it
+    //     PRECISELY as CorruptMetadata -- the old assertion pinned only the
+    //     refusal (NoSpace), which silently masked corruption as exhaustion;
+    //     the new one is strictly stronger and keeps genuine exhaustion at
+    //     NoSpace (see R29's healthy-allocation checks and the model's
+    //     allocatability oracle, both unchanged).
     P.bins.head[hf][hs] = 0xFFFFFFF0u;
     pm::RawRef r{};
     pm::Status as = pm::alloc(pool, 64, 8, 0, 2, r);
-    CHECK(as == pm::Status::NoSpace);
+    CHECK(as == pm::Status::CorruptMetadata);
     P.bins.head[hf][hs] = real_head;
     VALIDATE(pool);
 
@@ -2955,6 +2970,207 @@ static void test_state_publication() {
 }
 
 // ---------------------------------------------------------------------------
+// (R29) round-4 task book sections 7/8/11: the extended fault matrix --
+// reciprocal free-list links, duplicate bin membership, segment fields,
+// runtime-state fields, and alloc's own bounded order-list walk. Each case
+// names the mechanism it pins; all of them must be side-effect free.
+// ---------------------------------------------------------------------------
+static void test_round4_fault_matrix() {
+    printf("  [R29] extended fault matrix (links, duplicates, segments, state)\n");
+
+    // (1) free refuses a binned free block whose reciprocal links are bent
+    //     (free_block_binned verifies the found node's own links).
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef pad0{}, pin{}, pad2{};
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, pad0), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, 128, 8, pm::PM_PINNED, 2, pin), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, 512, 8, 0, 3, pad2), pm::Status::Ok);
+        CHECK_ST(pm::set_destroy_fn(pin, &counting_destroy), pm::Status::Ok);
+        fill(pad0, 128, 61); fill(pin, 128, 62); fill(pad2, 512, 63);
+        CHECK_ST(pm::free(pad0), pm::Status::Ok);
+        VALIDATE(pool);
+
+        using namespace pm::internal;
+        Pool const& P = g().pools[pool];
+        auto* fb = reinterpret_cast<FreeBlock*>(seg_base(P.segment_first));
+        pm::RawRef const refs[3] = {pad0, pin, pad2};
+        auto refuses_free_pin = [&]() {
+            snap_all(pool, pool, refs, 3, seg_base(P.segment_first), 1 * 4096);
+            int const dc = g_destroy_calls;
+            CHECK_ST(pm::free(pin), pm::Status::CorruptMetadata);
+            CHECK(g_destroy_calls == dc); // callback waits for the proof
+            check_all_unchanged(pool, pool, refs, 3, seg_base(P.segment_first), 1 * 4096);
+        };
+        uint32_t const saved_next = fb->next;
+        fb->next = 64; // readable in-pool offset, but not a list neighbour
+        refuses_free_pin();
+        fb->next = saved_next;
+        uint32_t const saved_prev = fb->prev;
+        fb->prev = 64;
+        refuses_free_pin();
+        fb->prev = saved_prev;
+        VALIDATE(pool);
+        int const dc = g_destroy_calls;
+        CHECK_ST(pm::free(pin), pm::Status::Ok); // healthy again
+        CHECK(g_destroy_calls == dc + 1);
+        CHECK_ST(pm::free(pad2), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+        done();
+    }
+
+    // (2) validate detects a free block that also appears as another bin's
+    //     head (duplicate membership): the size-class check refuses it.
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef a{};
+        CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, a), pm::Status::Ok);
+        CHECK_ST(pm::free(a), pm::Status::Ok);
+        VALIDATE(pool);
+
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        uint32_t hf = FL_COUNT, hs = SL_COUNT;
+        for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+                if (P.bins.head[f][sl] != NULL_OFF) { hf = f; hs = sl; break; }
+        CHECK(hf < FL_COUNT);
+        uint32_t const dup = P.bins.head[hf][hs];
+        uint32_t ef = FL_COUNT, es = SL_COUNT;
+        for (uint32_t f = 0; f < FL_COUNT && ef == FL_COUNT; ++f)
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+                if (P.bins.head[f][sl] == NULL_OFF) { ef = f; es = sl; break; }
+        CHECK(ef < FL_COUNT);
+        // A consistent-looking second head: bitmaps agree, so the walk truly
+        // reaches the block under the WRONG size class.
+        P.bins.head[ef][es] = dup;
+        P.bins.sl_bitmap[ef] = (uint16_t)(P.bins.sl_bitmap[ef] | (1u << es));
+        P.bins.fl_bitmap |= 1u << ef;
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        P.bins.head[ef][es] = NULL_OFF;
+        P.bins.sl_bitmap[ef] = (uint16_t)(P.bins.sl_bitmap[ef] & ~(1u << es));
+        P.bins.fl_bitmap &= ~(1u << ef);
+        VALIDATE(pool);
+        done();
+    }
+
+    // (3) segment fields: a shifted window or a wrong capacity breaks the
+    //     byte accounting and must be refused by validate AND by maintenance.
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef a{};
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+        fill(a, 128, 71);
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        uint16_t const saved_first = P.segment_first;
+        uint16_t const saved_count = P.segment_count;
+
+        P.segment_first = (uint16_t)(saved_first + 1); // window moved away
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        P.segment_first = saved_first;
+        VALIDATE(pool);
+
+        P.segment_count = (uint16_t)(saved_count + 1); // capacity inflated
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        CHECK_ST(pm::compact(pool), pm::Status::CorruptMetadata); // pre-move
+        CHECK(get_stats_state(pool) == 1);                        // restored
+        P.segment_count = saved_count;
+        VALIDATE(pool);
+        verify(a, 128, 71);
+        CHECK_ST(pm::free(a), pm::Status::Ok);
+        done();
+    }
+
+    // (4) runtime-state fields: corruption cannot be *audited* (they are
+    //     control fields, not invariants), but every affected entry must
+    //     refuse safely and recover once repaired.
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef a{};
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+
+        P.state = PoolState::Compacting; // phantom maintenance state
+        void* p = nullptr;
+        pm::RawRef b{};
+        CHECK_ST(pm::alloc(pool, 8, 8, 0, 2, b), pm::Status::Busy);
+        CHECK_ST(pm::borrow_begin(a, 128, 1, p), pm::Status::Busy);
+        CHECK_ST(pm::pause(pool), pm::Status::Busy);
+        CHECK_ST(pm::resume(pool), pm::Status::Busy);
+        CHECK_ST(pm::compact(pool), pm::Status::Busy);
+        pm::PoolId nid{};
+        CHECK_ST(pm::split(pool, 1, nid), pm::Status::Busy);
+        P.state = PoolState::Running; // repair
+        CHECK_ST(pm::alloc(pool, 8, 8, 0, 3, b), pm::Status::Ok);
+
+        P.borrow_count = 1; // phantom borrow: maintenance must refuse
+        CHECK_ST(pm::compact(pool), pm::Status::Busy);
+        CHECK_ST(pm::split(pool, 1, nid), pm::Status::Busy);
+        P.borrow_count = 0; // repair
+        CHECK_ST(pm::compact(pool), pm::Status::Ok);
+
+        g().objects[a.index].active_borrows = 2; // phantom object borrow
+        CHECK_ST(pm::free(a), pm::Status::Busy);
+        g().objects[a.index].active_borrows = 0; // repair
+        CHECK_ST(pm::free(a), pm::Status::Ok);
+        CHECK_ST(pm::free(b), pm::Status::Ok);
+        VALIDATE(pool);
+        CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+        done();
+    }
+
+    // (5) alloc's own cycle guard: a cyclic order list is refused with
+    //     CorruptMetadata in bounded time (previously alloc could hang in
+    //     the unbounded insertion walk), the slot is conserved, and the
+    //     pool recovers after repair.
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        pm::RawRef lo{}, hi{};
+        CHECK_ST(pm::alloc(pool, 3584, 8, 0, 1, lo), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, 3584, 8, 0, 2, hi), pm::Status::Ok);
+        using namespace pm::internal;
+        ObjectDesc& dlo = g().objects[lo.index];
+        uint32_t const saved_next = dlo.addr_next;
+        dlo.addr_next = lo.index; // cycle at the list head
+        // A fresh allocation lands in the tail block (above both objects),
+        // so the insertion walk runs into the cycle and must trip its cap.
+        pm::RawRef r{};
+        CHECK_ST(pm::alloc(pool, 64, 8, 0, 3, r), pm::Status::CorruptMetadata);
+        {
+            // the refused alloc rolled its slot back: the free chain holds
+            // every slot except the two live objects lo and hi
+            uint32_t nfree = 0;
+            for (uint16_t s = g().free_slot_head;
+                 s != NO_SLOT && nfree <= PM_MAX_OBJECTS;
+                 s = g().objects[s].next_free_slot)
+                ++nfree;
+            CHECK(nfree == PM_MAX_OBJECTS - 2);
+        }
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata); // still sick
+        dlo.addr_next = saved_next;                                // repair
+        CHECK_ST(pm::alloc(pool, 64, 8, 0, 3, r), pm::Status::Ok);
+        VALIDATE(pool);
+        CHECK_ST(pm::free(r), pm::Status::Ok);
+        CHECK_ST(pm::free(lo), pm::Status::Ok);
+        CHECK_ST(pm::free(hi), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
 static void run(const char* name, void (*fn)()) {
     printf("[TEST] %s\n", name);
     uint32_t const f0 = g_fails;
@@ -3012,6 +3228,7 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R26_resolve_clears_output", test_resolve_clears_output);
     run("R27_local_binding_semantics", test_local_binding_semantics);
     run("R28_state_publication", test_state_publication);
+    run("R29_round4_fault_matrix", test_round4_fault_matrix);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

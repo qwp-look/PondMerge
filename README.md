@@ -77,17 +77,18 @@ docs/              架构说明、代码指导书、各轮修复任务书与交�
 
 | 操作 | 最坏复杂度 | 说明 |
 |---|---|---|
-| `alloc` | O(该 SL bin 内链长)，上界 O(zone_size / PM_MIN_BLOCK) | TLSF 位图只定位到 bin；同一 bin 内块大小不一，需链内 first-fit 遍历（R2）。**不是严格 O(1)**。 |
+| `alloc` | O(SL bin 内链长 + live_objects)，上界 O(zone_size / PM_MIN_BLOCK) | TLSF 位图只定位到 bin；同一 bin 内块大小不一，需链内 first-fit 遍历（R2）；新描述符还要按地址序插入 order 链（有界防环走链，R29）。**不是严格 O(1)**。 |
 | `free` | O(1 + 邻块空闲 bin 链长)，上界 O(zone_size / PM_MIN_BLOCK) | 合并前先只读证明：自身块头、prev_size 链闭合、后继块 sane，且被判为空闲的邻块确实以其 size class 挂在对应 bin 上（含互逆链接校验，R24）。损坏时返回 `CorruptMetadata` 且**零副作用**（不跑销毁回调、不改统计与 bins）。 |
 | `pause` / `resume` | O(1) | 单次状态翻转。 |
 | `compact` / `split` | O(object_count + moved_bytes) | 地址序遍历完成只读规划（经 `walk_order` 有限遍历收集槽位），随后按序搬移与重建。 |
 | `merge` | O(object_count + free_blocks + moved_bytes) | 先对两池做只读审计（order 链 + 描述符 + 统计 + bins 结构），再对合并区间只读规划，执行阶段不可失败；规划失败两池逐字节不变（R22）。 |
 | `validate` | O(live_objects × free_blocks) | live 块与 binned 空闲块两两做重叠检查与 gap 归账；所有遍历均有步数上限。 |
-| `get_stats` | O(free_blocks) | 有步数上限；损坏链表下有限返回（`largest_free_block = 0`）。 |
+| `get_stats` | O(free_blocks) | 有步数上限；损坏链表下有限返回，且 `valid = 0` 与"真的没有空闲块"可区分（R18/R29）。 |
 | `borrow_begin` / `resolve` / `borrow_end` | O(1) | 描述符字段校验（含描述符块必须落在其所属池内的**池范围证明**，R23）+ 一次描述符读取，无地址缓存（见上文第 3 条）。`borrow_end` 的 token 校验与计数递减在同一临界区内完成（R25）；`resolve`/`borrow_begin` 失败时输出指针必为空（R26）。 |
 
 若产品必须保证严格 O(1) 分配，需要改变 bin 内组织方式（例如按块大小的固定容量
-结构）。v1 不做，文档也不再声明 `alloc` 为 O(1)。
+结构）并放弃地址序插入（或改为惰性重链）。v1 不做，文档也不再声明 `alloc`
+为 O(1)。
 
 ### 并发契约：单所有者 + 静默维护期（修复任务书 §4）
 
