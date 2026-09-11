@@ -1,5 +1,7 @@
 # PondMerge v1 第三轮收口报告（HANDOVER v5）
 
+> 第四轮长程审查见 `docs/HANDOVER_v6.md`；审计账本见 `docs/AUDIT_LEDGER.md`。
+
 > 依据 `PondMerge v1 第三轮审计修复指南与注意事项`（下称"指南"）执行。
 > 审计基线：`6bcd28f`（指南 §0；本轮开始时 HEAD 为其后的 `deec2ad` 纯文档提交）。
 > 本文是第三轮的交付报告 + 面向下一轮的交接，与 `HANDOVER_v2/v3/v4` 互补。

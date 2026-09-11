@@ -181,6 +181,11 @@ R25 borrow_end 单临界区 token 校验（Release 下重复/陈旧/错池 end �
 R26 resolve/borrow_begin 失败输出清空 ·
 R27 local 绑定语义固定（解析时强制、CROSS_HINT 拒绝、伪造 hint 得 PoolChanged） ·
 R28 维护仅在最终提交发布 Running（失败不留维护态、不建新池、不动 epoch） ·
+**v4 长程审查新增**（`docs/HANDOVER_v6.md`）：R29 扩展故障矩阵（互逆链接 /
+跨 bin 重复成员 / segment 字段 / 运行时状态字段 / alloc 自身防环——环链上
+有界拒绝）；alloc 对损坏 free-list 改报 CorruptMetadata（不再静默伪装成
+NoSpace）；`PoolStats.valid` 区分"拒绝"与"无空闲块"；审计账本
+`docs/AUDIT_LEDGER.md` ·
 **参考模型对拍**（固定 seed 随机 alloc/free/compact/merge/split，独立校验
 live 数、payload、池归属、字节账目与可分配性；失败打印 seed 与操作轨迹）。
 
