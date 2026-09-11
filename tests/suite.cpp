@@ -2177,6 +2177,773 @@ static void test_metadata_domain_corruption() {
 }
 
 // ---------------------------------------------------------------------------
+// Round-3 fault-injection scaffolding: byte-exact snapshots of every metadata
+// domain a maintenance operation must not touch on a planning failure.
+// ---------------------------------------------------------------------------
+namespace {
+using pm::internal::ObjectDesc;
+using pm::internal::Pool;
+
+uint8_t g_snap_zone[32 * 1024]; // Auto Zone byte-range snapshot
+uint8_t g_snap_pool_a[sizeof(Pool)];
+uint8_t g_snap_pool_b[sizeof(Pool)];
+uint8_t g_snap_desc[6][sizeof(ObjectDesc)];
+
+void snap_all(pm::PoolId a, pm::PoolId b, pm::RawRef const* refs, uint32_t nrefs,
+              void const* zone_from, uint32_t zone_len) {
+    using namespace pm::internal;
+    memcpy(g_snap_pool_a, &g().pools[a], sizeof(Pool));
+    memcpy(g_snap_pool_b, &g().pools[b], sizeof(Pool));
+    for (uint32_t i = 0; i < nrefs && i < 6; ++i)
+        memcpy(g_snap_desc[i], &g().objects[refs[i].index], sizeof(ObjectDesc));
+    if (zone_len > sizeof(g_snap_zone)) zone_len = sizeof(g_snap_zone);
+    memcpy(g_snap_zone, zone_from, zone_len);
+}
+
+void check_all_unchanged(pm::PoolId a, pm::PoolId b, pm::RawRef const* refs, uint32_t nrefs,
+                         void const* zone_from, uint32_t zone_len) {
+    using namespace pm::internal;
+    auto first_diff = [](uint8_t const* x, uint8_t const* y, size_t n) -> long {
+        for (size_t k = 0; k < n; ++k) if (x[k] != y[k]) return (long)k;
+        return -1;
+    };
+    if (memcmp(&g().pools[a], g_snap_pool_a, sizeof(Pool)) != 0) {
+        long k = first_diff(reinterpret_cast<uint8_t const*>(&g().pools[a]), g_snap_pool_a, sizeof(Pool));
+        printf("    DIFF pool a byte %ld: now %02x snap %02x\n", k,
+               reinterpret_cast<uint8_t const*>(&g().pools[a])[k], g_snap_pool_a[k]);
+    }
+    CHECK(memcmp(&g().pools[a], g_snap_pool_a, sizeof(Pool)) == 0);
+    if (memcmp(&g().pools[b], g_snap_pool_b, sizeof(Pool)) != 0) {
+        long k = first_diff(reinterpret_cast<uint8_t const*>(&g().pools[b]), g_snap_pool_b, sizeof(Pool));
+        printf("    DIFF pool b byte %ld: now %02x snap %02x\n", k,
+               reinterpret_cast<uint8_t const*>(&g().pools[b])[k], g_snap_pool_b[k]);
+    }
+    CHECK(memcmp(&g().pools[b], g_snap_pool_b, sizeof(Pool)) == 0);
+    for (uint32_t i = 0; i < nrefs && i < 6; ++i) {
+        if (memcmp(&g().objects[refs[i].index], g_snap_desc[i], sizeof(ObjectDesc)) != 0) {
+            long k = first_diff(reinterpret_cast<uint8_t const*>(&g().objects[refs[i].index]),
+                                g_snap_desc[i], sizeof(ObjectDesc));
+            printf("    DIFF desc[%u] (slot %u) byte %ld: now %02x snap %02x\n", i,
+                   refs[i].index, k,
+                   reinterpret_cast<uint8_t const*>(&g().objects[refs[i].index])[k],
+                   g_snap_desc[i][k]);
+        }
+        CHECK(memcmp(&g().objects[refs[i].index], g_snap_desc[i], sizeof(ObjectDesc)) == 0);
+    }
+    if (zone_len > sizeof(g_snap_zone)) zone_len = sizeof(g_snap_zone);
+    if (memcmp(zone_from, g_snap_zone, zone_len) != 0) {
+        long k = first_diff(reinterpret_cast<uint8_t const*>(zone_from), g_snap_zone, zone_len);
+        printf("    DIFF zone byte %ld (abs %ld): now %02x snap %02x\n", k,
+               (long)(reinterpret_cast<uint8_t const*>(zone_from) - g().zone) + k,
+               reinterpret_cast<uint8_t const*>(zone_from)[k], g_snap_zone[k]);
+    }
+    CHECK(memcmp(zone_from, g_snap_zone, zone_len) == 0);
+}
+} // namespace
+
+// ---------------------------------------------------------------------------
+// (R22) round-3 guide 3.2: merge must be a read-only-planned transaction.
+// Every planning failure returns CorruptMetadata with ZERO observable change:
+// pool structs (state, segments, statistics, bins), descriptors (pool_id,
+// address_epoch, order links) and the Auto Zone ranges stay byte-identical.
+// ---------------------------------------------------------------------------
+static void test_merge_transaction_faults() {
+    printf("  [R22] merge transaction faults are side-effect free\n");
+    pm::PoolId tgt = 0, src = 0;
+    pm::RawRef ot{}, os{}, pin{};
+    uint8_t* os_blk = nullptr;
+
+    // Each injection gets a freshly built fixture: a merge that (wrongly)
+    // half-commits consumes the source pool, and every case must stay
+    // isolated -- on the fixed code each case is byte-exact anyway.
+    auto rebuild = [&]() {
+        using namespace pm::internal;
+        memset(&g(), 0, sizeof(GlobalState)); // white-box power cycle
+        pm::Config cfg{g_zone, sizeof(g_zone), 4096};
+        CHECK_ST(pm::init(cfg), pm::Status::Ok);
+        CHECK_ST(pm::create_pool(tgt, 2), pm::Status::Ok); // segs 0-1 (below)
+        CHECK_ST(pm::create_pool(src, 2), pm::Status::Ok); // segs 2-3 (above)
+        pm::RawRef tpad{}, spad{};
+        CHECK_ST(pm::alloc(tgt, 256, 8, 0, 1, ot), pm::Status::Ok);
+        CHECK_ST(pm::alloc(tgt, 512, 8, 0, 2, tpad), pm::Status::Ok);
+        CHECK_ST(pm::alloc(src, 300, 8, 0, 3, os), pm::Status::Ok);
+        CHECK_ST(pm::alloc(src, 512, 8, 0, 4, spad), pm::Status::Ok);
+        CHECK_ST(pm::alloc(src, 128, 8, pm::PM_PINNED, 5, pin), pm::Status::Ok);
+        fill(ot, 256, 11); fill(tpad, 512, 12); fill(os, 300, 13);
+        fill(spad, 512, 14); fill(pin, 128, 15);
+        // Holes on both sides, so the merge has real moving to do on success.
+        CHECK_ST(pm::free(tpad), pm::Status::Ok);
+        CHECK_ST(pm::free(spad), pm::Status::Ok);
+        os_blk = g().objects[os.index].address - BLOCK_HEADER_SIZE;
+        VALIDATE(tgt); VALIDATE(src);
+    };
+
+    // (1) source descriptor claims the wrong pool
+    {
+        rebuild();
+        pm::RawRef const refs[3] = {ot, os, pin};
+        using namespace pm::internal;
+        uint16_t const saved = g().objects[os.index].pool_id;
+        g().objects[os.index].pool_id = tgt;
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK(get_stats_state(src) == 1 && get_stats_state(tgt) == 1);
+        g().objects[os.index].pool_id = saved;
+        VALIDATE(src); VALIDATE(tgt);
+    }
+    // (2) source descriptor address
+    {
+        rebuild();
+        pm::RawRef const refs[3] = {ot, os, pin};
+        using namespace pm::internal;
+        uint8_t* const saved = g().objects[os.index].address;
+        g().objects[os.index].address = g().zone + 5 * 4096 + 64;
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        g().objects[os.index].address = saved;
+        VALIDATE(src); VALIDATE(tgt);
+    }
+    // (3) source block header
+    {
+        rebuild();
+        pm::RawRef const refs[3] = {ot, os, pin};
+        using namespace pm::internal;
+        uint32_t hdr;
+        memcpy(&hdr, os_blk, 4);
+        uint32_t const bad = hdr + 8;
+        memcpy(os_blk, &bad, 4);
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        memcpy(os_blk, &hdr, 4);
+        VALIDATE(src); VALIDATE(tgt);
+    }
+    // (4) target bins
+    {
+        rebuild();
+        pm::RawRef const refs[3] = {ot, os, pin};
+        using namespace pm::internal;
+        Pool& T = g().pools[tgt];
+        uint32_t hf = FL_COUNT, hs = SL_COUNT;
+        for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+                if (T.bins.head[f][sl] != NULL_OFF) { hf = f; hs = sl; break; }
+        CHECK(hf < FL_COUNT);
+        uint32_t const saved_head = T.bins.head[hf][hs];
+        T.bins.head[hf][hs] = 0xFFFFFFF0u;
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        T.bins.head[hf][hs] = saved_head;
+        VALIDATE(tgt); VALIDATE(src);
+    }
+    // (5) target statistics corrupted: used_bytes no longer matches the
+    //     descriptors (merge must audit the target before touching anything)
+    {
+        rebuild();
+        pm::RawRef const refs[3] = {ot, os, pin};
+        using namespace pm::internal;
+        uint32_t const saved_used = g().pools[tgt].used_bytes;
+        g().pools[tgt].used_bytes = saved_used + 8;
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        g().pools[tgt].used_bytes = saved_used;
+        VALIDATE(tgt); VALIDATE(src);
+    }
+    // (6) Paused entry states
+    {
+        rebuild();
+        pm::RawRef const refs[3] = {ot, os, pin};
+        using namespace pm::internal;
+        CHECK_ST(pm::pause(src), pm::Status::Ok);
+        CHECK_ST(pm::pause(tgt), pm::Status::Ok);
+        uint16_t const saved = g().objects[os.index].pool_id;
+        g().objects[os.index].pool_id = tgt;
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK(get_stats_state(src) == 2 && get_stats_state(tgt) == 2);
+        g().objects[os.index].pool_id = saved;
+        CHECK_ST(pm::resume(src), pm::Status::Ok);
+        CHECK_ST(pm::resume(tgt), pm::Status::Ok);
+        VALIDATE(src); VALIDATE(tgt);
+    }
+    // (7) addr_next cycle
+    {
+        rebuild();
+        pm::RawRef const refs[3] = {ot, os, pin};
+        using namespace pm::internal;
+        ObjectDesc& d_os = g().objects[os.index];
+        uint32_t const saved_next = d_os.addr_next;
+        d_os.addr_next = pin.index;                    // os -> pin -> os -> ...
+        g().objects[pin.index].addr_next = os.index;
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        d_os.addr_next = saved_next;
+        g().objects[pin.index].addr_next = NO_ORDER;
+        VALIDATE(src); VALIDATE(tgt);
+    }
+    // (8) order_head
+    {
+        rebuild();
+        pm::RawRef const refs[3] = {ot, os, pin};
+        using namespace pm::internal;
+        uint32_t const saved_head = g().pools[src].order_head;
+        g().pools[src].order_head = PM_MAX_OBJECTS;
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        g().pools[src].order_head = saved_head;
+        VALIDATE(src); VALIDATE(tgt);
+    }
+
+    // Healthy merge still succeeds after all repairs.
+    rebuild();
+    CHECK_ST(pm::merge(src, tgt), pm::Status::Ok);
+    CHECK(get_stats_state(src) == 0 && get_stats_state(tgt) == 1);
+    VALIDATE(tgt);
+    pm::RawRef c_ot = ot; c_ot.pool_hint = pm::CROSS_HINT;
+    pm::RawRef c_os = os; c_os.pool_hint = pm::CROSS_HINT;
+    pm::RawRef c_pin = pin; c_pin.pool_hint = pm::CROSS_HINT;
+    verify(c_ot, 256, 11);
+    verify(c_os, 300, 13);
+    verify(c_pin, 128, 15);
+    CHECK(desc_pool(ot) == tgt && desc_pool(os) == tgt && desc_pool(pin) == tgt);
+    CHECK_ST(pm::free(c_ot), pm::Status::Ok);
+    CHECK_ST(pm::free(c_os), pm::Status::Ok);
+    CHECK_ST(pm::free(c_pin), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(tgt), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R23) round-3 guide 5.2: a descriptor whose block lies outside its pool is
+// refused by validate, resolve, borrow_begin AND free -- the address derived
+// from it must never be handed out, and free must not run the destroy
+// callback or touch any state before the physical proof succeeds.
+// ---------------------------------------------------------------------------
+static void test_descriptor_outside_pool() {
+    printf("  [R23] out-of-pool descriptors refused at every entry\n");
+    fresh();
+    pm::PoolId a{}, b{};
+    CHECK_ST(pm::create_pool(a, 2), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(b, 2), pm::Status::Ok);
+    pm::RawRef y{}, a1{};
+    CHECK_ST(pm::alloc(b, 128, 8, 0, 1, y), pm::Status::Ok);
+    CHECK_ST(pm::alloc(a, 128, 8, pm::PM_PINNED, 2, a1), pm::Status::Ok);
+    CHECK_ST(pm::set_destroy_fn(a1, &counting_destroy), pm::Status::Ok);
+    fill(a1, 128, 21);
+    fill(y, 128, 22);
+
+    using namespace pm::internal;
+    ObjectDesc& d = g().objects[a1.index];
+    Pool& P = g().pools[a];
+    uint8_t* const saved_addr = d.address;
+    uint32_t const saved_bs = d.block_size;
+    pm::RawRef const refs[2] = {a1, y};
+
+    auto expect_all_refuse = [&]() {
+        void* p = reinterpret_cast<void*>(static_cast<uintptr_t>(1)); // failure paths must clear it (R26)
+        CHECK_ST(pm::validate(a), pm::Status::CorruptMetadata);
+        CHECK_ST(pm::resolve(a1, 128, 1, p), pm::Status::CorruptMetadata);
+        CHECK(p == nullptr);
+        p = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+        CHECK_ST(pm::borrow_begin(a1, 128, 1, p), pm::Status::CorruptMetadata);
+        CHECK(p == nullptr);
+        int const dc = g_destroy_calls;
+        snap_all(a, b, refs, 2, seg_base(P.segment_first), 2 * 4096);
+        CHECK_ST(pm::free(a1), pm::Status::CorruptMetadata);
+        CHECK(g_destroy_calls == dc);  // no callback before the physical proof
+        check_all_unchanged(a, b, refs, 2, seg_base(P.segment_first), 2 * 4096);
+    };
+    auto repair = [&]() {
+        d.address = saved_addr;
+        d.block_size = saved_bs;
+        VALIDATE(a);
+    };
+
+    // (a) aligned address in the zone but beyond pool a's end
+    d.address = g().zone + 5 * 4096 + 64;
+    expect_all_refuse();
+    repair();
+    // (b) aligned address inside ANOTHER live pool
+    d.address = g().objects[y.index].address;
+    expect_all_refuse();
+    repair();
+    // (c) address before the zone base
+    d.address = g().zone - 128;
+    expect_all_refuse();
+    repair();
+    // (d) forged near-UINTPTR_MAX field, 8-aligned, never dereferenced
+    d.address = reinterpret_cast<uint8_t*>(~(uintptr_t)0x7);
+    expect_all_refuse();
+    repair();
+    // (e) block_size passes every descriptor-local check but crosses the
+    //     pool tail (a pool-filling block would be geometrically legal)
+    d.block_size = 2 * 4096 + 8;
+    expect_all_refuse();
+    repair();
+
+    // Healthy again: the callback runs exactly once on the real free.
+    verify(a1, 128, 21);
+    int const dc = g_destroy_calls;
+    CHECK_ST(pm::free(a1), pm::Status::Ok);
+    CHECK(g_destroy_calls == dc + 1);
+    CHECK_ST(pm::free(y), pm::Status::Ok);
+    VALIDATE(a);
+    VALIDATE(b);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R24) round-3 guide 6.1: free() verifies the physical neighbours (own
+// header, prev_size chain, successor sanity, free-list membership with
+// reciprocal links) BEFORE calling the destroy callback or touching any
+// state. A corrupt header must cost nothing: no callback, no statistics, no
+// bins write. A destroy callback re-entering the allocator for other objects
+// must leave the surrounding free() consistent.
+// ---------------------------------------------------------------------------
+static pm::PoolId g_reenter_pool = 0xFFFF;
+static int g_reenter_calls = 0;
+// cppcheck-suppress constParameterCallback
+static void reenter_destroy(void* p) {
+    // Legal re-entrancy: the callback allocates and frees OTHER objects in
+    // the SAME pool the enclosing free() is merging in.
+    ++g_reenter_calls;
+    pm::RawRef r{};
+    if (pm::alloc(g_reenter_pool, 64, 8, 0, 77, r) == pm::Status::Ok)
+        CHECK_ST(pm::free(r), pm::Status::Ok);
+    (void)p;
+}
+
+static void test_free_physical_header_faults() {
+    printf("  [R24] free verifies physical headers before any side effect\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    // Layout: [pad0 128][pin 128][pad2 512]; pad0 freed -> free predecessor.
+    pm::RawRef pad0{}, pin{}, pad2{};
+    CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, pad0), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 128, 8, pm::PM_PINNED, 2, pin), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 512, 8, 0, 3, pad2), pm::Status::Ok);
+    CHECK_ST(pm::set_destroy_fn(pin, &counting_destroy), pm::Status::Ok);
+    fill(pad0, 128, 31); fill(pin, 128, 32); fill(pad2, 512, 33);
+    CHECK_ST(pm::free(pad0), pm::Status::Ok);
+    VALIDATE(pool);
+
+    using namespace pm::internal;
+    ObjectDesc const& d = g().objects[pin.index];
+    Pool const& P = g().pools[pool];
+    uint8_t* blk = d.address - BLOCK_HEADER_SIZE;
+    uint8_t* pblk = seg_base(P.segment_first);          // pad0's free block
+    uint8_t* nblk = blk + d.block_size;     // pad2's live block
+    pm::RawRef const refs[3] = {pad0, pin, pad2};
+    auto rd32 = [](void const* q) { uint32_t v; memcpy(&v, q, 4); return v; };
+    auto wr32 = [](void* q, uint32_t v) { memcpy(q, &v, 4); };
+
+    uint32_t const own0 = rd32(blk);        // 136, used
+    uint32_t const pv0 = rd32(blk + 4);     // 136, pad0's block size
+    uint32_t const pfree0 = rd32(pblk);     // 136 | FREE
+    uint32_t const nown0 = rd32(nblk);      // 520, used
+
+    auto refuses = [&]() {
+        snap_all(pool, pool, refs, 3, seg_base(P.segment_first), 2 * 4096);
+        int const dc = g_destroy_calls;
+        CHECK_ST(pm::free(pin), pm::Status::CorruptMetadata);
+        CHECK(g_destroy_calls == dc);  // callback waits for the physical proof
+        check_all_unchanged(pool, pool, refs, 3, seg_base(P.segment_first), 2 * 4096);
+    };
+
+    // (1) own header size disagrees with the descriptor
+    wr32(blk, own0 + 8);
+    refuses();
+    wr32(blk, own0);
+    // (2) own header claims FREE
+    wr32(blk, own0 | 1u);
+    refuses();
+    wr32(blk, own0);
+    // (3) prev_size runs past the pool start
+    wr32(blk + 4, 2 * 4096 + 16);
+    refuses();
+    wr32(blk + 4, pv0);
+    // (4) prev_size points at a word that is not a matching block header
+    wr32(blk + 4, 8); // lands inside pad0's free-list link area
+    refuses();
+    wr32(blk + 4, pv0);
+    // (5) predecessor header bent to another size: the prev_size chain no
+    //     longer closes, and its (wrong) bin holds no such block
+    wr32(pblk, (own0 + 8) | BLOCK_FREE_BIT);
+    wr32(blk + 4, own0 + 8);
+    refuses();
+    wr32(pblk, pfree0);
+    wr32(blk + 4, pv0);
+    // (6) live successor faking the free bit: not present in any bin
+    wr32(nblk, nown0 | BLOCK_FREE_BIT);
+    refuses();
+    wr32(nblk, nown0);
+    // (7) successor free with an insane size (past the pool end)
+    wr32(nblk, 0x7FF8u | BLOCK_FREE_BIT);
+    refuses();
+    wr32(nblk, nown0);
+    // (8) successor free with a bent size class: no such block in that bin
+    wr32(nblk, (nown0 + 8) | BLOCK_FREE_BIT);
+    refuses();
+    wr32(nblk, nown0);
+
+    VALIDATE(pool);
+
+    // (9) reentrant callback allocating in the SAME pool while free() is
+    //     merging: the enclosing free must re-verify and stay consistent.
+    {
+        pm::RawRef pin2{};
+        CHECK_ST(pm::alloc(pool, 128, 8, pm::PM_PINNED, 5, pin2), pm::Status::Ok);
+        CHECK_ST(pm::set_destroy_fn(pin2, &reenter_destroy), pm::Status::Ok);
+        fill(pin2, 128, 35);
+        g_reenter_pool = pool;
+        int const dc = g_destroy_calls;
+        int const rc0 = g_reenter_calls;
+        CHECK_ST(pm::free(pin2), pm::Status::Ok);
+        CHECK(g_reenter_calls == rc0 + 1); // callback ran exactly once
+        CHECK(g_destroy_calls == dc);      // the re-entrancy freed no pinned obj
+        g_reenter_pool = 0xFFFF;
+        VALIDATE(pool);
+    }
+
+    // Healthy free: callback runs exactly once, neighbours merge cleanly.
+    verify(pin, 128, 32);
+    verify(pad2, 512, 33);
+    int const dc = g_destroy_calls;
+    CHECK_ST(pm::free(pin), pm::Status::Ok);
+    CHECK(g_destroy_calls == dc + 1);
+    CHECK_ST(pm::free(pad2), pm::Status::Ok);
+    pm::PoolStats st = pm::get_stats(pool);
+    CHECK(st.largest_free_block == 2 * 4096); // everything coalesced back
+    VALIDATE(pool);
+    CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R25) round-3 guide 7.1: borrow_end validates the token and decrements
+// inside ONE critical section. A duplicate, stale or wrong-pool end must
+// never move any counter (Release; Debug asserts these as caller bugs).
+// The concurrent half of this requirement runs on the dual-core device
+// (tests/concurrency_esp32.cpp) where PM_LOCK is a real spinlock.
+// ---------------------------------------------------------------------------
+static void test_borrow_end_token_discipline() {
+    printf("  [R25] borrow_end: single locked check-and-decrement\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef a{}, b{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, a), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 2, b), pm::Status::Ok);
+
+    using namespace pm::internal;
+    void* p = nullptr;
+    CHECK_ST(pm::borrow_begin(a, 64, 1, p), pm::Status::Ok);
+    CHECK(g().pools[pool].borrow_count == 1);
+    CHECK(g().objects[a.index].active_borrows == 1);
+    pm::borrow_end(a);
+    CHECK(g().pools[pool].borrow_count == 0);
+    CHECK(g().objects[a.index].active_borrows == 0);
+
+#if !PM_DEBUG
+    // Refusal paths: Debug asserts them as caller bugs (and would abort), so
+    // the no-side-effect guarantee is exercised on Release builds.
+    auto counters = [&]() {
+        return g().pools[pool].borrow_count * 16u + g().objects[a.index].active_borrows;
+    };
+    CHECK_ST(pm::borrow_begin(a, 64, 1, p), pm::Status::Ok);
+    pm::borrow_end(a);
+    uint32_t const c0 = counters();
+    CHECK(c0 == 0);
+
+    pm::borrow_end(a); // duplicate end: no underflow
+    CHECK(counters() == c0);
+
+    pm::RawRef stale = a;
+    stale.generation = (uint16_t)(a.generation + 1);
+    pm::borrow_end(stale); // stale token: refused
+    CHECK(counters() == c0);
+
+    pm::RawRef wrong = a;
+    wrong.pool_hint = (uint16_t)(pool + 1); // concrete but wrong pool
+    pm::borrow_end(wrong);                  // refused
+    CHECK(counters() == c0);
+
+    pm::RawRef bogus{};
+    bogus.index = PM_MAX_OBJECTS + 3;
+    bogus.generation = 1;
+    pm::borrow_end(bogus); // out of range: ignored
+    CHECK(counters() == c0);
+    CHECK(g().pools[pool].borrow_count == 0);
+#endif
+
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    CHECK_ST(pm::free(b), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R26) round-3 guide P2: a failed resolve/borrow_begin writes nullptr, so a
+// caller that reuses an old pointer variable can never keep a stale address.
+// ---------------------------------------------------------------------------
+static void test_resolve_clears_output() {
+    printf("  [R26] failed resolve/borrow_begin clear the output\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef a{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, a), pm::Status::Ok);
+    fill(a, 64, 5);
+
+    auto expect_cleared = [&](pm::RawRef ref, uint32_t sz, uint32_t al, pm::Status want) {
+        void* p = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+        CHECK_ST(pm::resolve(ref, sz, al, p), want);
+        if (want == pm::Status::Ok) CHECK(p != nullptr); // success writes through
+        else CHECK(p == nullptr);                        // failure clears
+        p = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+        CHECK_ST(pm::borrow_begin(ref, sz, al, p), want);
+        if (want == pm::Status::Ok) CHECK(p != nullptr);
+        else CHECK(p == nullptr);
+        if (want == pm::Status::Ok) pm::borrow_end(ref);
+    };
+
+    expect_cleared(a, 64, 1, pm::Status::Ok); // sanity: success writes through
+
+    pm::RawRef bad_index = a;
+    bad_index.index = PM_MAX_OBJECTS + 1;
+    expect_cleared(bad_index, 64, 1, pm::Status::InvalidRef);
+
+    pm::RawRef zero_gen = a;
+    zero_gen.generation = 0;
+    expect_cleared(zero_gen, 64, 1, pm::Status::InvalidRef);
+
+    pm::RawRef oob = a;
+    oob.offset = 64; // at the very end: nothing left to access
+    expect_cleared(oob, 1, 1, pm::Status::InvalidRef);
+
+    pm::RawRef oob2 = a;
+    oob2.offset = 60;
+    expect_cleared(oob2, 8, 1, pm::Status::InvalidRef); // 60+8 > 64
+
+    pm::RawRef misaligned = a;
+    misaligned.offset = 1;
+    expect_cleared(misaligned, 4, 4, pm::Status::InvalidAlignment);
+
+    pm::RawRef wrong_pool = a;
+    wrong_pool.pool_hint = (uint16_t)(pool + 1);
+    expect_cleared(wrong_pool, 64, 1, pm::Status::PoolChanged);
+
+    // Paused pool: Busy, and the output is still cleared.
+    CHECK_ST(pm::pause(pool), pm::Status::Ok);
+    expect_cleared(a, 64, 1, pm::Status::Busy);
+    CHECK_ST(pm::resume(pool), pm::Status::Ok);
+
+    // Corrupt descriptor: refused everywhere, output cleared.
+    {
+        using namespace pm::internal;
+        ObjectDesc& d = g().objects[a.index];
+        uint32_t const saved = d.size;
+        d.size = 0; // a live object always has a payload: desc-local refusal
+        expect_cleared(a, 64, 1, pm::Status::CorruptMetadata);
+        d.size = saved;
+    }
+
+    // Stale generation after a free/realloc cycle.
+    pm::RawRef stale = a;
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 2, a), pm::Status::Ok);
+    CHECK(stale.index == a.index && stale.generation != a.generation);
+    expect_cleared(stale, 64, 1, pm::Status::InvalidRef);
+
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R27) round-3 guide 7.2: the local-binding boundary is the documented one.
+// Constructing a pm_local_ptr from a caller-supplied RawRef is a deliberate
+// low-level capability; the binding is enforced at RESOLUTION time (a forged
+// concrete pool hint gets PoolChanged, never access), and CROSS_HINT still
+// cannot bootstrap a local pointer. This test pins that exact semantics so
+// the implementation and the README cannot drift apart.
+// ---------------------------------------------------------------------------
+static void test_local_binding_semantics() {
+    printf("  [R27] local binding enforced at resolution, not construction\n");
+    fresh();
+    pm::PoolId pool0{}, pool1{};
+    CHECK_ST(pm::create_pool(pool0, 2), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(pool1, 2), pm::Status::Ok);
+    auto made = pm::pm_make<uint32_t>(pool0);
+    CHECK(made.ok());
+    auto pod = made.value;
+
+    // (1) forged local binding to another concrete pool: construction is
+    // possible, but every resolution refuses with PoolChanged -- the object
+    // is unreachable through a pool it does not live in.
+    pm::RawRef forged = pod.raw();
+    forged.pool_hint = pool1;
+    pm::pm_local_ptr<uint32_t> evil{forged};
+    CHECK(evil.valid()); // not invalidated at construction (documented)
+    CHECK_ST(evil.try_borrow().status, pm::Status::PoolChanged);
+    CHECK_ST(evil.peek().status, pm::Status::PoolChanged);
+
+    // (2) CROSS_HINT still cannot bootstrap a local pointer (R4's rule).
+    pm::RawRef crossified = pod.raw();
+    crossified.pool_hint = pm::CROSS_HINT;
+    pm::pm_local_ptr<uint32_t> smuggled{crossified};
+    CHECK(!smuggled.valid());
+    CHECK_ST(smuggled.try_borrow().status, pm::Status::InvalidRef);
+
+    // (3) a forged hint equal to the true pool is indistinguishable from the
+    // genuine binding: same object, same access rights.
+    pm::RawRef twin = pod.raw();
+    twin.pool_hint = pool0;
+    pm::pm_local_ptr<uint32_t> twin_ptr{twin};
+    {
+        auto acc = twin_ptr.try_borrow();
+        CHECK(acc.ok());
+        *acc.value = 7;
+    }
+    {
+        auto acc = pod.try_borrow();
+        CHECK(acc.ok());
+        CHECK(*acc.value == 7);
+    }
+
+    // (4) the explicit cross path forces CROSS_HINT and works.
+    auto cross = pm::pm_cross_ref<uint32_t>(pod.raw());
+    CHECK(cross.pool_hint() == pm::CROSS_HINT);
+    CHECK_ST(cross.try_borrow().status, pm::Status::Ok);
+
+    CHECK_ST(pm::pm_destroy(pod), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(pool1), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R28) round-3 guide 8: maintenance publishes Running only in the final
+// commit. A refused operation leaves no maintenance state behind, bumps no
+// epoch, creates no pool, and writes no out parameter.
+// ---------------------------------------------------------------------------
+static void test_state_publication() {
+    printf("  [R28] state published only at the final commit\n");
+
+    // (a) failed compact: no epoch bump, Running restored, payload intact.
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef a{};
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+        fill(a, 128, 1);
+        CHECK_ST(pm::compact(pool), pm::Status::Ok); // epoch 1 -> 2
+        CHECK(pm::get_stats(pool).structure_epoch == 2);
+        {
+            using namespace pm::internal;
+            uint32_t const saved = g().objects[a.index].block_size;
+            g().objects[a.index].block_size = saved + 8;
+            CHECK_ST(pm::compact(pool), pm::Status::CorruptMetadata);
+            g().objects[a.index].block_size = saved;
+        }
+        CHECK(get_stats_state(pool) == 1); // no maintenance state left
+        CHECK(pm::get_stats(pool).structure_epoch == 2); // failure published nothing
+        verify(a, 128, 1);
+        VALIDATE(pool);
+        CHECK_ST(pm::free(a), pm::Status::Ok);
+        done();
+    }
+
+    // (b) failed merge: both pools restored, target epoch untouched, the
+    // object still belongs to the source pool.
+    {
+        fresh();
+        pm::PoolId s{}, t{};
+        CHECK_ST(pm::create_pool(t, 2), pm::Status::Ok);
+        CHECK_ST(pm::create_pool(s, 2), pm::Status::Ok);
+        pm::RawRef os{};
+        CHECK_ST(pm::alloc(s, 128, 8, 0, 1, os), pm::Status::Ok);
+        fill(os, 128, 2);
+        uint32_t const t_epoch = pm::get_stats(t).structure_epoch;
+        uint32_t const s_epoch = pm::get_stats(s).structure_epoch;
+        {
+            using namespace pm::internal;
+            uint32_t const saved = g().objects[os.index].block_size;
+            g().objects[os.index].block_size = saved + 8;
+            CHECK_ST(pm::merge(s, t), pm::Status::CorruptMetadata);
+            g().objects[os.index].block_size = saved;
+        }
+        CHECK(get_stats_state(s) == 1 && get_stats_state(t) == 1);
+        CHECK(pm::get_stats(t).structure_epoch == t_epoch);
+        CHECK(pm::get_stats(s).structure_epoch == s_epoch);
+        CHECK(desc_pool(os) == s); // ownership unchanged
+        verify(os, 128, 2);
+        VALIDATE(s); VALIDATE(t);
+        CHECK_ST(pm::free(os), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(t), pm::Status::Ok);
+        done();
+    }
+
+    // (c) failed split: no pool appears in the table, out_new untouched.
+    {
+        fresh();
+        pm::PoolId s{};
+        CHECK_ST(pm::create_pool(s, 4), pm::Status::Ok);
+        pm::RawRef big{}, pin{};
+        CHECK_ST(pm::alloc(s, 8000, 8, 0, 1, big), pm::Status::Ok);
+        CHECK_ST(pm::alloc(s, 1024, 8, pm::PM_PINNED, 2, pin), pm::Status::Ok);
+        uint32_t live_pools = 0;
+        for (uint32_t i = 0; i < 16; ++i)
+            if (get_stats_state((pm::PoolId)i) != 0) ++live_pools;
+        CHECK(live_pools == 1);
+        uint32_t const s_epoch = pm::get_stats(s).structure_epoch;
+        pm::PoolId nid = (pm::PoolId)0xBEEF;
+        CHECK_ST(pm::split(s, 2, nid), pm::Status::PinnedConflict);
+        CHECK(nid == (pm::PoolId)0xBEEF); // out parameter untouched
+        live_pools = 0;
+        for (uint32_t i = 0; i < 16; ++i)
+            if (get_stats_state((pm::PoolId)i) != 0) ++live_pools;
+        CHECK(live_pools == 1); // no new pool was published
+        CHECK(get_stats_state(s) == 1);
+        CHECK(pm::get_stats(s).structure_epoch == s_epoch);
+        VALIDATE(s);
+        CHECK_ST(pm::free(big), pm::Status::Ok);
+        CHECK_ST(pm::free(pin), pm::Status::Ok);
+        done();
+    }
+
+    // (d) successful merge publishes exactly once: source Empty, target
+    // Running, target epoch bumped by one.
+    {
+        fresh();
+        pm::PoolId s{}, t{};
+        CHECK_ST(pm::create_pool(t, 2), pm::Status::Ok);
+        CHECK_ST(pm::create_pool(s, 2), pm::Status::Ok);
+        pm::RawRef os{};
+        CHECK_ST(pm::alloc(s, 128, 8, 0, 1, os), pm::Status::Ok);
+        fill(os, 128, 3);
+        uint32_t const t_epoch = pm::get_stats(t).structure_epoch;
+        CHECK_ST(pm::merge(s, t), pm::Status::Ok);
+        CHECK(get_stats_state(s) == 0);
+        CHECK(get_stats_state(t) == 1);
+        CHECK(pm::get_stats(t).structure_epoch == t_epoch + 1);
+        pm::RawRef c = os; c.pool_hint = pm::CROSS_HINT;
+        verify(c, 128, 3);
+        CHECK_ST(pm::free(c), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(t), pm::Status::Ok);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
 static void run(const char* name, void (*fn)()) {
     printf("[TEST] %s\n", name);
     uint32_t const f0 = g_fails;
@@ -2227,6 +2994,13 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R19_destroy_fn_semantics", test_destroy_fn_semantics);
     run("R20_compact_fault_injection", test_compact_fault_injection);
     run("R21_metadata_domain_corruption", test_metadata_domain_corruption);
+    run("R22_merge_transaction_faults", test_merge_transaction_faults);
+    run("R23_descriptor_outside_pool", test_descriptor_outside_pool);
+    run("R24_free_physical_header_faults", test_free_physical_header_faults);
+    run("R25_borrow_end_token_discipline", test_borrow_end_token_discipline);
+    run("R26_resolve_clears_output", test_resolve_clears_output);
+    run("R27_local_binding_semantics", test_local_binding_semantics);
+    run("R28_state_publication", test_state_publication);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;
