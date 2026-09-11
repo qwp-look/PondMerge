@@ -215,7 +215,15 @@ int pondmerge_run_concurrency_tests(void) {
     // Both sides actually ran and overlapped.
     CCHECK(snap.a_ok > 0 && snap.b_ok > 0);
     CCHECK(snap.compact_ok > 0);
-    CCHECK(snap.a_busy > 0); // the borrowers DID hit paused/compacting windows
+    // At least one borrower DID hit paused/compacting windows. Which one
+    // depends on scheduling: the cross-core borrower (core 1) races the
+    // maintainer's pause window directly and reports Busy; the same-core
+    // borrower (core 0) runs only while the maintainer is off-CPU, and the
+    // whole 200-round maintenance phase finishes inside one equal-priority
+    // time slice, so it legitimately never observes a paused window
+    // (measured on device: b_busy=393, a_busy=0).
+    CCHECK(snap.a_busy + snap.b_busy > 0);
+    CCHECK(snap.compact_busy > 0); // quiescence gate refused live borrowers
     // Contract: the only allowed failure for a borrow against a valid object
     // in a paused/compacting pool is Busy.
     CCHECK(snap.bad_status == 0);
