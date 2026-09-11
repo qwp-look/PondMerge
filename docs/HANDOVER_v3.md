@@ -61,26 +61,32 @@
 
 ## 4. 未完成 / 未验证项
 
-1. **ESP32-S3 实机未验证**：本轮只做了**固件编译验证**（`idf.py -B build build`
-   成功，产物 233,280 B，sha256 前 16 位 `e0fc7f7a7bfd8d63`），
-   原因是手上没有可用开发板（无 `/dev/ttyACM*` 或 `/dev/ttyUSB*`）。
-   因此**不得**声称 v2 已实机验证。重烧后必须核对启动日志 `App version` 与提交号
-   一致再采信串口 PASS。
+1. **ESP32-S3 实机：已验证（2026-09-11 补做）。** 固件按收口提交重建并烧录，
+   启动日志 `App version: a9232c7`（ESP-IDF 从 git 派生，与 HEAD 一致）、
+   `ELF file SHA256: 42cdce502...`（与本地产物 `esptool image_info` 输出一致）、
+   `Compile time: Sep 11 2026 21:15:07`。实机输出
+   `1102255 checks, 0 failures`、`=== suite PASSED (rc=0) ===`，
+   13 组基础 + R1–R21 全部 PASS；`chip: model=9 rev=0.2 cores=2`、
+   启动空闲内部堆 93,680 B、元数据 27,192 B。
+   复现脚本已入库：`tests/serial_cap.py`（见 README 的 ESP32 章节）。
 2. **模型对拍未在 ESP32 运行**：`esp32/main/CMakeLists.txt` 只编译 `tests/suite.cpp`。
    若要把模型测试纳入设备侧，需要同时加入 `tests/model.cpp` 并调用
    `pondmerge_run_model()`（注意设备侧静态内存预算与 `PM_MAX_OBJECTS=256`）。
-3. **cpcheck 的 `knownConditionTrueFalse` 抑制**：`bump_epoch()` 与
+   这是本轮唯一「host 有、设备没有」的覆盖。
+3. **cppcheck 的 `knownConditionTrueFalse` 抑制**：`bump_epoch()` 与
    `next_generation()` 的两处回绕分支是真实可达的（uint32/uint16 回绕），属工具
    误报，已带理由抑制。若将来更换为能正确做值域分析的工具，应删除抑制。
 4. **`validate()` 成本上升**：新增覆盖审计把最坏复杂度从 `O(live × free)` 提到
-   `O((live + free)²)`，README 已如实声明。当前随机压测（`PM_MAX_OBJECTS=1024`，
-   实际 live ≤ 160）下未见性能问题；若要在大对象数下频繁调用，需要改成一次排序遍历
-   （受限于「无动态分配」约束，需要固定 scratch 数组）。
+   `O((live + free)²)`，README 已如实声明。设备侧可观察到的代价：本轮 2000 op 压测
+   的 `max_compact_us` 为 **2487 µs**（第一轮固件同档为 1176 µs，约 2.1 倍），来源是
+   precheck 全量审计 + `finalize_layout` 后的 `validate` 调用。仍在文档 §14
+   「不保证整理硬实时」的边界内；若产品需要更紧的维护窗口，需要把覆盖审计改成
+   一次排序遍历（受「无动态分配」约束，需固定 scratch 数组）。
 5. **§9.3 的更严格目标未做**：任务书建议「从 pool start 按物理块头走到 pool end，
    用 `covered == capacity` 校验」。本轮实现的是等价但更弱的表述：并集间隙
-   `gap < PM_MIN_BLOCK` 且三部分求和等于 capacity（见 §2 注释里的理由——朴素的
-   「每个空闲块恰好填满一个块间空隙」在 `free()` 之后不成立）。物理头逐块串行校验
-   需要额外的固定 scratch，未做。
+   `gap < PM_MIN_BLOCK` 且三部分求和等于 capacity（理由写在 `validate()` 的注释里
+   ——朴素的「每个空闲块恰好填满一个块间空隙」在 `free()` 之后不成立）。物理头逐块
+   串行校验需要额外的固定 scratch，未做。
 
 ## 5. 验收状态快照（收口时）
 
@@ -91,8 +97,12 @@
 | `tests/run_host.sh --san 3000` | 1,490,428 checks, 0 failures + 模型 466,859 checks, 0 failures |
 | `tests/run_host.sh --cppcheck` | 退出码 0，0 告警 |
 | `tests/config_matrix.sh` | SL 2/4/8/16 + FL 31 通过；SL 32 / FL 32 编译期拒绝；FL 容量上限 16/24 均按预期拒绝与接受 |
-| ESP32-S3 构建 | `idf.py -B build build` 成功（编译 `tests/suite.cpp`，含 R1–R21） |
-| ESP32-S3 实机 | **未验证**（无开发板，见 §4.1） |
+| ESP32-S3 实机（2000 op） | **1,102,255 checks, 0 failures**；`App version a9232c7`、ELF SHA256 与本地产物一致；13 组基础 + R1–R21 全 PASS |
+
+设备记录的完整字段（任务书 §12.3）：芯片 ESP32-S3（model=9, rev=0.2, 双核）、
+串口 `/dev/ttyACM0`（Espressif USB JTAG/serial debug unit，控制台走
+`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`）、固件 233,280 B、烧录时间 2026-09-11 21:15、
+ESP-IDF v6.0.2、gnu++17、`PM_MAX_OBJECTS=256`、Auto Zone 256 KiB。
 
 测试组清单：13 组基础（指导书 §18 + typed API）+ R1–R21 + 配置矩阵 + 参考模型对拍。
 
@@ -122,3 +132,11 @@
   slack 会把两个空闲块隔开，所以不能要求「每个空闲块恰好填满一个块间空隙」。
 - `precheck_pool()` 故意不校验 `prev_size` 链（merge 中间态的链未重写）；这是设计
   边界，不是遗漏。
+- **跑设备测试必须持续读串口**：控制台是 USB-Serial-JTAG，宿主不读时发送队列会填满
+  并阻塞 `printf`，现象是「测试停在小分组数不再前进」，很容易误判成死锁或性能问题。
+  用 `tests/serial_cap.py`（它同时负责复位，脚本名 `serial_cap.py`）。
+- **复位方式要选对**：正常启动复位 = IO0 保持高（`DTR=False`）+ 脉冲 EN（`RTS`）；
+  把 IO0 拉低会进入下载模式（`boot:0x23 (DOWNLOAD(USB/UART0))`），串口只会打印
+  `waiting for download`，看起来像设备无响应。
+- 设备侧的 `App version` 由 ESP-IDF 从 git 派生，**烧录前必须先提交**，否则版本会带
+  `-dirty` 后缀、失去与提交号的对应关系。

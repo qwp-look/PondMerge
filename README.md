@@ -22,6 +22,7 @@ tests/
     main.cpp        主机 runner（套件 + 模型）
     config_smoke.cpp    每个 TLSF 配置编译一次的冒烟测试
     config_limits.cpp   FL 容量契约（zone 上限拒绝 / 上限以下接受）
+    serial_cap.py       ESP32 串口抓取（正常启动复位 + 完整启动日志/测试输出）
     run_host.sh     构建 + 运行（--release / --san / --cppcheck / --configs）
     config_matrix.sh    配置矩阵（SL 2/4/8/16、FL 31、非法配置编译期拒绝）
 esp32/             ESP32-S3 (n16r8) IDF 工程（v6.0.2，组件强制 gnu++17）
@@ -161,10 +162,11 @@ R21 统计/顺序链/位图/块头/prev_size 逐域损坏检测 ·
 **参考模型对拍**（固定 seed 随机 alloc/free/compact/merge/split，独立校验
 live 数、payload、池归属、字节账目与可分配性；失败打印 seed 与操作轨迹）。
 
-验收结果（v2 修复轮，提交见 `docs/HANDOVER_v3.md`，全部 0 failures）：
+验收结果（v2 修复轮，提交 `a9232c7`，全部 0 failures）：
 Host Debug（10000 op）`5,391,417` 项检查 · Host Release（10000 op）同套件 ·
 ASan/UBSan（3000 op）`1,490,428` 项检查 · 参考模型对拍 `466,859` 项检查 ·
-cppcheck 退出码 0（0 告警）· 配置矩阵（含 FL 容量上限契约）全部通过。
+cppcheck 退出码 0（0 告警）· 配置矩阵（含 FL 容量上限契约）全部通过 ·
+**ESP32-S3 实机（2000 op）`1,102,255` 项检查，13 组基础 + R1–R21 全部 PASS**。
 
 ## v2 修复轮要点（详见 `docs/HANDOVER_v3.md`）
 
@@ -188,8 +190,11 @@ cppcheck 退出码 0（0 告警）· 配置矩阵（含 FL 容量上限契约）
 - **`precheck_pool()` 补对齐校验**：整理前的全量审计现在也验证 descriptor 地址对齐。
 - **`init()` FL 容量契约**：声明的 zone 若其最大块达到 `2^PM_FL_MAX`，init 直接
   拒绝（`NoSpace`），不再把超出表示范围的大块静默 clamp 进最高 bin；配置矩阵覆盖。
-- **ESP32 设备未重烧**：手上没有可用开发板（无 `/dev/ttyACM*`），本轮只做了固件
-  编译验证，见下文的诚实性说明。
+- **ESP32-S3 实机已重烧并验证**：固件以提交 `a9232c7` 重建（启动日志
+  `App version: a9232c7`、`ELF file SHA256: 42cdce502...` 与本地产物逐字节一致），
+  实机跑出 `1,102,255 checks, 0 failures`，13 组基础 + R1–R21 全部 PASS。
+  `tests/serial_cap.py` 已入库，可复现抓取。唯一未覆盖的是参考模型对拍
+  （`esp32/main/CMakeLists.txt` 只编译 `tests/suite.cpp`）。
 
 ## ESP32-S3（n16r8）上机
 
@@ -202,24 +207,46 @@ idf.py -B build -p /dev/ttyACM0 flash monitor
 ```
 
 设备端跑同一套验收套件（压力 2000 次，Auto Zone 256 KiB @ 内部 SRAM，
-`PM_MAX_OBJECTS=256` 以收紧元数据）。实测输出：
+`PM_MAX_OBJECTS=256` 以收紧元数据；`suite.cpp` 与 host 共用）。v2 修复轮的实机
+输出（2026-09-11，提交 `a9232c7`）：
 
 ```
 === PondMerge v1 ESP32-S3 acceptance suite ===
 chip: model=9 rev=0.2 cores=2
-[1]..[13] 全部 PASS
-830,988 checks, 0 failures
+free internal heap at boot: 93680 bytes
+[1]..[13] 全部 PASS · R1..R21 全部 PASS
+max_live=55 max_borrow=1 max_moved=30960 max_compact_us=2487 meta=27192
+1102255 checks, 0 failures
 === suite PASSED (rc=0) ===
 ```
 
-> **注意（诚实性要求，修复任务书 v2 §3.1）**：上面的设备结果是**第一轮固件**的
-> 记录。v2 修复轮（split 搬移顺序、锁边界、init 生命周期、TLSF 配置契约、
-> 维护前预检、validate 整数化、覆盖审计）**尚未重烧到设备**，因此不构成 v2 的实机
-> 验证。v2 在设备侧目前只有**编译证据**：`idf.py -B build build` 成功、产物
-> 233,280 B（sha256 前 16 位 `e0fc7f7a7bfd8d63`）、编译单元已包含含 R1–R21 的
-> `tests/suite.cpp`。重烧后必须核对启动日志里的 `App version` 与提交号一致，再采信
-> 串口 PASS。在此之前，v2 的可信度来自 Host Debug / Release / ASan / UBSan /
-> cppcheck / 配置矩阵 / 参考模型对拍。
+启动日志中的版本证据（任务书 v2 §12.3 要求的记录项）：
+
+```
+rst:0x15 (USB_UART_CHIP_RESET),boot:0x2b (SPI_FAST_FLASH_BOOT)
+I (92) app_init: Project name:     pondmerge_test
+I (93) app_init: App version:      a9232c7        <- 与 HEAD 一致
+I (93) app_init: Compile time:     Sep 11 2026 21:15:07
+I (93) app_init: ELF file SHA256:  42cdce502...   <- 与本地产物一致
+I (93) app_init: ESP-IDF:          v6.0.2
+```
+
+`App version` 由 ESP-IDF 从 git 派生，因此它同时充当提交号核对（§3.1）。
+复现方式（复位 USB-Serial-JTAG、抓完整启动日志与测试输出）：
+
+```sh
+source ~/esp/activate-idf.sh
+cd esp32 && idf.py -B build build
+python -m esptool --chip esp32s3 image_info build/pondmerge_test.bin  # 记录版本/SHA
+idf.py -B build -p /dev/ttyACM0 flash
+python ../tests/serial_cap.py /dev/ttyACM0 900 115200 | tee /tmp/device.log
+```
+
+设备侧注意：控制台配置为 `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`，所以
+**宿主必须持续读串口**——不读时 USB-Serial-JTAG 的发送队列会填满并阻塞 `printf`，
+表现为「测试卡在小分组数」。另外 `tests/serial_cap.py` 用的是**正常启动复位**
+（IO0 保持高、只脉冲 EN）；若把 IO0 拉低会进入下载模式
+（`rst:0x15 USB_UART_CHIP_RESET, boot:0x23 DOWNLOAD`），这是本轮踩过的坑。
 
 压力统计（设备）：`max_compact_us=1176`，元数据 27 KB。
 
