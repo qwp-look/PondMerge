@@ -14,6 +14,10 @@
 //   * borrow_begin/borrow_end and the pool state flips (pause/resume/compact
 //     entry) are internally synchronized, so pausing can never race a new
 //     borrow into existence.
+//   * compact/merge/split are ALSO single-owner operations: they must never
+//     be called concurrently from two contexts, not even for different pools
+//     (the planning scratch is one shared fixed buffer). Within one owner
+//     they are internally synchronized at entry and at the final commit.
 //   * Before compact/merge/split, the owner pauses the pool(s); all active
 //     borrows must have ended (borrow counters zero). DMA, ISRs and other
 //     threads holding raw pointers must be stopped and drained by the CALLER
@@ -149,12 +153,19 @@ Status set_destroy_fn(RawRef const& ref, void (*destroy_fn)(void*));
 
 // --- borrow accounting ------------------------------------------------------
 // Full validation + borrow. `access_size`/`access_align` describe the sub-object
-// being touched (sizeof(T)/alignof(T) plus the ref offset).
+// being touched (sizeof(T)/alignof(T) plus the ref offset). On failure
+// out_addr is written as nullptr, never left stale.
 Status borrow_begin(RawRef const& ref, uint32_t access_size, uint32_t access_align,
                     void*& out_addr);
+// Ends exactly one borrow_begin. The token (index, generation, pool binding)
+// and the counters are validated and decremented inside ONE critical
+// section: a duplicate, stale or wrong-pool end can never move a counter
+// (Debug asserts such tokens as caller bugs; Release ignores them).
 void   borrow_end(RawRef const& ref);
 // Validation only, no borrow, no address caching guarantee: safe inside a
-// critical section or when the pool is quiescent.
+// critical section or when the pool is quiescent. On failure out_addr is
+// ALWAYS nullptr, so a caller that reuses the variable cannot keep a stale
+// address (round-3 guide P2).
 Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align,
                void*& out_addr);
 
@@ -181,8 +192,13 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align,
 // NOT O(1): the TLSF bitmap locates a bin, and several block sizes share one
 // SL bin, so the allocator walks that bin for a first fit. The honest bounds
 // are: alloc O(bin chain length), upper bound O(zone_size / PM_MIN_BLOCK);
-// free O(1); pause/resume O(1); compact/merge/split O(objects + moved bytes);
-// validate O((live + free)^2); get_stats O(free_blocks) with a step cap.
+// free O(1 + the bin chain lengths of its free neighbours), upper bound
+// O(zone_size / PM_MIN_BLOCK) -- free proves the neighbours' free-list
+// membership before merging instead of trusting their headers (round-3
+// guide 6.2); pause/resume O(1); compact/merge/split O(objects + moved
+// bytes) plus the read-only audits (merge audits both pools' order lists,
+// descriptors, statistics and bins: O(objects + free blocks)); validate
+// O((live + free)^2); get_stats O(free_blocks) with a step cap.
 Status compact(PoolId pool);
 Status merge(PoolId source, PoolId target);
 // Splits `source` after `new_pool_segments` segments; the new pool owns the
@@ -263,8 +279,18 @@ public:
 // pointer can never be bootstrapped from a CROSS_HINT ref (the constructor
 // invalidates such refs; task-book 3.4).
 //
+// BINDING BOUNDARY (round-3 guide 7.2, pinned by R27): a local binding is
+// enforced at RESOLUTION time, not at construction time. pm_local_ptr can be
+// constructed from any caller-copied RawRef -- that is a deliberate low-level
+// capability, and it cannot grant access: a forged concrete pool hint is
+// refused with PoolChanged on every borrow/resolve/free, exactly like a
+// genuine pointer whose object changed pools. RawRef itself is therefore an
+// unsafe, forgeable handle by design; pm_cross_ref(raw) is the documented
+// unsafe cross-pool constructor. Nothing beyond the resolution-time checks
+// (range, generation, state, pool) protects against forged refs.
+//
 // Performance model (task-book 5): there is NO address cache. Every
-// borrow/resolve performs the full validation (range, generation, state,
+// borrow/resolve performs the full validation (pool range, generation, state,
 // pool) plus exactly one descriptor read to fetch the current payload
 // address — a single indexed load, so caching would save nothing. The lazy
 // update of an object's address after compaction happens through the

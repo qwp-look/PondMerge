@@ -52,6 +52,11 @@ docs/              架构说明、代码指导书、各轮修复任务书与交�
 4. `pm_local_ptr`（默认）绑定创建时的池，对象换池后解析返回 `PoolChanged`；
    `pm_cross_ptr` 必须通过 `pm_as_cross()` / `pm_cross_ref()` 显式生成。从
    `CROSS_HINT` 原始引用构造 local 指针会被构造函数无效化（不可绕过，R4 测试）。
+   **绑定边界（R27）**：local 绑定在**解析时**强制，而非构造时——调用者可以用
+   拷贝来的 `RawRef` 构造 local 指针（这是有意的低层能力），但伪造的具体 pool
+   hint 在每次 borrow/resolve/free 都被 `PoolChanged` 拒绝，无法借此访问不属于
+   该池的对象；`RawRef` 本身因此是可伪造的低层句柄，`pm_cross_ref(raw)` 是
+   文档化的 unsafe 跨池构造入口。
 5. 对象生命周期 generation 只在释放并复用槽位时递增（跳过 0），防 ABA；
    `address_epoch` 在搬迁 / 换池时递增（跳过 0）。分配失败回滚不触碰 generation。
 6. 压缩为“地址顺序稳定打包”：先只读规划（pinned 屏障、越界、对齐全部校验），
@@ -73,12 +78,13 @@ docs/              架构说明、代码指导书、各轮修复任务书与交�
 | 操作 | 最坏复杂度 | 说明 |
 |---|---|---|
 | `alloc` | O(该 SL bin 内链长)，上界 O(zone_size / PM_MIN_BLOCK) | TLSF 位图只定位到 bin；同一 bin 内块大小不一，需链内 first-fit 遍历（R2）。**不是严格 O(1)**。 |
-| `free` | O(1) | 与物理前后邻块合并，均为常数次操作（前提：块头与空闲链未被破坏）。 |
+| `free` | O(1 + 邻块空闲 bin 链长)，上界 O(zone_size / PM_MIN_BLOCK) | 合并前先只读证明：自身块头、prev_size 链闭合、后继块 sane，且被判为空闲的邻块确实以其 size class 挂在对应 bin 上（含互逆链接校验，R24）。损坏时返回 `CorruptMetadata` 且**零副作用**（不跑销毁回调、不改统计与 bins）。 |
 | `pause` / `resume` | O(1) | 单次状态翻转。 |
-| `compact` / `merge` / `split` | O(object_count + moved_bytes) | 一次地址序遍历完成只读规划，随后按序搬移与重建。 |
+| `compact` / `split` | O(object_count + moved_bytes) | 地址序遍历完成只读规划（经 `walk_order` 有限遍历收集槽位），随后按序搬移与重建。 |
+| `merge` | O(object_count + free_blocks + moved_bytes) | 先对两池做只读审计（order 链 + 描述符 + 统计 + bins 结构），再对合并区间只读规划，执行阶段不可失败；规划失败两池逐字节不变（R22）。 |
 | `validate` | O(live_objects × free_blocks) | live 块与 binned 空闲块两两做重叠检查与 gap 归账；所有遍历均有步数上限。 |
 | `get_stats` | O(free_blocks) | 有步数上限；损坏链表下有限返回（`largest_free_block = 0`）。 |
-| `borrow_begin` / `resolve` / `borrow_end` | O(1) | 描述符字段校验 + 一次描述符读取，无地址缓存（见上文第 3 条）。 |
+| `borrow_begin` / `resolve` / `borrow_end` | O(1) | 描述符字段校验（含描述符块必须落在其所属池内的**池范围证明**，R23）+ 一次描述符读取，无地址缓存（见上文第 3 条）。`borrow_end` 的 token 校验与计数递减在同一临界区内完成（R25）；`resolve`/`borrow_begin` 失败时输出指针必为空（R26）。 |
 
 若产品必须保证严格 O(1) 分配，需要改变 bin 内组织方式（例如按块大小的固定容量
 结构）。v1 不做，文档也不再声明 `alloc` 为 O(1)。
@@ -91,6 +97,10 @@ docs/              架构说明、代码指导书、各轮修复任务书与交�
 - 维护（compact/merge/split）前：`pause` → 等待借用计数归零 → 操作 → `resume`。
   DMA、ISR、其他线程持有的物理指针必须由调用方先行停止——PondMerge 不发现
   外部持有者。
+- 维护操作本身也由**单一所有者串行调用**（即使操作不同池也不并发）：只读规划
+  使用一块共享的固定 scratch 缓冲，并发维护会互相覆盖计划。同一所有者内部，
+  各维护入口与最终提交均持有与 borrow_begin 相同的锁；新池只在最终提交时发布
+  为 Running（R28）。
 - 构造函数与销毁回调不得对“正在构造/销毁的对象”重入分配器；对其他对象的
   重入允许但顺序敏感。
 
@@ -159,6 +169,17 @@ R18 `get_stats` 损坏链表有限返回且越界游标不解引用 ·
 R19 销毁回调仅限 pinned 且恰好执行一次 ·
 R20 compact 故障注入（越界/未对齐/size 与 block 不一致，搬移前中止） ·
 R21 统计/顺序链/位图/块头/prev_size 逐域损坏检测 ·
+**v3 修复轮新增回归组**（`docs/HANDOVER_v5.md`）：
+R22 merge 事务故障注入（规划失败两池 Pool/描述符/links/bins/Auto Zone 逐字节
+不变；含 Paused 恢复、环链步数上限、越界 order_head） ·
+R23 池外描述符在 validate/resolve/borrow/free 处处拒绝（回调不执行、零副作用） ·
+R24 free 物理头故障（块头/prev_size/后继/bin 成员资格，验证先于销毁回调）+ 同池
+重入销毁回调一致性 ·
+R25 borrow_end 单临界区 token 校验（Release 下重复/陈旧/错池 end 不动计数；双核
+真并发由设备侧 `tests/concurrency_esp32.cpp` 覆盖） ·
+R26 resolve/borrow_begin 失败输出清空 ·
+R27 local 绑定语义固定（解析时强制、CROSS_HINT 拒绝、伪造 hint 得 PoolChanged） ·
+R28 维护仅在最终提交发布 Running（失败不留维护态、不建新池、不动 epoch） ·
 **参考模型对拍**（固定 seed 随机 alloc/free/compact/merge/split，独立校验
 live 数、payload、池归属、字节账目与可分配性；失败打印 seed 与操作轨迹）。
 
