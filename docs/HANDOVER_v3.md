@@ -61,14 +61,18 @@
 
 ## 4. 未完成 / 未验证项
 
-1. **ESP32-S3 实机：已验证（2026-09-11 补做）。** 固件按收口提交重建并烧录，
-   启动日志 `App version: a9232c7`（ESP-IDF 从 git 派生，与 HEAD 一致）、
+1. **ESP32-S3 实机：已验证（2026-09-11 补做）。** 固件按 `a9232c7` 重建并烧录，
+   启动日志 `App version: a9232c7`（ESP-IDF 从 git 派生，与提交号一致）、
    `ELF file SHA256: 42cdce502...`（与本地产物 `esptool image_info` 输出一致）、
    `Compile time: Sep 11 2026 21:15:07`。实机输出
    `1102255 checks, 0 failures`、`=== suite PASSED (rc=0) ===`，
    13 组基础 + R1–R21 全部 PASS；`chip: model=9 rev=0.2 cores=2`、
    启动空闲内部堆 93,680 B、元数据 27,192 B。
    复现脚本已入库：`tests/serial_cap.py`（见 README 的 ESP32 章节）。
+   > 版本对应关系：设备侧记录的是构建时提交 `a9232c7`。其后只有 `d746738`
+   > （仅改 `README.md`、本文档与新增 `tests/serial_cap.py`，`src/` 与
+   > `tests/suite.cpp` 未变），因此实机结论对当前 HEAD 同样成立；
+   > 再次烧录会显示新提交号，但被测代码是同一份。
 2. **模型对拍未在 ESP32 运行**：`esp32/main/CMakeLists.txt` 只编译 `tests/suite.cpp`。
    若要把模型测试纳入设备侧，需要同时加入 `tests/model.cpp` 并调用
    `pondmerge_run_model()`（注意设备侧静态内存预算与 `PM_MAX_OBJECTS=256`）。
