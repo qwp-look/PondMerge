@@ -144,3 +144,64 @@ ESP-IDF v6.0.2、gnu++17、`PM_MAX_OBJECTS=256`、Auto Zone 256 KiB。
   `waiting for download`，看起来像设备无响应。
 - 设备侧的 `App version` 由 ESP-IDF 从 git 派生，**烧录前必须先提交**，否则版本会带
   `-dirty` 后缀、失去与提交号的对应关系。
+
+## 8. 剩余问题清单（2026-09-11 收口，按优先级）
+
+### A. 任务书条目未完全覆盖（需要补测试）
+
+1. **§11.1 条目 4「并发模型测试」只做到单线程**。R16 覆盖了 `borrow_count` /
+   `active_borrows` 与状态转换的**单线程**矩阵，但 `pause` 与新 `borrow` 之间
+   「检查-翻转」竞态没有真并发测试。库的契约是单所有者 + 静默维护期（`alloc/free/
+   resolve` 本身不承诺多线程安全），所以唯一值得真并发验证的是
+   `borrow_begin/borrow_end/pause/compact` 的锁边界——这需要在双核 + FreeRTOS 上做，
+   ESP32-S3 正合适。**建议**：设备侧新增任务对（任务 A 反复 borrow/borrow_end，
+   任务 B 反复 pause/compact），断言「Paused 期间不会有新的 borrow 成功」，循环 N 次。
+2. **§12.2「长时间重复 init/deinit」没有专项压力**。R14 只做了 2~3 次
+   `deinit → init` 循环。**建议**加一个固定 seed、约 200 次 init/deinit 的循环测试
+   （host 侧开销很小）。
+3. **ASan 档只跑了 3000 op**（Debug/Release 各跑了 10000）。`--san 10000` 未跑，属时间
+   成本取舍；若怀疑内存类问题应补跑。
+
+### B. 本轮的已知取舍
+
+见 §4.2（模型对拍未上设备）、§4.3（cppcheck 抑制待复核）、§4.4（`validate()` 成本
+2.1 倍与 `max_compact_us` 上升）、§4.5（§9.3 的更严格物理头校验未做）。
+
+### C. 接口与能力边界（不是缺陷，但调用方必须知道）
+
+1. **`get_stats()` 的 `largest_free_block == 0` 有两种含义**：真的没有空闲块，或遇到
+   损坏链表而拒绝报告。调用方无法区分「空池」与「元数据损坏」。**建议**给 `PoolStats`
+   增加状态位，或让 `get_stats()` 返回 `Status`。
+2. **`free()` 与 poison 不变式的隐性耦合**：前向合并依赖「池内未覆盖区的首字为 0」
+   （由 `finalize_layout()` 写入，含块间与池尾）。任何绕过 `finalize_layout()` 直接写
+   池内裸数据的内部路径都会破坏它，而当前没有防御性校验。**建议**（可选）在 `free()`
+   里对 `next` 处的块大小做一次界内校验。
+3. **零长对象被拒**：`desc_block_consistent()` 把 live 且 `size == 0` 视为元数据损坏
+   （`alloc` 也早已拒绝 `size == 0`）。若将来要支持零长对象，需同时调整这两处。
+4. **FL 容量契约与 `PM_MAX_SEGMENTS` 的相互作用**：`init()` 现在拒绝「最大块 ≥
+   2^PM_FL_MAX」的 zone。默认 `PM_MAX_SEGMENTS=64` + segment 4 KiB 时 zone 上限仅
+   256 KiB，远低于 2^24，因此该检查在默认配置下是**防御性**的；要用更大的 zone 必须
+   同时提高 `segment_size`（例如 128 KiB × 64 = 8 MiB，仍低于 16 MiB 上限）。
+5. **单所有者并发契约**：`alloc/free/resolve/get_stats` 不承诺多线程安全，锁只保证状态
+   翻转与借用计数的原子性。这是设计边界（架构文档 §4），不是待办。
+
+### D. 工程与流程
+
+1. `docs/` 尚缺第一轮的《PondMerge_v1_修复注意事项.md》（本轮只入库了 v2 任务书、
+   代码指导书、架构说明）。
+2. 设备侧压力次数硬编码 2000（`esp32/main/main.cpp`），host 默认 10000；不一致是有意的
+   （设备 RAM 与耗时），若要让设备跑满需改 `main.cpp` 或引入编译期宏。
+3. 全仓共 9 处 cppcheck 抑制：3 处既有 `dangerousTypeCast`、6 处本轮新增
+   （2× `knownConditionTrueFalse` 回绕、1× 测试框架、2× `nullPointerRedundantCheck`、
+   1× `constParameterCallback`），都写了理由；更换静态分析工具时应逐条复核。
+4. `tests/serial_cap.py` 依赖 pyserial（ESP-IDF 的 python env 自带）；换环境需自行安装。
+5. 设备侧没有跑参考模型（§4.2），因此「host 有、设备没有」的覆盖目前只有这一项。
+
+### 已确认满足的验收项（供对照）
+
+- §12.2 的「固定 seed 的 10000+ 随机压力」：`tests/suite.cpp` 的随机压测用固定 seed
+  `12345`，Debug/Release 各跑 10000 op；模型对拍另有固定 seed `0x51ED2701`。
+- §12.2 的「ESP32 多次复位后重复运行」：本轮共 3 次复位抓取，3/3 为
+  `=== suite PASSED (rc=0) ===`。
+- §12.2 的 split crossing 专项、配置矩阵、故障注入均已落地（R13/R15、config_matrix.sh、
+  R18/R20/R21）。
