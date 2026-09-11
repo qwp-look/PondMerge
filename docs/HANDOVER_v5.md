@@ -102,15 +102,28 @@ fail_restore:
 - 单所有者 + scratch 共享：维护操作**必须**由单一所有者串行调用已写入
   pondmerge.hpp 并发契约与 README（指南 §8 末段的 v1 契约选择）。
 
-## 6. 设备验收（ESP32-S3 实机）
+## 6. 设备验收（ESP32-S3 实机，已执行）
 
 - 芯片：ESP32-S3 rev 0.2，双核；串口 `/dev/ttyACM0`（USB-Serial-JTAG）115200。
-- 构建：ESP-IDF v6.0.2，gnu++17，`PM_MAX_OBJECTS=256`，Auto Zone 256 KiB @ 内部 SRAM。
-- App version / ELF SHA256 / 编译时间 / 检查数：见提交记录与下方实测块
-  （烧录前已提交，App version 无 -dirty）。
-- 测试内容：suite（基础 13 组 + R1–R28，2000 ops）+ 双核并发锁边界测试
-  （200 轮 pause/compact/resume × 双核 borrower）。
-- 结果：待本轮设备运行后回填（见 §9 交付清单）。
+- 构建：ESP-IDF v6.0.2（组件强制 gnu++17），`PM_MAX_OBJECTS=256`，
+  Auto Zone 256 KiB @ 内部 SRAM，启动时空闲内部堆 93,056 B。
+- 固件：镜像 258,592 B；`App version: eb47ef8`（= HEAD，先提交后烧录，无
+  -dirty）；`Compile time: Sep 12 2026 00:41:57`；
+  `ELF file SHA256: 301f801a1ec588ec068ec5f8b24826e93974a67fb03f326425a53783eb264d98`。
+- 套件（基础 13 组 + R1–R28，2000 ops）：**1,104,594 checks, 0 failures**，
+  `=== suite PASSED (rc=0) ===`；压力统计 `max_live=55 max_borrow=1
+  max_moved=30960 max_compact_us=2509 meta=27704`。
+- 双核并发锁边界测试（`tests/concurrency_esp32.cpp`，200 轮
+  pause/compact/resume，双核 borrower）：`borrow_a ok=4032 busy=64 |
+  borrow_b ok=3629 busy=463 | pause=200 compact ok=181 busy=19 resume=200`，
+  **28 checks, 0 failures**，`=== concurrency PASSED (rc=0) ===`。核对项：
+  观测状态全部属于契约允许集合、begin/end 严格配对、结束后
+  borrow_count == 0 且两对象 active_borrows == 0、payload 完好、validate 通过。
+- 设备调试记录（对下一轮有用）：并发测试首版把 app_main 饿死（borrower 以高
+  优先级创建后立即抢占，后两个任务从未创建）——修复为先同优先级创建后统一
+  提权；测试脚手架的快照缓冲改从堆上取（设备 dram0_0_seg 静态余量 <1 KiB），
+  并发测试复用 g_zone 低 2 segment；`serial_cap.py` 结束标记更新为
+  `=== concurrency PASSED/FAILED`。
 
 ## 7. 已知边界（本轮明确、未变更）
 
@@ -138,19 +151,43 @@ fail_restore:
 
 既有测试 R1–R21 与基础 1–13 无一删除或放宽（check 总数上升来自新增组）。
 
-## 9. 交付清单（提交后回填实测数字）
+## 9. 交付清单
 
-- Host Debug（10000 ops）：见 §10
-- Host Release（10000 ops）：见 §10
-- ASan/UBSan（10000 ops）：见 §10
-- cppcheck：exit 0，0 告警
-- 配置矩阵：PASSED
-- ESP32-S3：commit / App version / ELF SHA / chip / checks / failures —— 见 §6 回填
-
-## 10. 验收命令实测记录（本轮收口时回填）
+提交序列（自审计基线 `6bcd28f` 起；`deec2ad` 为基线后的纯文档提交）：
 
 ```
-（由收口流程回填：五档 host 命令输出与设备日志摘录）
+e2a0a86 tests:   R22–R28 回归组（先红后绿；红测证据见 §4）
+d00adf7 core:    第三轮 P0/P1/P2 修复 + API/README 契约同步
+4978474 device:  双核 borrow/pause/compact 锁边界测试（T1 + R25 设备部分）
+7b83e75 tests/device: 设备 DRAM 适配（BSS 溢出修复，库语义不变）
+b0c9bc0 device:  并发测试任务创建顺序修复（app_main 饿死）+ serial_cap 结束标记
+eb47ef8 device:  并发断言与实测 SMP 调度对齐（核心不变量全部保持）
+```
+
+- Host Debug（10000 ops）：5,393,756 checks, 0 failures
+- Host Release（10000 ops）：5,393,763 checks, 0 failures
+- ASan/UBSan（10000 ops）：5,393,756 checks, 0 failures
+- 参考模型对拍：466,859 checks, 0 failures
+- cppcheck：exit 0，0 告警
+- 配置矩阵：PASSED
+- ESP32-S3：commit `eb47ef8` / App version `eb47ef8` /
+  ELF SHA `301f801a1e...` / chip ESP32-S3 rev 0.2 双核 /
+  suite 1,104,594 checks 0 failures + concurrency 28 checks 0 failures
+
+## 10. 验收命令实测记录
+
+```
+tests/run_host.sh 10000           -> 5,393,756 checks, 0 failures（模型 466,859 checks, 0 failures）
+tests/run_host.sh --release 10000 -> 5,393,763 checks, 0 failures
+tests/run_host.sh --san 10000     -> 5,393,756 checks, 0 failures
+tests/run_host.sh --cppcheck      -> exit 0, 0 warnings（3/3 files checked）
+tests/run_host.sh --configs       -> configuration matrix PASSED
+idf.py -B build build             -> pondmerge_test.bin 258,592 B, App version eb47ef8
+idf.py -B build -p /dev/ttyACM0 flash
+python tests/serial_cap.py /dev/ttyACM0 300 115200
+  -> App version eb47ef8 / ELF SHA 301f801a1e... / Compile time Sep 12 2026 00:41:57
+  -> 1104594 checks, 0 failures === suite PASSED (rc=0) ===
+  -> 28 checks, 0 failures === concurrency PASSED (rc=0) ===
 ```
 
 ## 11. 给下一轮的提示

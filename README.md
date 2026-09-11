@@ -253,6 +253,30 @@ I (93) app_init: ESP-IDF:          v6.0.2
 ```
 
 `App version` 由 ESP-IDF 从 git 派生，因此它同时充当提交号核对（§3.1）。
+
+v3 修复轮的实机输出（2026-09-12，提交 `eb47ef8`，同一套件新增 R22–R28 与
+双核并发锁边界测试 `tests/concurrency_esp32.cpp`）：
+
+```
+I (97) app_init: App version:      eb47ef8        <- 与 HEAD 一致
+I (98) app_init: Compile time:     Sep 12 2026 00:41:57
+I (98) app_init: ELF file SHA256:  301f801a1...   <- 与本地产物一致
+chip: model=9 rev=0.2 cores=2 · 串口 /dev/ttyACM0 115200 (USB-Serial-JTAG)
+stress ops: 2000 · free internal heap at boot: 93056 bytes
+max_live=55 max_borrow=1 max_moved=30960 max_compact_us=2509 meta=27704
+1104594 checks, 0 failures
+=== suite PASSED (rc=0) ===
+    rounds: borrow_a ok=4032 busy=64 | borrow_b ok=3629 busy=463
+    maintainer: pause=200 compact ok=181 busy=19 resume=200
+  [CONC] 28 checks, 0 failures
+=== concurrency PASSED (rc=0) ===
+```
+
+`max_compact_us` 口径说明（v3 指南 P2）：该值只在与检查数同一次运行的日志里
+引用（如上，含提交号/App version/ELF SHA/编译时间）。`HANDOVER_v3.md` 中
+`1176` 与旧 README 的 `2487` 均出自 `a9232c7` 时代不同次运行的记录，引用时
+必须带上各自运行日志的完整证据链，不得互相替代。
+
 复现方式（复位 USB-Serial-JTAG、抓完整启动日志与测试输出）：
 
 ```sh
