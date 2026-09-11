@@ -23,12 +23,15 @@
 // surface as a payload/validate failure (data moved under a live borrow) or
 // as an impossible status -- not as a timing guess.
 #include "pondmerge/pondmerge.hpp"
+#include "../src/internal.h" // white-box: borrow-count conservation reads
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include <cstdio>
 #include <cstdint>
+
+extern uint8_t g_zone[]; // 256 KiB, 16-byte aligned (tests/suite.cpp)
 
 namespace {
 
@@ -55,7 +58,12 @@ uint32_t c_fails = 0;
         }                                                                             \
     } while (0)
 
-uint8_t c_zone[24 * 1024] __attribute__((aligned(16)));
+// The device Auto Zone for this test lives in the low segments of the
+// suite's zone buffer (shared with tests/suite.cpp): static DRAM is too
+// tight for another zone-sized buffer. g_zone has external linkage in
+// tests/suite.cpp; the extern declaration must stay OUTSIDE the anonymous
+// namespace below, or it would declare a NEW internal-linkage object.
+uint8_t* const c_zone = ::g_zone;
 
 // Task-safe accounting: every mutation happens inside this test's own
 // spinlock, so the counters are exact even across cores.
@@ -143,13 +151,13 @@ void maintainer_task(void*) {
 
 } // namespace
 
-extern "C" int pondmerge_run_concurrency_tests(void) {
+int pondmerge_run_concurrency_tests(void) {
     printf("[CONC] dual-core borrow/pause/compact lock boundary\n");
     uint32_t const f0 = c_fails;
 
-    pm::Config cfg{c_zone, sizeof(c_zone), 4096};
+    pm::Config cfg{c_zone, 2 * 4096, 4096}; // first two segments of the shared zone
     CCHECK_ST(pm::init(cfg), pm::Status::Ok);
-    CCHECK_ST(pm::create_pool(c.pool, 4), pm::Status::Ok);
+    CCHECK_ST(pm::create_pool(c.pool, 2), pm::Status::Ok);
     CCHECK_ST(pm::alloc(c.pool, 64, 8, 0, 1, c.ref_a), pm::Status::Ok);
     CCHECK_ST(pm::alloc(c.pool, 64, 8, 0, 2, c.ref_b), pm::Status::Ok);
     {

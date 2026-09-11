@@ -41,7 +41,7 @@ static uint32_t g_fails = 0;
         }                                                                              \
     } while (0)
 
-static uint8_t g_zone[256 * 1024] __attribute__((aligned(16)));
+uint8_t g_zone[256 * 1024] __attribute__((aligned(16))); // extern: the device concurrency test borrows the low segments
 
 static void fresh() {
     pm::Config cfg{g_zone, sizeof(g_zone), 4096};
@@ -2184,20 +2184,30 @@ namespace {
 using pm::internal::ObjectDesc;
 using pm::internal::Pool;
 
-uint8_t g_snap_zone[32 * 1024]; // Auto Zone byte-range snapshot
-uint8_t g_snap_pool_a[sizeof(Pool)];
-uint8_t g_snap_pool_b[sizeof(Pool)];
-uint8_t g_snap_desc[6][sizeof(ObjectDesc)];
+// Fault-injection snapshot storage. The device's static DRAM is nearly
+// exhausted by the Auto Zone plus the fixed metadata, so the TEST
+// SCAFFOLDING (not the library -- the core stays allocation-free) takes one
+// ~9.5 KiB block from the free heap at first use and keeps it for the run.
+struct SnapBufs {
+    uint8_t zone[8 * 1024]; // Auto Zone byte-range snapshot (2 segments max)
+    uint8_t pool_a[sizeof(Pool)];
+    uint8_t pool_b[sizeof(Pool)];
+    uint8_t desc[3][sizeof(ObjectDesc)];
+};
+SnapBufs* g_snap = nullptr;
 
 void snap_all(pm::PoolId a, pm::PoolId b, pm::RawRef const* refs, uint32_t nrefs,
               void const* zone_from, uint32_t zone_len) {
     using namespace pm::internal;
-    memcpy(g_snap_pool_a, &g().pools[a], sizeof(Pool));
-    memcpy(g_snap_pool_b, &g().pools[b], sizeof(Pool));
-    for (uint32_t i = 0; i < nrefs && i < 6; ++i)
-        memcpy(g_snap_desc[i], &g().objects[refs[i].index], sizeof(ObjectDesc));
-    if (zone_len > sizeof(g_snap_zone)) zone_len = sizeof(g_snap_zone);
-    memcpy(g_snap_zone, zone_from, zone_len);
+    if (!g_snap) g_snap = static_cast<SnapBufs*>(malloc(sizeof(SnapBufs)));
+    CHECK(g_snap != nullptr);
+    if (!g_snap) return;
+    memcpy(g_snap->pool_a, &g().pools[a], sizeof(Pool));
+    memcpy(g_snap->pool_b, &g().pools[b], sizeof(Pool));
+    for (uint32_t i = 0; i < nrefs && i < 3; ++i)
+        memcpy(g_snap->desc[i], &g().objects[refs[i].index], sizeof(ObjectDesc));
+    if (zone_len > sizeof(g_snap->zone)) zone_len = sizeof(g_snap->zone);
+    memcpy(g_snap->zone, zone_from, zone_len);
 }
 
 void check_all_unchanged(pm::PoolId a, pm::PoolId b, pm::RawRef const* refs, uint32_t nrefs,
@@ -2207,37 +2217,38 @@ void check_all_unchanged(pm::PoolId a, pm::PoolId b, pm::RawRef const* refs, uin
         for (size_t k = 0; k < n; ++k) if (x[k] != y[k]) return (long)k;
         return -1;
     };
-    if (memcmp(&g().pools[a], g_snap_pool_a, sizeof(Pool)) != 0) {
-        long k = first_diff(reinterpret_cast<uint8_t const*>(&g().pools[a]), g_snap_pool_a, sizeof(Pool));
+    if (!g_snap) { ++g_fails; printf("    snap buffers missing\n"); return; }
+    if (memcmp(&g().pools[a], g_snap->pool_a, sizeof(Pool)) != 0) {
+        long k = first_diff(reinterpret_cast<uint8_t const*>(&g().pools[a]), g_snap->pool_a, sizeof(Pool));
         printf("    DIFF pool a byte %ld: now %02x snap %02x\n", k,
-               reinterpret_cast<uint8_t const*>(&g().pools[a])[k], g_snap_pool_a[k]);
+               reinterpret_cast<uint8_t const*>(&g().pools[a])[k], g_snap->pool_a[k]);
     }
-    CHECK(memcmp(&g().pools[a], g_snap_pool_a, sizeof(Pool)) == 0);
-    if (memcmp(&g().pools[b], g_snap_pool_b, sizeof(Pool)) != 0) {
-        long k = first_diff(reinterpret_cast<uint8_t const*>(&g().pools[b]), g_snap_pool_b, sizeof(Pool));
+    CHECK(memcmp(&g().pools[a], g_snap->pool_a, sizeof(Pool)) == 0);
+    if (memcmp(&g().pools[b], g_snap->pool_b, sizeof(Pool)) != 0) {
+        long k = first_diff(reinterpret_cast<uint8_t const*>(&g().pools[b]), g_snap->pool_b, sizeof(Pool));
         printf("    DIFF pool b byte %ld: now %02x snap %02x\n", k,
-               reinterpret_cast<uint8_t const*>(&g().pools[b])[k], g_snap_pool_b[k]);
+               reinterpret_cast<uint8_t const*>(&g().pools[b])[k], g_snap->pool_b[k]);
     }
-    CHECK(memcmp(&g().pools[b], g_snap_pool_b, sizeof(Pool)) == 0);
-    for (uint32_t i = 0; i < nrefs && i < 6; ++i) {
-        if (memcmp(&g().objects[refs[i].index], g_snap_desc[i], sizeof(ObjectDesc)) != 0) {
+    CHECK(memcmp(&g().pools[b], g_snap->pool_b, sizeof(Pool)) == 0);
+    for (uint32_t i = 0; i < nrefs && i < 3; ++i) {
+        if (memcmp(&g().objects[refs[i].index], g_snap->desc[i], sizeof(ObjectDesc)) != 0) {
             long k = first_diff(reinterpret_cast<uint8_t const*>(&g().objects[refs[i].index]),
-                                g_snap_desc[i], sizeof(ObjectDesc));
-            printf("    DIFF desc[%u] (slot %u) byte %ld: now %02x snap %02x\n", i,
-                   refs[i].index, k,
+                                g_snap->desc[i], sizeof(ObjectDesc));
+            printf("    DIFF desc[%u] (slot %u) byte %ld: now %02x snap %02x\n",
+                   (unsigned)i, (unsigned)refs[i].index, k,
                    reinterpret_cast<uint8_t const*>(&g().objects[refs[i].index])[k],
-                   g_snap_desc[i][k]);
+                   g_snap->desc[i][k]);
         }
-        CHECK(memcmp(&g().objects[refs[i].index], g_snap_desc[i], sizeof(ObjectDesc)) == 0);
+        CHECK(memcmp(&g().objects[refs[i].index], g_snap->desc[i], sizeof(ObjectDesc)) == 0);
     }
-    if (zone_len > sizeof(g_snap_zone)) zone_len = sizeof(g_snap_zone);
-    if (memcmp(zone_from, g_snap_zone, zone_len) != 0) {
-        long k = first_diff(reinterpret_cast<uint8_t const*>(zone_from), g_snap_zone, zone_len);
+    if (zone_len > sizeof(g_snap->zone)) zone_len = sizeof(g_snap->zone);
+    if (memcmp(zone_from, g_snap->zone, zone_len) != 0) {
+        long k = first_diff(reinterpret_cast<uint8_t const*>(zone_from), g_snap->zone, zone_len);
         printf("    DIFF zone byte %ld (abs %ld): now %02x snap %02x\n", k,
                (long)(reinterpret_cast<uint8_t const*>(zone_from) - g().zone) + k,
-               reinterpret_cast<uint8_t const*>(zone_from)[k], g_snap_zone[k]);
+               reinterpret_cast<uint8_t const*>(zone_from)[k], g_snap->zone[k]);
     }
-    CHECK(memcmp(zone_from, g_snap_zone, zone_len) == 0);
+    CHECK(memcmp(zone_from, g_snap->zone, zone_len) == 0);
 }
 } // namespace
 
@@ -2261,8 +2272,8 @@ static void test_merge_transaction_faults() {
         memset(&g(), 0, sizeof(GlobalState)); // white-box power cycle
         pm::Config cfg{g_zone, sizeof(g_zone), 4096};
         CHECK_ST(pm::init(cfg), pm::Status::Ok);
-        CHECK_ST(pm::create_pool(tgt, 2), pm::Status::Ok); // segs 0-1 (below)
-        CHECK_ST(pm::create_pool(src, 2), pm::Status::Ok); // segs 2-3 (above)
+        CHECK_ST(pm::create_pool(tgt, 1), pm::Status::Ok); // seg 0 (below)
+        CHECK_ST(pm::create_pool(src, 1), pm::Status::Ok); // seg 1 (above)
         pm::RawRef tpad{}, spad{};
         CHECK_ST(pm::alloc(tgt, 256, 8, 0, 1, ot), pm::Status::Ok);
         CHECK_ST(pm::alloc(tgt, 512, 8, 0, 2, tpad), pm::Status::Ok);
@@ -2285,9 +2296,9 @@ static void test_merge_transaction_faults() {
         using namespace pm::internal;
         uint16_t const saved = g().objects[os.index].pool_id;
         g().objects[os.index].pool_id = tgt;
-        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
-        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK(get_stats_state(src) == 1 && get_stats_state(tgt) == 1);
         g().objects[os.index].pool_id = saved;
         VALIDATE(src); VALIDATE(tgt);
@@ -2299,9 +2310,9 @@ static void test_merge_transaction_faults() {
         using namespace pm::internal;
         uint8_t* const saved = g().objects[os.index].address;
         g().objects[os.index].address = g().zone + 5 * 4096 + 64;
-        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
-        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         g().objects[os.index].address = saved;
         VALIDATE(src); VALIDATE(tgt);
     }
@@ -2314,9 +2325,9 @@ static void test_merge_transaction_faults() {
         memcpy(&hdr, os_blk, 4);
         uint32_t const bad = hdr + 8;
         memcpy(os_blk, &bad, 4);
-        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
-        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         memcpy(os_blk, &hdr, 4);
         VALIDATE(src); VALIDATE(tgt);
     }
@@ -2333,9 +2344,9 @@ static void test_merge_transaction_faults() {
         CHECK(hf < FL_COUNT);
         uint32_t const saved_head = T.bins.head[hf][hs];
         T.bins.head[hf][hs] = 0xFFFFFFF0u;
-        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
-        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         T.bins.head[hf][hs] = saved_head;
         VALIDATE(tgt); VALIDATE(src);
     }
@@ -2347,9 +2358,9 @@ static void test_merge_transaction_faults() {
         using namespace pm::internal;
         uint32_t const saved_used = g().pools[tgt].used_bytes;
         g().pools[tgt].used_bytes = saved_used + 8;
-        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
-        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         g().pools[tgt].used_bytes = saved_used;
         VALIDATE(tgt); VALIDATE(src);
     }
@@ -2362,9 +2373,9 @@ static void test_merge_transaction_faults() {
         CHECK_ST(pm::pause(tgt), pm::Status::Ok);
         uint16_t const saved = g().objects[os.index].pool_id;
         g().objects[os.index].pool_id = tgt;
-        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
-        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK(get_stats_state(src) == 2 && get_stats_state(tgt) == 2);
         g().objects[os.index].pool_id = saved;
         CHECK_ST(pm::resume(src), pm::Status::Ok);
@@ -2380,9 +2391,9 @@ static void test_merge_transaction_faults() {
         uint32_t const saved_next = d_os.addr_next;
         d_os.addr_next = pin.index;                    // os -> pin -> os -> ...
         g().objects[pin.index].addr_next = os.index;
-        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
-        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         d_os.addr_next = saved_next;
         g().objects[pin.index].addr_next = NO_ORDER;
         VALIDATE(src); VALIDATE(tgt);
@@ -2394,9 +2405,9 @@ static void test_merge_transaction_faults() {
         using namespace pm::internal;
         uint32_t const saved_head = g().pools[src].order_head;
         g().pools[src].order_head = PM_MAX_OBJECTS;
-        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
-        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 4 * 4096);
+        check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         g().pools[src].order_head = saved_head;
         VALIDATE(src); VALIDATE(tgt);
     }
@@ -2430,8 +2441,8 @@ static void test_descriptor_outside_pool() {
     printf("  [R23] out-of-pool descriptors refused at every entry\n");
     fresh();
     pm::PoolId a{}, b{};
-    CHECK_ST(pm::create_pool(a, 2), pm::Status::Ok);
-    CHECK_ST(pm::create_pool(b, 2), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(a, 1), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(b, 1), pm::Status::Ok);
     pm::RawRef y{}, a1{};
     CHECK_ST(pm::alloc(b, 128, 8, 0, 1, y), pm::Status::Ok);
     CHECK_ST(pm::alloc(a, 128, 8, pm::PM_PINNED, 2, a1), pm::Status::Ok);
@@ -2455,10 +2466,10 @@ static void test_descriptor_outside_pool() {
         CHECK_ST(pm::borrow_begin(a1, 128, 1, p), pm::Status::CorruptMetadata);
         CHECK(p == nullptr);
         int const dc = g_destroy_calls;
-        snap_all(a, b, refs, 2, seg_base(P.segment_first), 2 * 4096);
+        snap_all(a, b, refs, 2, seg_base(P.segment_first), 1 * 4096);
         CHECK_ST(pm::free(a1), pm::Status::CorruptMetadata);
         CHECK(g_destroy_calls == dc);  // no callback before the physical proof
-        check_all_unchanged(a, b, refs, 2, seg_base(P.segment_first), 2 * 4096);
+        check_all_unchanged(a, b, refs, 2, seg_base(P.segment_first), 1 * 4096);
     };
     auto repair = [&]() {
         d.address = saved_addr;
@@ -2524,7 +2535,7 @@ static void test_free_physical_header_faults() {
     printf("  [R24] free verifies physical headers before any side effect\n");
     fresh();
     pm::PoolId pool{};
-    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(pool, 1), pm::Status::Ok);
     // Layout: [pad0 128][pin 128][pad2 512]; pad0 freed -> free predecessor.
     pm::RawRef pad0{}, pin{}, pad2{};
     CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, pad0), pm::Status::Ok);
@@ -2551,11 +2562,11 @@ static void test_free_physical_header_faults() {
     uint32_t const nown0 = rd32(nblk);      // 520, used
 
     auto refuses = [&]() {
-        snap_all(pool, pool, refs, 3, seg_base(P.segment_first), 2 * 4096);
+        snap_all(pool, pool, refs, 3, seg_base(P.segment_first), 1 * 4096);
         int const dc = g_destroy_calls;
         CHECK_ST(pm::free(pin), pm::Status::CorruptMetadata);
         CHECK(g_destroy_calls == dc);  // callback waits for the physical proof
-        check_all_unchanged(pool, pool, refs, 3, seg_base(P.segment_first), 2 * 4096);
+        check_all_unchanged(pool, pool, refs, 3, seg_base(P.segment_first), 1 * 4096);
     };
 
     // (1) own header size disagrees with the descriptor
@@ -2621,7 +2632,7 @@ static void test_free_physical_header_faults() {
     CHECK(g_destroy_calls == dc + 1);
     CHECK_ST(pm::free(pad2), pm::Status::Ok);
     pm::PoolStats st = pm::get_stats(pool);
-    CHECK(st.largest_free_block == 2 * 4096); // everything coalesced back
+    CHECK(st.largest_free_block == 1 * 4096); // everything coalesced back
     VALIDATE(pool);
     CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
     done();

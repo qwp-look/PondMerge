@@ -565,12 +565,11 @@ struct MovePlanEntry {
     uint32_t slot;
     uint32_t dst_off; // zone offset of the new block start
     uint32_t size;
-    uint16_t pool_id; // owning pool at plan time (merge rewrites source objects)
 };
 MovePlanEntry s_plan[PM_MAX_OBJECTS];    // lower-side packing (ascending moves)
 MovePlanEntry s_upper[PM_MAX_OBJECTS];   // upper-side packing (descending moves)
 uint8_t* s_barriers[PM_MAX_OBJECTS]; // pinned block starts (address order)
-uint32_t s_slots[PM_MAX_OBJECTS];    // audited address-order slot list
+uint16_t s_slots[PM_MAX_OBJECTS];    // audited address-order slot list
 
 // --- compaction core ---------------------------------------------------------
 // Requires: state == Compacting, borrow_count == 0 (caller validated).
@@ -1275,6 +1274,11 @@ Status merge(PoolId source_id, PoolId target_id) {
     uint8_t* const end = pool_end(*upper);
     Status st = Status::Ok;
     uint32_t nslot = 0, nbar = 0, nplan = 0;
+    // The combined sequence is (lower pool, upper pool); the source objects
+    // are therefore one contiguous run of the plan -- the prefix when the
+    // source is the lower pool, the suffix otherwise (precheck audited the
+    // live counts). No per-entry pool field is needed.
+    uint32_t const n_lower = (uint32_t)lower->live_objects;
 
     // Full audit of BOTH pools before any planning: order lists, descriptor
     // ranges, physical header agreement and statistics (precheck_pool), then
@@ -1326,7 +1330,6 @@ Status merge(PoolId source_id, PoolId target_id) {
                 s_plan[nplan].slot = s_slots[i];
                 s_plan[nplan].dst_off = off_of(bstart);
                 s_plan[nplan].size = bsize;
-                s_plan[nplan].pool_id = d.pool_id;
                 nplan++;
                 cursor = bstart + bsize;
                 bar++;
@@ -1340,7 +1343,6 @@ Status merge(PoolId source_id, PoolId target_id) {
             s_plan[nplan].slot = s_slots[i];
             s_plan[nplan].dst_off = off_of(cursor);
             s_plan[nplan].size = bsize;
-            s_plan[nplan].pool_id = d.pool_id; // source objects adopt the target
             nplan++;
             cursor += bsize;
         }
@@ -1360,7 +1362,9 @@ Status merge(PoolId source_id, PoolId target_id) {
                 d.address = dst + BLOCK_HEADER_SIZE;
                 bump_epoch(d.address_epoch);
             }
-            if (s_plan[i].pool_id != target_id) {
+            bool const from_source =
+                source_below ? (i < n_lower) : (i >= n_lower);
+            if (from_source) {
                 d.pool_id = target_id;
                 bump_epoch(d.address_epoch); // even if the address is unchanged
             }
