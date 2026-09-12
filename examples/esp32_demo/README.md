@@ -25,7 +25,9 @@ while True:
     print(l)'
 ```
 
-or point the Host demo server at the device (display-only mode):
+or point the Host demo server at the device (DISPLAY-ONLY mode — the UI
+renders the streamed snapshots; commands are not forwarded to the device,
+because the firmware scene is scripted):
 
 ```sh
 python3 examples/demo_server.py --serial /dev/ttyACM0 --port 8080
