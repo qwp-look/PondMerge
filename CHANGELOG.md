@@ -39,6 +39,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   scaling, and a fragmentation A/B (compaction on vs off, same allocator).
 - `tests/consumer_smoke.sh`, an end-to-end proof of the install + `find_package`
   consumption path.
+- `tests/run_host.sh --coverage`: line and branch coverage of the core over the
+  acceptance suite, with an enforced floor. Measured at this commit: **96.47% of
+  1302 lines, 98.75% of branches executed, 77.09% of branches taken**.
+- `tests/run_host.sh --fuzz` plus `fuzz/fuzz_pm.cpp`: a structure-aware libFuzzer
+  target that replays byte-derived operation sequences against the public API
+  under ASan + UBSan, looking for the crashes, hangs and UB that a curated suite
+  cannot reasonably reach. Run with `PM_DEBUG=0` so that a caller bug (which
+  Debug aborts on by design) is not mistaken for a crash. Bounded runs of 60 s
+  executed 31-61 million inputs with no crash and no sanitizer finding. Its
+  limitation is recorded in the source: edge coverage plateaus quickly
+  (~400-450 edges), so its value is the volume of random sequences rather than
+  deep exploration.
 
 ## [1.0.0] - 2026-09-12
 

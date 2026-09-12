@@ -4,3 +4,9 @@ esp32/sdkconfig
 esp32/sdkconfig.old
 esp32/dependencies.lock
 *.o
+# gcov writes one .gcov per source into the directory it was invoked from;
+# tests/run_host.sh --coverage invokes it inside build/cov. This is a safety net
+# so a manual gcov run cannot leave uncommitted files in the repository root.
+*.gcov
+*.gcda
+*.gcno

@@ -113,6 +113,19 @@
    **换来的**是 alloc 与 live 数解耦（实测 799→38 ns @1024，232→38 ns @256）
    以及地址序维护成本的冷路径化（每次维护一次 O(n log n)，在 memmove 面前可忽略）。
    若将来需要"alloc 也拒绝损坏结构"，须先恢复一次遍历，届时会重新引入 O(live)。
+9. **`validate` 保持二次复杂度（O((live+free)²)），不做线性化**（本轮决策，
+   非遗漏）。已实测：192 块 13.9 µs → 1536 块 1665.8 µs（指数 ≈1.74，见
+   `bench/RESULTS.md` §2）。线性化的自然做法是"把 live ∪ free 按地址归并成一次
+   扫描"，但它需要 **O(free) 的额外 scratch** 来排序空闲块（bins 是按尺寸分箱的，
+   不提供地址序）。而 **free 在最坏情形下不被 `PM_MAX_OBJECTS` 约束**：两个空闲块
+   可以由一段 sub-minimal slack 隔开（`free()` 只合并物理相邻块，slack 头部被
+   poison 为 0 因而不参与合并），因此 `free ≤ live + 1` 不成立。一个按
+   `PM_MAX_OBJECTS + 1` 定长的数组会在合法的极端池上**误报 CorruptMetadata**，
+   而 `validate` 恰恰是"报告 OK 即真的结构完好"的那一个函数，不能引入假阳性；
+   按 `capacity / PM_MIN_BLOCK + 1` 定长则要 64 KB（256 KiB 池）甚至 512 KB
+   （FL 上限 8 MiB），在设备 DRAM 上不可接受。
+   **触发条件**（满足即应重新评估）：出现"把 `validate` 纳入运行时健康监控"的
+   真实需求；届时应同时评估上述 scratch 预算与假阳性取舍。
 
 ## 7. 账本维护记录
 
