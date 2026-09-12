@@ -51,11 +51,14 @@ void emit_info(char const* event, char const* detail) {
 }
 
 // ---------- minimal flat-JSON parser (demo-side only) ------------------------
-// Parses one {"key":value,...} object where every value is a number, a
-// string, true/false or null. Fixed-capacity: at most 16 pairs, keys <= 23
-// chars, strings <= 47 chars. Any malformation (bad syntax, unterminated
-// input, overlong fields) fails the whole parse -- no partial results, no
-// sscanf defaults.
+// SUPPORTED SUBSET (documented in docs/DEMO_REQUIREMENTS section 2.1; this is
+// deliberately NOT a complete JSON parser): one flat {"key":value,...}
+// object; values are decimal integers, strings, or true/false/null (folded
+// to 0/1/0). Arrays, nested objects, hex and floating-point literals are
+// REJECTED with a structured INVALID_REQUEST. Capacity: <= 16 pairs, keys
+// <= 23 chars, strings <= 47 chars, lines <= 1024 bytes (the fgets buffer);
+// duplicate keys: first occurrence wins. Anything malformed fails the whole
+// parse -- no partial results, no silent defaults.
 constexpr uint32_t JSON_MAX_PAIRS = 16;
 struct JPair {
     char key[24];

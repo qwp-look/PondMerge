@@ -173,34 +173,67 @@ def main():
     recs = d.op("split", source=0, segments=2)
     check(status_of(recs) == "OK", "split")
 
-    # ---- malformed input: structured rejection, scene intact ----
-    bad_inputs = [
+    # ---- malformed input: structured rejection, scene provably intact ----
+    # (a) pure-reject inputs: ONE bare INVALID_REQUEST result, no snapshot;
+    #     the scene snapshot before/after each rejection must be IDENTICAL
+    #     (object set, digests, pool layout, counters) -- round-8 guide §7.
+    reject_inputs = [
         "not json at all",
         "",
         "   ",
-        '{"cmd": "alloc", "pool": 0, "size": 100}',      # spaces + missing align
         '{ "cmd" : "free" }',                             # missing id
         '{"cmd":"alloc","pool":0,"size":"hundred"}',      # wrong type
         '{"cmd":"nosuchcommand"}',                        # unknown
         '{"no_cmd":1}',
         '{"cmd":"alloc","pool":0,"size":99999999999}',    # out of range
+        '{"cmd":"alloc","pool":0,"size":{"a":1}}',        # nested object
+        '{"cmd":"alloc","pool":[0]}',                     # array
+        '{"cmd":"alloc","pool":0,"size":0x10}',           # hex literal
+        '{"cmd":"alloc","pool":0,"size":1.5}',            # float
+        '{"cmd":"alloc","pool":-1,"size":10}',            # negative
+        '{"cmd":"' + "x" * 200 + '"}',                    # overlong value
+        '{"' + "k" * 40 + '":1,"cmd":"advice"}',          # overlong key
     ]
+
+    def scene_signature(snap):
+        objs = sorted((o["object_id"], o["generation"], o["pool_id"],
+                       o["address_offset"], o["payload_digest"])
+                      for o in snap["objects"])
+        pools = sorted((p["pool_id"], p["state"], p["used_bytes"],
+                        p["free_bytes"], p["live_objects"])
+                       for p in snap["pools"])
+        return objs, pools
+
     seq_before = snapshot_of(d.op("advice", pool=0))["seq"]
-    for text in bad_inputs:
+    for text in reject_inputs:
+        before = snapshot_of(d.op("advice", pool=0))
         recs = d.line(text, until_snapshot=False)
         check(len(recs) > 0, f"answer emitted for {text[:32]!r}")
         result = next((r for r in recs if r.get("t") == "result"), None)
         check(result is not None, f"result for {text[:32]!r}")
         if result:
-            # a malformed line is answered with a structured INVALID_REQUEST;
-            # a parseable command with defaulted optional fields may execute
-            # (status OK) -- both are structured answers, never silence
-            check(result.get("status") in ("INVALID_REQUEST", "OK"),
-                  f"structured answer for {text[:32]!r}")
-        # (the client drains leftovers before every send, so a command that
-        # executed with defaulted fields cannot desync the stream)
+            check(result.get("status") == "INVALID_REQUEST",
+                  f"INVALID_REQUEST for {text[:32]!r}")
+        after = snapshot_of(d.op("advice", pool=0))
+        check(scene_signature(before) == scene_signature(after),
+              f"scene unchanged after {text[:32]!r}")
     snap = snapshot_of(d.op("advice", pool=0))
     check(snap["seq"] > seq_before, "seq monotonic after rejections")
+
+    # (b) duplicate keys: FIRST occurrence wins (DEMO_REQUIREMENTS §2.1) --
+    #     size 0 (first) means generic advice, not a request error
+    recs = d.line('{"cmd":"advice","pool":0,"size":0,"size":100}')
+    result = next((r for r in recs if r.get("t") == "result"), None)
+    check(result is not None and "verdict" in result,
+          "duplicate key: first wins, advice still answers")
+
+    # (c) legal omitted-optional fields execute with the documented defaults
+    recs = d.op("alloc", pool=0, size=100)  # align/flags omitted
+    check(status_of(recs) == "OK", "omitted optional fields default")
+    snap = snapshot_of(recs)
+    new_obj = max(snap["objects"], key=lambda o: o["object_id"])
+    check(new_obj["flags"] == 0, "default flags = 0")
+    check(new_obj["block_size"] == 112, "default align 8 -> block 112")
 
     # ---- failed operations keep the scene consistent ----
     # object ids 1 and 3 were freed by the fragment step; free a survivor

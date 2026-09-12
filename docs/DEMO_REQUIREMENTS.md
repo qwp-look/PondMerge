@@ -66,12 +66,36 @@ Info   { t:"info", event, detail, commit }
   `INVALID_REQUEST` 结果记录，绝不静默取默认值。
 - 协议回归：`examples/protocol_smoke.py`（无浏览器依赖，58 项检查）。
 
+### 2.1 受限 JSON 子集与应答分类（第八轮明确化）
+
+**解析器支持的 JSON 子集**（host_demo 内置解析器，非完整 JSON）：
+
+| 项 | 规则 |
+|---|---|
+| 值类型 | 十进制整数、字符串、"true"/"false"/"null"（压成 0/1/0） |
+| 不支持 | 数组、嵌套对象、十六进制、浮点（解析即整条 INVALID_REQUEST） |
+| 容量 | 每行 ≤ 1024 字符；每对象 ≤ 16 个 pair；key ≤ 23 字符；字符串 ≤ 47 字符 |
+| 重复 key | **first wins**（明确语义，protocol_smoke 钉住） |
+| 未知字段 | 明确**忽略**（不拒绝） |
+| 转义 | 仅 `" ` / \n / \t`；其他转义序列拒绝 |
+
+**应答分类**（每类记录数量固定，protocol_smoke 按类验证）：
+
+| 命令类别 | 应答 |
+|---|---|
+| state-changing（alloc/free/fragment/compact/merge/split，成功或失败） | result + snapshot |
+| query（advice / thresholds） | result（thresholds 无 snapshot；advice 附 snapshot） |
+| parse error / 非法输入 | 仅 INVALID_REQUEST result，无 snapshot |
+| quit | bye info，不再发送 snapshot |
+
 ## 3. 串口/管道协议
 
 - Host 模式：命令行（紧凑 JSON，`{"cmd":"alloc","pool":0,"size":120,...}`）
   写入 demo 进程 stdin；record 行读自 stdout。
-- ESP32 模式：固件上电后自动执行固定脚本并连续输出；`demo_server --serial`
-  仅显示（设备端交互命令留待后续版本）。
+- ESP32 模式：**固定脚本场景，当前版本只输出快照（display-only）**——
+  设备端的 compact/merge/split 由固件场景触发，**不由浏览器命令触发**；
+  双向串口命令通道（Host → device JSON 命令行、owner task 内执行、
+  背压约束）留待后续版本（需求文档 §8 允许该选择）。
 - 命令集：`reset / alloc{pool,size,align,flags} / free{id} / fragment /
   advice{pool,size,align} / compact{pool} / merge{source,target} /
   split{source,segments} / thresholds{ratio,min} / quit`。

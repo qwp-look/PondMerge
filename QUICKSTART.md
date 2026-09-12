@@ -135,7 +135,7 @@ pm::validate(pool);     // 可选：全量结构审计
 |---|---|
 | `examples/demo_server.py --host build/host_demo` | Host 可视化 Demo（浏览器） |
 | `examples/host_demo.cpp` | Host demo 进程（命令 → JSON 快照） |
-| `examples/esp32_demo/` | ESP32 demo 固件（同一协议，串口输出） |
+| `examples/esp32_demo/` | ESP32 demo 固件（同一协议，串口输出；**固定脚本场景、只读展示**——设备端整理由固件触发，不支持浏览器命令） |
 | `tests/run_host.sh` | Host 验收套件（基础 1–13 + R1–R31 + 模型对拍） |
 | `tests/suite.cpp` | 全部回归组源码（host 与设备共用） |
 | `tests/model.cpp` | 参考模型对拍（独立预言机） |

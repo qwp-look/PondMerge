@@ -619,6 +619,28 @@ struct AdviceCache {
     uint32_t thr_min_bytes;
 };
 AdviceCache s_advice_cache[PM_MAX_POOLS];
+
+// Round-8 (guide section 3, plan A): Debug-only owner gate for the whole
+// advice family (analyze/poll/threshold accessors). The first advice-family
+// call after init() binds the calling context; a call from a different
+// context is a single-owner contract violation and aborts in Debug. Release
+// performs no runtime check and REQUIRES the caller to follow the contract
+// (same discipline as alloc/free/resolve/get_stats/validate). Lifecycle: the
+// binding is cleared by init()/deinit(); on ESP32 the id is the task handle,
+// so a deleted owner task requires a fresh init() to re-bind.
+#if PM_DEBUG
+uintptr_t s_advice_owner = 0;
+uint8_t s_advice_owner_bound = 0;
+bool advice_owner_check() {
+    uintptr_t const ctx = pm_port_context_id();
+    if (!s_advice_owner_bound) {
+        s_advice_owner = ctx;
+        s_advice_owner_bound = 1;
+        return true;
+    }
+    return s_advice_owner == ctx;
+}
+#endif
 uint16_t s_slots[PM_MAX_OBJECTS];    // audited address-order slot list
 
 // --- compaction core ---------------------------------------------------------
@@ -759,6 +781,9 @@ Status init(Config const& cfg) {
     // All checks passed: only now may global state be (re)initialized.
     memset(&G, 0, sizeof(G));
     memset(s_advice_cache, 0, sizeof(s_advice_cache)); // advice state reset
+#if PM_DEBUG
+    s_advice_owner_bound = 0; // the owner re-binds on the next advice call
+#endif
     G.zone = cfg.zone;
     G.segment_size = cfg.segment_size;
     G.segment_count = seg_count;
@@ -780,6 +805,9 @@ Status deinit() {
     if (G.live_object_count != 0) return Status::Busy;
     G.initialized = 0;
     memset(&G, 0, sizeof(G));
+#if PM_DEBUG
+    s_advice_owner_bound = 0;
+#endif
     return Status::Ok;
 }
 
@@ -1253,9 +1281,13 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align, v
 // analyze/poll write. The zero-side-effect guarantee covers every Pool,
 // ObjectDesc and Auto Zone byte (R31 snapshots prove it).
 // ---------------------------------------------------------------------------
-CompactionThresholds get_compaction_thresholds() { return s_advice_thresholds; }
+CompactionThresholds get_compaction_thresholds() {
+    PM_ASSERT(advice_owner_check()); // owner-context API (round-8)
+    return s_advice_thresholds;
+}
 
 void set_compaction_thresholds(CompactionThresholds const& t) {
+    PM_ASSERT(advice_owner_check());
     s_advice_thresholds = t; // single-owner configuration, taken as-is
 }
 
@@ -1298,11 +1330,18 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
         c.thr_min_bytes = s_advice_thresholds.fragment_min_bytes;
     };
 
-    GlobalState& G = g();
+    PM_ASSERT(advice_owner_check()); // owner-context API (round-8)
+    GlobalState const& G = g();
     if (!G.initialized) {
         store(0);
         return a;
     }
+    // Coherent observation point (round-8 guide section 5): under the
+    // single-owner contract NO allocator mutation can interleave with this
+    // analysis, so the sequential reads below (pool counters, order list,
+    // bins via get_stats) form one logical observation. This is NOT a
+    // lock-free concurrent-consistent snapshot -- concurrent monitoring is
+    // out of v1 scope (header contract).
     // Request validation comes FIRST (round-7 guide section 3): a malformed
     // caller request is INVALID_REQUEST -- distinct from metadata damage --
     // and returns WITHOUT refreshing the advice cache.
@@ -1424,12 +1463,13 @@ CompactionAdvice poll_compaction_advice(PoolId pool_id, CompactionRequest const*
     // caller was last told, not against the refresh itself. An
     // INVALID_REQUEST result never touches the cache and is reported on
     // every poll (caller errors are not state changes to be suppressed).
+    PM_ASSERT(advice_owner_check()); // owner-context API (round-8)
     AdviceCache prev{};
     if (pool_id < PM_MAX_POOLS) prev = s_advice_cache[pool_id];
     CompactionAdvice a = analyze_compaction(pool_id, expected);
     bool is_changed;
     if (a.verdict == CompactionVerdict::INVALID_REQUEST) {
-        is_changed = true;
+        is_changed = true; // caller errors are reported on every poll
     } else {
         Pool const* P = pool_at(pool_id);
         uint32_t const epoch = P ? P->structure_epoch : 0;

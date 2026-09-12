@@ -3679,7 +3679,42 @@ static void test_advice_change_key() {
         }
     }
 
-    for (auto& i : o) CHECK_ST(pm::free(i), pm::Status::Ok);
+    for (auto const& i : o) CHECK_ST(pm::free(i), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R34) round-8 guide section 3: the advice family is an owner-context API
+// with a Debug-only owner gate. In-process checks: the first advice call
+// binds the context, later calls keep it, init()/deinit() re-arm the
+// binding, and the gate is O(1). The cross-context VIOLATION aborts in
+// Debug (caller bug, like a duplicate borrow_end) and is diagnosed by the
+// separate examples/owner_probe.cpp; Release performs no runtime check and
+// requires the caller to follow the contract.
+// ---------------------------------------------------------------------------
+static void test_advice_owner_gate() {
+    printf("  [R34] advice owner gate binding/lifecycle\n");
+    fresh(); // init() clears any previous binding
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+
+    // First call binds this context; all family members then accept it.
+    pm::CompactionAdvice a = pm::analyze_compaction(pool);
+    CHECK(a.verdict == pm::CompactionVerdict::NO_ACTION);
+    CHECK(pm::poll_compaction_advice(pool, nullptr, nullptr).verdict ==
+          pm::CompactionVerdict::NO_ACTION);
+    pm::CompactionThresholds t = pm::get_compaction_thresholds();
+    pm::set_compaction_thresholds(t);
+    CHECK(pm::get_compaction_thresholds().fragment_ratio_permille ==
+          t.fragment_ratio_permille);
+
+    // deinit()/init() re-arms the binding: the next advice call re-binds.
+    CHECK_ST(pm::deinit(), pm::Status::Ok);
+    CHECK_ST(pm::init({g_zone, sizeof(g_zone), 4096}), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    a = pm::analyze_compaction(pool);
+    CHECK(a.verdict == pm::CompactionVerdict::NO_ACTION);
+    CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
     done();
 }
 
@@ -3746,6 +3781,7 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R31_compaction_advice", test_compaction_advice);
     run("R32_advice_invalid_request", test_advice_invalid_request);
     run("R33_advice_change_key", test_advice_change_key);
+    run("R34_advice_owner_gate", test_advice_owner_gate);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;
