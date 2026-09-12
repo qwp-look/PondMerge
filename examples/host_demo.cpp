@@ -50,6 +50,101 @@ void emit_info(char const* event, char const* detail) {
            event, detail);
 }
 
+// ---------- minimal flat-JSON parser (demo-side only) ------------------------
+// Parses one {"key":value,...} object where every value is a number, a
+// string, true/false or null. Fixed-capacity: at most 16 pairs, keys <= 23
+// chars, strings <= 47 chars. Any malformation (bad syntax, unterminated
+// input, overlong fields) fails the whole parse -- no partial results, no
+// sscanf defaults.
+constexpr uint32_t JSON_MAX_PAIRS = 16;
+struct JPair {
+    char key[24];
+    bool is_str;
+    char sval[48];
+    long long nval;
+};
+struct JObj {
+    JPair pairs[JSON_MAX_PAIRS];
+    uint32_t n = 0;
+    JPair const* find(char const* key) const {
+        for (uint32_t i = 0; i < n; ++i)
+            if (strcmp(pairs[i].key, key) == 0) return &pairs[i];
+        return nullptr;
+    }
+    bool num(char const* key, long long& out) const {
+        JPair const* p = find(key);
+        if (!p || p->is_str) return false;
+        out = p->nval;
+        return true;
+    }
+};
+
+bool json_skip_ws(char const*& s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') ++s;
+    return true;
+}
+bool json_parse_string(char const*& s, char* out, uint32_t cap) {
+    if (*s != '"') return false;
+    ++s;
+    uint32_t n = 0;
+    while (*s && *s != '"') {
+        char c = *s++;
+        if (c == '\\') { // accept the common escapes; reject unknown ones
+            char e = *s++;
+            if (e == '"' || e == '\\' || e == '/') c = e;
+            else if (e == 'n') c = '\n';
+            else if (e == 't') c = '\t';
+            else return false;
+        }
+        if (n + 1 >= cap) return false;
+        out[n++] = c;
+    }
+    if (*s != '"') return false;
+    ++s;
+    out[n] = 0;
+    return true;
+}
+bool json_parse_flat(char const* line, JObj& obj) {
+    obj.n = 0;
+    char const* s = line;
+    json_skip_ws(s);
+    if (*s != '{') return false;
+    ++s;
+    json_skip_ws(s);
+    if (*s == '}') return true; // empty object
+    while (true) {
+        json_skip_ws(s);
+        if (obj.n >= JSON_MAX_PAIRS) return false;
+        JPair& p = obj.pairs[obj.n];
+        p.is_str = false; p.nval = 0; p.sval[0] = 0;
+        if (!json_parse_string(s, p.key, sizeof(p.key))) return false;
+        json_skip_ws(s);
+        if (*s != ':') return false;
+        ++s;
+        json_skip_ws(s);
+        if (*s == '"') {
+            p.is_str = true;
+            if (!json_parse_string(s, p.sval, sizeof(p.sval))) return false;
+        } else {
+            char* end = nullptr;
+            long long v = strtoll(s, &end, 10);
+            if (end == s) { // not a number: true/false/null
+                if (strncmp(s, "true", 4) == 0) { v = 1; s += 4; }
+                else if (strncmp(s, "false", 5) == 0) { v = 0; s += 5; }
+                else if (strncmp(s, "null", 4) == 0) { v = 0; s += 4; }
+                else return false;
+            }
+            p.nval = v;
+            s = end;
+        }
+        ++obj.n;
+        json_skip_ws(s);
+        if (*s == ',') { ++s; continue; }
+        if (*s == '}') { ++s; json_skip_ws(s); return *s == 0; }
+        return false;
+    }
+}
+
 uint32_t fnv1a(uint8_t const* p, uint32_t n) {
     uint32_t h = 2166136261u;
     for (uint32_t i = 0; i < n; ++i) { h ^= p[i]; h *= 16777619u; }
@@ -186,12 +281,12 @@ void emit_snapshot() {
         pm::CompactionAdvice a = pm::analyze_compaction((pm::PoolId)pi);
         printf("%s{\"pool_id\":%u,\"verdict\":%d,\"fragment_ratio_permille\":%u,"
                "\"borrow_count\":%u,\"has_pinned_objects\":%u,"
-               "\"external_quiescence_required\":%u,"
+               "\"caller_must_establish_quiescence\":%u,"
                "\"estimated_moved_bytes\":%u}",
                first_adv ? "" : ",", (unsigned)pi, (int)a.verdict,
                (unsigned)a.fragment_ratio_permille, (unsigned)a.borrow_count,
                (unsigned)a.has_pinned_objects,
-               (unsigned)a.external_quiescence_required,
+               (unsigned)a.caller_must_establish_quiescence,
                (unsigned)a.estimated_moved_bytes);
         first_adv = false;
     }
@@ -276,6 +371,8 @@ void do_free(uint32_t id) {
 
 // Classic fragmentation maker: free every second live object of the lowest
 // pool, then allocate one small object so the freed holes stay stranded.
+// Protocol discipline: exactly ONE result + ONE snapshot per command -- the
+// refill alloc is inlined WITHOUT its own emission (do_alloc would emit).
 void do_fragment() {
     uint32_t lowest = 0xFFFF, freed = 0, pos = 0;
     for (auto const& e : g_entries)
@@ -289,7 +386,23 @@ void do_fragment() {
             ++pos;
         }
     }
-    if (freed != 0) do_alloc(lowest, 400, 0);
+    if (freed != 0) {
+        for (auto& e : g_entries) {
+            if (!e.live) {
+                pm::RawRef ref{};
+                if (pm::alloc((pm::PoolId)lowest, 400, 8, 0, 0, ref) == pm::Status::Ok) {
+                    e.live = true; e.id = g_next_id++; e.ref = ref; e.size = 400;
+                    e.seed = 1 + (g_next_id & 0xFF);
+                    void* p = nullptr;
+                    if (pm::borrow_begin(ref, 400, 1, p) == pm::Status::Ok) {
+                        memset(p, (int)e.seed, 400);
+                        pm::borrow_end(ref);
+                    }
+                }
+                break;
+            }
+        }
+    }
     emit_result("fragment", pm::Status::Ok);
 }
 
@@ -304,7 +417,7 @@ void do_advice(uint32_t pool_id, uint32_t size, uint32_t align) {
            "\"borrow_count\":%u,\"has_pinned_objects\":%u,"
            "\"request_can_fit_now\":%u,"
            "\"request_can_fit_after_compaction_estimate\":%u,"
-           "\"external_quiescence_required\":%u,"
+           "\"caller_must_establish_quiescence\":%u,"
            "\"estimated_moved_bytes\":%u}\n",
            (unsigned)pool_id, (int)a.verdict, (unsigned)a.capacity,
            (unsigned)a.used_bytes, (unsigned)a.free_bytes,
@@ -313,7 +426,7 @@ void do_advice(uint32_t pool_id, uint32_t size, uint32_t align) {
            (unsigned)a.borrow_count, (unsigned)a.has_pinned_objects,
            (unsigned)a.request_can_fit_now,
            (unsigned)a.request_can_fit_after_compaction_estimate,
-           (unsigned)a.external_quiescence_required,
+           (unsigned)a.caller_must_establish_quiescence,
            (unsigned)a.estimated_moved_bytes);
     fflush(stdout);
     emit_snapshot();
@@ -326,55 +439,104 @@ int main() {
     emit_info("ready", "host demo process");
     do_reset();
 
-    char line[512];
+    auto num_field = [](JObj const& o, char const* key, uint32_t& out,
+                        uint32_t def, bool required) -> bool {
+        long long v = 0;
+        if (!o.num(key, v)) {
+            if (required) return false;
+            out = def;
+            return true;
+        }
+        if (v < 0 || v > 0xFFFFFFFFll) return false;
+        out = (uint32_t)v;
+        return true;
+    };
+    auto reject = [](char const* op, char const* why) {
+        printf("{\"t\":\"result\",\"protocol\":1,\"op\":\"%s\","
+               "\"status\":\"INVALID_REQUEST\",\"why\":\"%s\"}\n",
+               op, why);
+        fflush(stdout);
+    };
+
+    char line[1024];
     while (fgets(line, sizeof(line), stdin)) {
-        uint32_t id = 0, size = 0, align = 0, pool_idx = 0;
-        uint32_t source = 0, target = 1, segments = 2, ratio = 0, minb = 0;
-        if (strstr(line, "\"reset\"")) { do_reset(); continue; }
-        if (strstr(line, "\"alloc\"")) {
-            unsigned uflags = 0;
-            sscanf(line,
-                   "{\"cmd\":\"alloc\",\"pool\":%u,\"size\":%u,\"align\":%u,"
-                   "\"flags\":%u}", &pool_idx, &size, &align, &uflags);
-            do_alloc(pool_idx, size, (uint16_t)uflags);
+        JObj cmd;
+        if (!json_parse_flat(line, cmd)) {
+            reject("parse", "malformed json");
             continue;
         }
-        if (strstr(line, "\"free\"")) {
-            sscanf(line, "{\"cmd\":\"free\",\"id\":%u}", &id);
-            do_free(id);
+        JPair const* c = cmd.find("cmd");
+        if (!c || !c->is_str) {
+            reject("parse", "missing cmd");
             continue;
         }
-        if (strstr(line, "\"fragment\"")) { do_fragment(); continue; }
-        if (strstr(line, "\"advice\"")) {
-            sscanf(line, "{\"cmd\":\"advice\",\"pool\":%u,\"size\":%u,\"align\":%u}",
-                   &pool_idx, &size, &align);
-            do_advice(pool_idx, size, align);
+        char const* op = c->sval;
+        uint32_t a = 0, b = 0, d = 0, e = 0;
+        if (strcmp(op, "reset") == 0) { do_reset(); continue; }
+        if (strcmp(op, "alloc") == 0) {
+            // pool/size required; align/flags optional with documented defaults
+            if (!num_field(cmd, "pool", a, 0, true) ||
+                !num_field(cmd, "size", b, 0, true) ||
+                !num_field(cmd, "align", d, 8, false) ||
+                !num_field(cmd, "flags", e, 0, false)) {
+                reject(op, "bad or out-of-range fields");
+                continue;
+            }
+            do_alloc(a, b, (uint16_t)e);
             continue;
         }
-        if (strstr(line, "\"compact\"")) {
-            sscanf(line, "{\"cmd\":\"compact\",\"pool\":%u}", &pool_idx);
-            emit_result("compact", pm::compact((pm::PoolId)pool_idx));
+        if (strcmp(op, "free") == 0) {
+            if (!num_field(cmd, "id", a, 0, true)) { reject(op, "bad id"); continue; }
+            do_free(a);
             continue;
         }
-        if (strstr(line, "\"merge\"")) {
-            sscanf(line, "{\"cmd\":\"merge\",\"source\":%u,\"target\":%u}",
-                   &source, &target);
-            emit_result("merge",
-                        pm::merge((pm::PoolId)source, (pm::PoolId)target));
+        if (strcmp(op, "fragment") == 0) { do_fragment(); continue; }
+        if (strcmp(op, "advice") == 0) {
+            if (!num_field(cmd, "pool", a, 0, true) ||
+                !num_field(cmd, "size", b, 0, false) ||
+                !num_field(cmd, "align", d, 8, false)) {
+                reject(op, "bad fields");
+                continue;
+            }
+            do_advice(a, b, d);
             continue;
         }
-        if (strstr(line, "\"split\"")) {
-            sscanf(line, "{\"cmd\":\"split\",\"source\":%u,\"segments\":%u}",
-                   &source, &segments);
+        if (strcmp(op, "compact") == 0) {
+            if (!num_field(cmd, "pool", a, 0, true)) { reject(op, "bad pool"); continue; }
+            emit_result("compact", pm::compact((pm::PoolId)a));
+            continue;
+        }
+        if (strcmp(op, "merge") == 0) {
+            if (!num_field(cmd, "source", a, 0, true) ||
+                !num_field(cmd, "target", b, 0, true)) {
+                reject(op, "bad pools");
+                continue;
+            }
+            emit_result("merge", pm::merge((pm::PoolId)a, (pm::PoolId)b));
+            continue;
+        }
+        if (strcmp(op, "split") == 0) {
+            if (!num_field(cmd, "source", a, 0, true) ||
+                !num_field(cmd, "segments", b, 2, false)) {
+                reject(op, "bad fields");
+                continue;
+            }
             pm::PoolId nid{};
-            emit_result("split", pm::split((pm::PoolId)source, segments, nid));
+            emit_result("split", pm::split((pm::PoolId)a, b, nid));
             continue;
         }
-        if (strstr(line, "\"thresholds\"")) {
-            int n = sscanf(line,
-                           "{\"cmd\":\"thresholds\",\"ratio\":%u,\"min\":%u}",
-                           &ratio, &minb);
-            if (n == 2) pm::set_compaction_thresholds({ratio, minb});
+        if (strcmp(op, "thresholds") == 0) {
+            long long ratio = 0, minb = 0;
+            bool has_ratio = cmd.find("ratio") != nullptr;
+            bool has_min = cmd.find("min") != nullptr;
+            if (has_ratio && has_min) {
+                if (!cmd.num("ratio", ratio) || !cmd.num("min", minb) ||
+                    ratio < 0 || ratio > 1000 || minb < 0 || minb > 0xFFFFFFFFll) {
+                    reject(op, "bad thresholds");
+                    continue;
+                }
+                pm::set_compaction_thresholds({(uint32_t)ratio, (uint32_t)minb});
+            }
             pm::CompactionThresholds t = pm::get_compaction_thresholds();
             printf("{\"t\":\"result\",\"protocol\":1,\"op\":\"thresholds\","
                    "\"status\":\"OK\",\"fragment_ratio_permille\":%u,"
@@ -384,8 +546,8 @@ int main() {
             fflush(stdout);
             continue;
         }
-        if (strstr(line, "\"quit\"")) break;
-        emit_info("error", "unknown command");
+        if (strcmp(op, "quit") == 0) break;
+        reject(op, "unknown command");
     }
     emit_info("bye", "");
     return 0;

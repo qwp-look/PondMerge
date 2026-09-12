@@ -250,6 +250,11 @@ enum class CompactionVerdict : uint8_t {
                               // move (no fragmentation)
     INVALID_METADATA,         // invalid pool id or damaged metadata detected
                               // by the advice's bounded audit
+    INVALID_REQUEST,          // round-7: the CALLER's request is malformed
+                              // (size 0, bad alignment, overflow, unservable
+                              // FL size). Distinct from INVALID_METADATA so
+                              // input errors are never mistaken for pool
+                              // damage; the advice cache is NOT touched.
 };
 
 // What the caller intends to allocate next (all optional). size 0 = "no
@@ -301,14 +306,31 @@ struct CompactionAdvice {
     // ---- expected-request echo (0 when no request was given)
     uint32_t expected_request_size;
     uint32_t expected_request_alignment;
+    uint32_t request_flags; // full request echo: part of the poll change key
+    uint32_t request_tag;
     uint8_t  request_can_fit_now;     // largest_free_block >= need
     uint8_t  request_can_fit_after_compaction_estimate; // free - fragment >= need
-    uint8_t  external_quiescence_required; // 1 = stop DMA/ISR/external users
-                                           // before calling compact()
+    // 1 = the CALLER must establish and drain the quiescence window (stop
+    // DMA/ISR/other tasks/external users) before calling compact(). This flag
+    // is a reminder of the caller's OBLIGATION: PondMerge has NOT detected
+    // external users and never will; 0 does NOT mean the pool is externally
+    // safe (round-7 guide section 7).
+    uint8_t  caller_must_establish_quiescence;
 };
 
-// Read-only analysis; may be called in any pool state. Returns INVALID_METADATA
-// for an unknown pool id or when the bounded audit detects damage.
+// Read-only analysis; may be called in any pool state. Returns
+// INVALID_METADATA for an unknown pool id or when the bounded audit detects
+// damage, and INVALID_REQUEST for a malformed expected request.
+//
+// CONCURRENCY BOUNDARY (round-7 guide sections 4/5): analyze_compaction,
+// poll_compaction_advice and the threshold accessors are OWNER-CONTEXT APIs,
+// exactly like alloc/free/resolve/get_stats/validate. They must not be called
+// from an ISR, not concurrently with alloc/free/maintenance, and not from two
+// contexts at once. Under that contract the internal reads (order list, bins,
+// pool counters) form one coherent observation; this is NOT a lock-free
+// concurrent-consistent snapshot, and v1 provides no such mechanism. All
+// internal cursors are range-checked and step-capped (O(objects + free
+// blocks) worst case, O(1) extra memory beyond the advice cache).
 CompactionAdvice analyze_compaction(PoolId pool,
                                     CompactionRequest const* expected = nullptr);
 

@@ -177,10 +177,10 @@ void emit_snapshot() {
         if (G.pools[pi].state == PoolState::Empty) continue;
         pm::CompactionAdvice a = pm::analyze_compaction((pm::PoolId)pi);
         printf("%s{\"pool_id\":%u,\"verdict\":%d,\"borrow_count\":%u,"
-               "\"has_pinned_objects\":%u,\"external_quiescence_required\":%u}",
+               "\"has_pinned_objects\":%u,\"caller_must_establish_quiescence\":%u}",
                first_adv ? "" : ",", (unsigned)pi, (int)a.verdict,
                (unsigned)a.borrow_count, (unsigned)a.has_pinned_objects,
-               (unsigned)a.external_quiescence_required);
+               (unsigned)a.caller_must_establish_quiescence);
         first_adv = false;
     }
     printf("]}\n");
@@ -197,10 +197,10 @@ void emit_advice(pm::PoolId pool, uint32_t size) {
     printf("{\"t\":\"result\",\"protocol\":1,\"op\":\"advice\",\"status\":\"OK\","
            "\"pool_id\":%u,\"verdict\":%d,\"request_can_fit_now\":%u,"
            "\"request_can_fit_after_compaction_estimate\":%u,"
-           "\"external_quiescence_required\":%u}\n",
+           "\"caller_must_establish_quiescence\":%u}\n",
            (unsigned)pool, (int)a.verdict, (unsigned)a.request_can_fit_now,
            (unsigned)a.request_can_fit_after_compaction_estimate,
-           (unsigned)a.external_quiescence_required);
+           (unsigned)a.caller_must_establish_quiescence);
 }
 
 } // namespace

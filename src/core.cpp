@@ -606,6 +606,17 @@ struct AdviceCache {
     uint32_t fragment_bytes;
     uint32_t request_size;
     uint32_t request_alignment;
+    // round-7: the change key covers every input the advice depends on
+    uint8_t pool_state;
+    uint8_t has_pinned;
+    uint8_t stats_valid;
+    uint32_t used_bytes;
+    uint32_t free_bytes;
+    uint32_t live_objects;
+    uint32_t request_flags;
+    uint32_t request_tag;
+    uint32_t thr_ratio_permille;
+    uint32_t thr_min_bytes;
 };
 AdviceCache s_advice_cache[PM_MAX_POOLS];
 uint16_t s_slots[PM_MAX_OBJECTS];    // audited address-order slot list
@@ -1255,11 +1266,81 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
     a.estimated_moved_bytes = COMPACTION_ESTIMATE_UNKNOWN;
     a.expected_request_size = expected ? expected->requested_size : 0;
     a.expected_request_alignment = expected ? expected->requested_alignment : 0;
+    a.request_flags = expected ? expected->requested_flags : 0;
+    a.request_tag = expected ? expected->user_tag : 0;
+
+    // The advice cache holds "what the caller was last told" (advice state,
+    // separate fixed storage -- never allocator metadata). EVERY analysis
+    // outcome refreshes it so state transitions (damage, recovery, verdict
+    // flips) are reported exactly once -- EXCEPT INVALID_REQUEST, which is a
+    // caller input error, not pool state, and must never clobber a valid
+    // cached advice (round-7 guide section 3).
+    auto store = [&](uint32_t epoch) {
+        if (pool_id >= PM_MAX_POOLS) return;
+        AdviceCache& c = s_advice_cache[pool_id];
+        c.valid = 1;
+        c.verdict = (uint8_t)a.verdict;
+        c.structure_epoch = epoch;
+        c.borrow_count = a.borrow_count;
+        c.largest_free_block = a.largest_free_block;
+        c.fragment_bytes = a.fragment_bytes;
+        c.request_size = a.expected_request_size;
+        c.request_alignment = a.expected_request_alignment;
+        c.pool_state = a.pool_state;
+        c.has_pinned = a.has_pinned_objects;
+        c.stats_valid = a.stats_valid;
+        c.used_bytes = a.used_bytes;
+        c.free_bytes = a.free_bytes;
+        c.live_objects = a.live_objects;
+        c.request_flags = a.request_flags;
+        c.request_tag = a.request_tag;
+        c.thr_ratio_permille = s_advice_thresholds.fragment_ratio_permille;
+        c.thr_min_bytes = s_advice_thresholds.fragment_min_bytes;
+    };
 
     GlobalState& G = g();
-    if (!G.initialized) return a;
+    if (!G.initialized) {
+        store(0);
+        return a;
+    }
+    // Request validation comes FIRST (round-7 guide section 3): a malformed
+    // caller request is INVALID_REQUEST -- distinct from metadata damage --
+    // and returns WITHOUT refreshing the advice cache.
+    uint32_t need = 0;
+    bool have_request = false;
+    if (expected) {
+        if (expected->requested_size == 0) {
+            a.verdict = CompactionVerdict::INVALID_REQUEST;
+            return a; // cache untouched by caller errors
+        }
+        uint32_t align = expected->requested_alignment;
+        if (align == 0) align = PM_ALIGNMENT;
+        if (align == 0 || (align & (align - 1)) != 0 || align > PM_MAX_ALIGNMENT) {
+            a.verdict = CompactionVerdict::INVALID_REQUEST;
+            return a;
+        }
+        if (expected->requested_size > UINT32_MAX - (PM_ALIGNMENT - 1)) {
+            a.verdict = CompactionVerdict::INVALID_REQUEST;
+            return a;
+        }
+        uint32_t payload = align_up_u(expected->requested_size, PM_ALIGNMENT);
+        if (payload > UINT32_MAX - BLOCK_HEADER_SIZE) {
+            a.verdict = CompactionVerdict::INVALID_REQUEST;
+            return a;
+        }
+        need = payload + BLOCK_HEADER_SIZE;
+        if (need < PM_MIN_BLOCK) need = PM_MIN_BLOCK;
+        if (need >= (1u << PM_FL_MAX)) { // unservable by the allocator: input error
+            a.verdict = CompactionVerdict::INVALID_REQUEST;
+            return a;
+        }
+        have_request = true;
+    }
     Pool* P = pool_at(pool_id);
-    if (!P) return a;
+    if (!P) {
+        store(0);
+        return a;
+    }
 
     a.pool_state = (uint8_t)P->state;
     a.capacity = pool_capacity(*P);
@@ -1276,24 +1357,19 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
     if (walk_order(*P, pool_id, [&](ObjectDesc const& d, uint32_t) {
             if (d.flags & PM_PINNED) a.has_pinned_objects = 1;
             return Status::Ok;
-        }) != Status::Ok)
-        return a; // damaged order list: INVALID_METADATA, nothing written
+        }) != Status::Ok) {
+        store(P->structure_epoch); // damage is state the caller was told about
+        return a;                  // damaged order list: INVALID_METADATA
+    }
     PoolStats st = get_stats(pool_id);
     a.largest_free_block = st.largest_free_block;
     a.stats_valid = st.valid;
-    if (!st.valid) return a; // damaged free list
+    if (!st.valid) {
+        store(P->structure_epoch); // damaged free list: reported, then cached
+        return a;
+    }
 
-    // Expected-request arithmetic mirrors alloc() exactly (same rounding).
-    if (expected && expected->requested_size != 0) {
-        uint32_t align = expected->requested_alignment;
-        if (align == 0) align = PM_ALIGNMENT;
-        if (align == 0 || (align & (align - 1)) != 0 || align > PM_MAX_ALIGNMENT)
-            return a; // malformed request: INVALID_METADATA
-        uint32_t payload = align_up_u(expected->requested_size, PM_ALIGNMENT);
-        if (payload > UINT32_MAX - BLOCK_HEADER_SIZE) return a;
-        uint32_t need = payload + BLOCK_HEADER_SIZE;
-        if (need < PM_MIN_BLOCK) need = PM_MIN_BLOCK;
-        if (need >= (1u << PM_FL_MAX)) return a; // unservable by the allocator
+    if (have_request) {
         a.request_can_fit_now = (a.largest_free_block >= need) ? 1 : 0;
         // Honest estimate of the post-compaction largest block: slack
         // (fragment_bytes) cannot be merged by compaction; pinned barriers
@@ -1315,18 +1391,18 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
          stranded * 1000 / a.capacity >= s_advice_thresholds.fragment_ratio_permille);
     if (blocked) {
         a.verdict = CompactionVerdict::COMPACT_BLOCKED;
-    } else if (expected && expected->requested_size != 0) {
+    } else if (have_request) {
         if (a.request_can_fit_now) {
             a.verdict = CompactionVerdict::NO_ACTION;
         } else if (!a.request_can_fit_after_compaction_estimate) {
             a.verdict = CompactionVerdict::COMPACT_UNLIKELY_TO_HELP;
         } else {
             a.verdict = CompactionVerdict::COMPACT_RECOMMENDED;
-            a.external_quiescence_required = 1; // caller still owes the window
+            a.caller_must_establish_quiescence = 1; // caller owes the window
         }
     } else if (fragmented) {
         a.verdict = CompactionVerdict::COMPACT_RECOMMENDED;
-        a.external_quiescence_required = 1;
+        a.caller_must_establish_quiescence = 1;
     } else {
         a.verdict = CompactionVerdict::NO_ACTION;
     }
@@ -1337,15 +1413,7 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
         a.estimated_moved_bytes = 0;
     }
 
-    AdviceCache& c = s_advice_cache[pool_id];
-    c.valid = 1;
-    c.verdict = (uint8_t)a.verdict;
-    c.structure_epoch = P->structure_epoch;
-    c.borrow_count = a.borrow_count;
-    c.largest_free_block = a.largest_free_block;
-    c.fragment_bytes = a.fragment_bytes;
-    c.request_size = a.expected_request_size;
-    c.request_alignment = a.expected_request_alignment;
+    store(P->structure_epoch);
     return a;
 }
 
@@ -1353,20 +1421,37 @@ CompactionAdvice poll_compaction_advice(PoolId pool_id, CompactionRequest const*
                                         bool* changed) {
     // Snapshot the PREVIOUS cache first: analyze_compaction refreshes it, and
     // the suppression verdict must compare the fresh result against what the
-    // caller was last told, not against the refresh itself.
+    // caller was last told, not against the refresh itself. An
+    // INVALID_REQUEST result never touches the cache and is reported on
+    // every poll (caller errors are not state changes to be suppressed).
     AdviceCache prev{};
     if (pool_id < PM_MAX_POOLS) prev = s_advice_cache[pool_id];
     CompactionAdvice a = analyze_compaction(pool_id, expected);
-    bool is_changed = !prev.valid || prev.verdict != (uint8_t)a.verdict ||
-                      prev.structure_epoch != [&] {
-                          Pool const* P = pool_at(pool_id);
-                          return P ? P->structure_epoch : 0;
-                      }() ||
-                      prev.borrow_count != a.borrow_count ||
-                      prev.largest_free_block != a.largest_free_block ||
-                      prev.fragment_bytes != a.fragment_bytes ||
-                      prev.request_size != a.expected_request_size ||
-                      prev.request_alignment != a.expected_request_alignment;
+    bool is_changed;
+    if (a.verdict == CompactionVerdict::INVALID_REQUEST) {
+        is_changed = true;
+    } else {
+        Pool const* P = pool_at(pool_id);
+        uint32_t const epoch = P ? P->structure_epoch : 0;
+        is_changed = !prev.valid ||
+                     prev.verdict != (uint8_t)a.verdict ||
+                     prev.pool_state != a.pool_state ||
+                     prev.structure_epoch != epoch ||
+                     prev.borrow_count != a.borrow_count ||
+                     prev.used_bytes != a.used_bytes ||
+                     prev.free_bytes != a.free_bytes ||
+                     prev.live_objects != a.live_objects ||
+                     prev.largest_free_block != a.largest_free_block ||
+                     prev.fragment_bytes != a.fragment_bytes ||
+                     prev.has_pinned != a.has_pinned_objects ||
+                     prev.stats_valid != a.stats_valid ||
+                     prev.request_size != a.expected_request_size ||
+                     prev.request_alignment != a.expected_request_alignment ||
+                     prev.request_flags != a.request_flags ||
+                     prev.request_tag != a.request_tag ||
+                     prev.thr_ratio_permille != s_advice_thresholds.fragment_ratio_permille ||
+                     prev.thr_min_bytes != s_advice_thresholds.fragment_min_bytes;
+    }
     if (changed) *changed = is_changed;
     return a;
 }

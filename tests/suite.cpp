@@ -3306,7 +3306,7 @@ static void test_compaction_advice() {
         pm::CompactionAdvice a = pm::analyze_compaction(pool);
         CHECK(a.verdict == Verdict::NO_ACTION);
         CHECK(a.estimated_moved_objects == 0 && a.estimated_moved_bytes == 0);
-        CHECK(a.external_quiescence_required == 0);
+        CHECK(a.caller_must_establish_quiescence == 0);
         CHECK(a.capacity == 4 * 4096 && a.live_objects == 5);
         CHECK(a.stats_valid == 1 && a.has_pinned_objects == 0);
 
@@ -3316,7 +3316,7 @@ static void test_compaction_advice() {
         CHECK_ST(pm::free(o[3]), pm::Status::Ok);
         a = pm::analyze_compaction(pool);
         CHECK(a.verdict == Verdict::COMPACT_RECOMMENDED);
-        CHECK(a.external_quiescence_required == 1);
+        CHECK(a.caller_must_establish_quiescence == 1);
         CHECK(a.estimated_moved_objects == pm::COMPACTION_ESTIMATE_UNKNOWN);
         CHECK(a.estimated_moved_bytes == pm::COMPACTION_ESTIMATE_UNKNOWN);
         CHECK(a.free_bytes == 2 * 3008 && a.largest_free_block == 3008);
@@ -3372,7 +3372,7 @@ static void test_compaction_advice() {
         CHECK(a.verdict == Verdict::COMPACT_RECOMMENDED);
         CHECK(a.request_can_fit_now == 0);
         CHECK(a.request_can_fit_after_compaction_estimate == 1);
-        CHECK(a.external_quiescence_required == 1);
+        CHECK(a.caller_must_establish_quiescence == 1);
         // 15000 B request: free_bytes ~ 6016 -- can never fit ->
         // UNLIKELY_TO_HELP (no fake optimism).
         pm::CompactionRequest big{15000, 8, 0, 9};
@@ -3408,8 +3408,12 @@ static void test_compaction_advice() {
         CHECK_ST(pm::free(a_ref), pm::Status::Ok);
         CHECK(pm::analyze_compaction((pm::PoolId)77).verdict ==
               Verdict::INVALID_METADATA);
+        // Round-7: a malformed caller request is INVALID_REQUEST -- input
+        // errors are distinct from pool damage and never touch the cache.
         pm::CompactionRequest bad{64, 3, 0, 1}; // alignment not a power of two
-        CHECK(pm::analyze_compaction(pool, &bad).verdict == Verdict::INVALID_METADATA);
+        CHECK(pm::analyze_compaction(pool, &bad).verdict == Verdict::INVALID_REQUEST);
+        pm::CompactionRequest empty{0, 8, 0, 1}; // an explicit request with size 0
+        CHECK(pm::analyze_compaction(pool, &empty).verdict == Verdict::INVALID_REQUEST);
         using namespace pm::internal;
         Pool& P = g().pools[pool];
         uint32_t hf = FL_COUNT, hs = SL_COUNT;
@@ -3449,8 +3453,11 @@ static void test_compaction_advice() {
         pm::poll_compaction_advice(pool, nullptr, &changed);
         CHECK(changed == false);
         // (b) merging a hole with the next one does NOT move the largest
-        //     block (the tail dominates), nor the epoch -> no repeat prompt.
+        //     block (the tail dominates), nor the epoch -- but the extended
+        //     change key (round-7) sees used/free byte accounting move.
         CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+        pm::poll_compaction_advice(pool, nullptr, &changed);
+        CHECK(changed == true);
         pm::poll_compaction_advice(pool, nullptr, &changed);
         CHECK(changed == false);
         // (c) a compaction bumps structure_epoch and (here) clears the
@@ -3480,6 +3487,15 @@ static void test_compaction_advice() {
         CHECK(pm::analyze_compaction(pool).verdict == Verdict::COMPACT_RECOMMENDED);
         pm::set_compaction_thresholds(t);
         CHECK(pm::get_compaction_thresholds().fragment_ratio_permille == 100);
+        // Round-7: thresholds are part of the poll change key -- restoring
+        // them changes the key, so the next poll reports once. The poll must
+        // come BEFORE any fresh analyze (an analyze refreshes the cache and
+        // would consume the change).
+        bool tchanged = false;
+        pm::poll_compaction_advice(pool, nullptr, &tchanged);
+        CHECK(tchanged == true);
+        pm::poll_compaction_advice(pool, nullptr, &tchanged);
+        CHECK(tchanged == false);
         CHECK(pm::analyze_compaction(pool).verdict == Verdict::COMPACT_RECOMMENDED);
 
         CHECK_ST(pm::free(n[0]), pm::Status::Ok);
@@ -3488,6 +3504,183 @@ static void test_compaction_advice() {
         VALIDATE(pool);
         done();
     }
+}
+
+// ---------------------------------------------------------------------------
+// (R32) round-7 guide section 3: caller input errors are INVALID_REQUEST,
+// distinct from INVALID_METADATA. An invalid request never touches the
+// advice cache (proven: a valid poll right after still reports no change)
+// and has zero side effects on Pool/ObjectDesc/Auto Zone bytes.
+// ---------------------------------------------------------------------------
+static void test_advice_invalid_request() {
+    printf("  [R32] advice: INVALID_REQUEST vs INVALID_METADATA\n");
+    using Verdict = pm::CompactionVerdict;
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef o[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+        CHECK_ST(pm::alloc(pool, 800, 8, 0, i, o[i]), pm::Status::Ok);
+        fill(o[i], 800, 700 + i);
+    }
+    CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+    VALIDATE(pool);
+
+    // Establish a valid baseline advice (populates the cache). The stranded
+    // 808 B are only 49 permille of this pool, so tighten the threshold to
+    // make the baseline RECOMMENDED.
+    pm::set_compaction_thresholds({10, 100});
+    pm::CompactionAdvice base = pm::analyze_compaction(pool);
+    CHECK(base.verdict == Verdict::COMPACT_RECOMMENDED);
+
+    pm::RawRef refs[3] = {o[0], o[2], o[1]};
+    using namespace pm::internal;
+    auto expect_invalid_request = [&](pm::CompactionRequest const& req, const char* what) {
+        snap_all(pool, pool, refs, 3, seg_base(g().pools[pool].segment_first), 4 * 4096);
+        pm::CompactionAdvice a = pm::analyze_compaction(pool, &req);
+        CHECK(a.verdict == Verdict::INVALID_REQUEST);
+        check_all_unchanged(pool, pool, refs, 3, seg_base(g().pools[pool].segment_first), 4 * 4096);
+    };
+    expect_invalid_request({0, 8, 0, 1}, "size=0");
+    expect_invalid_request({800, 3, 0, 1}, "alignment");
+    expect_invalid_request({800, 4096, 0, 1}, "alignment>max");
+    expect_invalid_request({0xFFFFFFF0u, 8, 0, 1}, "size overflow");
+    expect_invalid_request({0x01000000u, 8, 0, 1}, "FL ceiling");
+    CHECK_ST(pm::validate(pool), pm::Status::Ok);
+
+    // The cache was NOT clobbered by any invalid request: a valid poll right
+    // after still compares equal to the baseline (no change reported).
+    bool changed = true;
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == false);
+    pm::CompactionAdvice again = pm::analyze_compaction(pool);
+    CHECK(again.verdict == base.verdict);
+    CHECK(again.used_bytes == base.used_bytes && again.free_bytes == base.free_bytes);
+    pm::set_compaction_thresholds({100, 512}); // restore the documented defaults
+
+    // INVALID_METADATA remains the verdict for real damage / bad pool id.
+    CHECK(pm::analyze_compaction((pm::PoolId)77).verdict == Verdict::INVALID_METADATA);
+    {
+        Pool& P = g().pools[pool];
+        uint32_t hf = FL_COUNT, hs = SL_COUNT;
+        for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+                if (P.bins.head[f][sl] != NULL_OFF) { hf = f; hs = sl; break; }
+        if (hf < FL_COUNT) {
+            uint32_t const saved = P.bins.head[hf][hs];
+            P.bins.head[hf][hs] = 0xFFFFFFF0u;
+            CHECK(pm::analyze_compaction(pool).verdict == Verdict::INVALID_METADATA);
+            P.bins.head[hf][hs] = saved;
+        }
+    }
+    VALIDATE(pool);
+
+    CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+    CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R33) round-7 guide section 6: the poll change key covers every advice
+// input. First poll reports; an unchanged state is suppressed; each of
+// epoch (compact/merge/split), borrow, thresholds, pinned presence, request
+// flags/tag and metadata damage/recovery reports exactly once.
+// ---------------------------------------------------------------------------
+static void test_advice_change_key() {
+    printf("  [R33] advice poll change key\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef o[3], pin{};
+    for (uint32_t i = 0; i < 3; ++i) {
+        CHECK_ST(pm::alloc(pool, 800, 8, 0, i, o[i]), pm::Status::Ok);
+    }
+    CHECK_ST(pm::alloc(pool, 256, 8, pm::PM_PINNED, 9, pin), pm::Status::Ok);
+
+    bool changed = false;
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == true);  // first poll always reports
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == false); // unchanged: suppressed
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == false);
+
+    // (a) borrow changes borrow_count
+    void* p = nullptr;
+    CHECK_ST(pm::borrow_begin(o[0], 800, 1, p), pm::Status::Ok);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == true);
+    pm::borrow_end(o[0]);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == true);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == false);
+
+    // (b) request flags/tag are part of the key
+    pm::CompactionRequest r1{400, 8, 0, 1};
+    pm::CompactionRequest r2{400, 8, pm::PM_MOVABLE, 1};
+    pm::CompactionRequest r3{400, 8, 0, 2};
+    pm::poll_compaction_advice(pool, &r1, &changed);
+    CHECK(changed == true); // request appears
+    pm::poll_compaction_advice(pool, &r1, &changed);
+    CHECK(changed == false);
+    pm::poll_compaction_advice(pool, &r2, &changed);
+    CHECK(changed == true); // flags changed
+    pm::poll_compaction_advice(pool, &r3, &changed);
+    CHECK(changed == true); // tag changed
+
+    // (c) thresholds are part of the key
+    pm::CompactionThresholds const saved = pm::get_compaction_thresholds();
+    pm::set_compaction_thresholds({saved.fragment_ratio_permille + 1,
+                                   saved.fragment_min_bytes});
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == true);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == false);
+    pm::set_compaction_thresholds(saved);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == true);
+
+    // (d) epoch changes through maintenance
+    CHECK_ST(pm::compact(pool), pm::Status::Ok);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == true);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == false);
+
+    // (e) pinned presence changes
+    CHECK_ST(pm::free(pin), pm::Status::Ok);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == true);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == false);
+
+    // (f) metadata damage -> reports; recovery -> reports again
+    {
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        uint32_t hf = FL_COUNT, hs = SL_COUNT;
+        for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+                if (P.bins.head[f][sl] != NULL_OFF) { hf = f; hs = sl; break; }
+        if (hf < FL_COUNT) {
+            uint32_t const saved_head = P.bins.head[hf][hs];
+            P.bins.head[hf][hs] = 0xFFFFFFF0u;
+            pm::poll_compaction_advice(pool, nullptr, &changed);
+            CHECK(changed == true); // INVALID_METADATA reported
+            pm::poll_compaction_advice(pool, nullptr, &changed);
+            CHECK(changed == false); // identical damage: suppressed (the cache
+                                     // holds the state the caller was told)
+            P.bins.head[hf][hs] = saved_head;
+            pm::poll_compaction_advice(pool, nullptr, &changed);
+            CHECK(changed == true); // recovery reported
+            pm::poll_compaction_advice(pool, nullptr, &changed);
+            CHECK(changed == false);
+        }
+    }
+
+    for (auto& i : o) CHECK_ST(pm::free(i), pm::Status::Ok);
+    done();
 }
 
 // ---------------------------------------------------------------------------
@@ -3551,6 +3744,8 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R29_round4_fault_matrix", test_round4_fault_matrix);
     run("R30_alloc_clears_output_on_failure", test_alloc_clears_output_on_failure);
     run("R31_compaction_advice", test_compaction_advice);
+    run("R32_advice_invalid_request", test_advice_invalid_request);
+    run("R33_advice_change_key", test_advice_change_key);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

@@ -114,3 +114,9 @@
   suite 的 g_zone，4000 ops，随固件运行）。
 - 2026-09-12（第六轮）：新增整理建议不变量行；R31 钉住只读性与判定矩阵；
   examples/ 双端 Demo 与快照协议 v1（docs/DEMO_REQUIREMENTS.md）。
+- 2026-09-12（第七轮）：建议结论新增 INVALID_REQUEST（输入错误与元数据损坏
+  区分，cache 不被输入错误污染，R32）；poll 变化键补全至全部输入
+  （state/pinned/字节账目/stats_valid/请求 echo/阈值，R33）；Advice 并发
+  边界（owner 上下文、禁 ISR、非并发一致快照）写入公共 API 文档；
+  external_quiescence_required 更名为 caller_must_establish_quiescence；
+  demo 换内置 JSON 解析器 + protocol_smoke.py 协议回归（58 项检查）。

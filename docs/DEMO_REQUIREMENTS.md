@@ -26,7 +26,7 @@ Snapshot {
   pools[]              PoolSnapshot
   objects[]            ObjectSnapshot（全系统存活对象）
   advice[]             每池一条 {pool_id, verdict, borrow_count,
-                                has_pinned_objects, external_quiescence_required}
+                                has_pinned_objects, caller_must_establish_quiescence}
 }
 
 PoolSnapshot {
@@ -54,6 +54,17 @@ Info   { t:"info", event, detail, commit }
 约定：快照是**只读副本**；UI 不得直接修改分配器元数据。所有状态变化必须来自
 新的真实快照，前端动画不得伪造终态。块布局经 `src/internal.h` 白盒枚举
 （公共 API 不暴露空闲链——Demo 属诊断工具，此为有意豁免）。
+
+## 2.1 协议 v1.1 变更（第七轮）
+
+- 建议记录的旧字段 `external_quiescence_required` 已更名为
+  `caller_must_establish_quiescence`（语义澄清：调用方义务，非库检测）。
+- 建议结论新增 `INVALID_REQUEST`（= 6）：调用方输入错误（size=0/对齐非法/
+  溢出/超过 FL 上限）与 `INVALID_METADATA`（池损坏）严格区分。
+- Demo 进程使用内置的扁平 JSON 解析器（无第三方依赖）：空白容忍、字段顺序
+  无关、缺省字段取文档化默认值、类型错误/越界/未知命令一律回结构化
+  `INVALID_REQUEST` 结果记录，绝不静默取默认值。
+- 协议回归：`examples/protocol_smoke.py`（无浏览器依赖，58 项检查）。
 
 ## 3. 串口/管道协议
 

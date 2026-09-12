@@ -158,7 +158,14 @@ simulates what real drivers must do themselves.</div>
 <h2>log</h2><div id="log"></div>
 <script>
 let last = null;
-const KIND = {MOVABLE:'MOVABLE', PINNED:'PINNED', FREE:'FREE', SLACK:'SLACK'};
+// All dynamic text goes through textContent (round-7 guide section 9): no
+// protocol field, build id or error detail is ever interpolated into HTML.
+function el(tag, cls, text){
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
 function op(cmd, params){ fetch('/api/op',{method:'POST',
   headers:{'Content-Type':'application/json'},
   body:JSON.stringify(Object.assign({cmd:cmd}, params||{}))}).then(refresh); }
@@ -170,47 +177,70 @@ function refresh(){
     document.getElementById('conn').textContent = s.connected ? 'yes' : 'NO';
     const sn = s.snapshot;
     if (!sn) return;
-    let lanes = '';
+    const lanes = document.getElementById('lanes');
+    lanes.textContent = '';
     for (const p of sn.pools){
       const cap = p.capacity || 1;
-      let blocks = '';
-      for (const b of p.blocks){
-        const pct = (100*b.size/cap).toFixed(2);
-        const tip = `off ${b.offset} size ${b.size}` +
-          (b.object_id!==undefined ? ` id ${b.object_id} gen ${b.generation} ` +
-           `epoch ${b.address_epoch} flags ${b.flags}` : '');
-        blocks += `<div class="blk ${b.kind}" title="${tip}" ` +
-          `style="width:${pct}%">${b.kind==='MOVABLE'||b.kind==='PINNED' ? '#'+b.object_id : ''}</div>`;
-      }
-      lanes += `<h2>pool ${p.pool_id} [segs ${p.segment_first}..` +
-        `${p.segment_first+p.segment_count-1}] state ${p.state} · ` +
-        `used ${p.used_bytes} / free ${p.free_bytes} · ` +
+      lanes.appendChild(el('h2', null,
+        `pool ${p.pool_id} [segs ${p.segment_first}..${p.segment_first+p.segment_count-1}] ` +
+        `state ${p.state} · used ${p.used_bytes} / free ${p.free_bytes} · ` +
         `largest free ${p.largest_free_block} · fragment ${p.fragment_bytes} · ` +
-        `objects ${p.live_objects} · borrows ${p.borrow_count} · epoch ${p.structure_epoch}` +
-        `</h2><div class="lane">${blocks}</div>`;
+        `objects ${p.live_objects} · borrows ${p.borrow_count} · epoch ${p.structure_epoch}`));
+      const lane = el('div', 'lane');
+      for (const b of p.blocks){
+        const d = el('div', 'blk ' + b.kind,
+          (b.kind === 'MOVABLE' || b.kind === 'PINNED') ? '#' + b.object_id : '');
+        d.style.width = (100*b.size/cap).toFixed(2) + '%';
+        d.title = 'off ' + b.offset + ' size ' + b.size +
+          (b.object_id !== undefined
+            ? ' id ' + b.object_id + ' gen ' + b.generation +
+              ' epoch ' + b.address_epoch + ' flags ' + b.flags
+            : '');
+        lane.appendChild(d);
+      }
+      lanes.appendChild(lane);
     }
-    document.getElementById('lanes').innerHTML = lanes;
-    let adv = '<h2>compaction advice</h2><table><tr><th>pool</th><th>verdict</th>' +
-      '<th>fragment</th><th>borrows</th><th>pinned</th><th>quiescence needed</th></tr>';
+    const adv = document.getElementById('advice');
+    adv.textContent = '';
+    adv.appendChild(el('h2', null, 'compaction advice'));
+    const at = el('table');
+    const ah = el('tr');
+    for (const h of ['pool','verdict','fragment ‰','borrows','pinned','caller must establish quiescence'])
+      ah.appendChild(el('th', null, h));
+    at.appendChild(ah);
+    const names = ['NO_ACTION','COMPACT_RECOMMENDED','COMPACT_BLOCKED',
+                   'COMPACT_UNLIKELY_TO_HELP','INVALID_METADATA','INVALID_REQUEST'];
     for (const a of sn.advice){
-      const names = ['NO_ACTION','COMPACT_RECOMMENDED','COMPACT_BLOCKED',
-                     'COMPACT_UNLIKELY_TO_HELP','INVALID_METADATA'];
-      adv += `<tr><td>${a.pool_id}</td><td><b>${names[a.verdict]}</b></td>` +
-             `<td>${a.fragment_ratio_permille}‰</td><td>${a.borrow_count}</td>` +
-             `<td>${a.has_pinned_objects}</td><td>${a.external_quiescence_required}</td></tr>`;
+      const row = el('tr');
+      row.appendChild(el('td', null, String(a.pool_id)));
+      row.appendChild(el('td')).appendChild(el('b', null, names[a.verdict] || a.verdict));
+      row.appendChild(el('td', null, String(a.fragment_ratio_permille)));
+      row.appendChild(el('td', null, String(a.borrow_count)));
+      row.appendChild(el('td', null, String(a.has_pinned_objects)));
+      row.appendChild(el('td', null, String(a.caller_must_establish_quiescence)));
+      at.appendChild(row);
     }
-    document.getElementById('advice').innerHTML = adv + '</table>';
-    let objs = '<table><tr><th>id</th><th>gen</th><th>pool</th><th>offset</th>' +
-      '<th>size</th><th>block</th><th>epoch</th><th>flags</th><th>digest</th></tr>';
-    for (const o of sn.objects)
-      objs += `<tr><td>${o.object_id}</td><td>${o.generation}</td><td>${o.pool_id}</td>` +
-              `<td>${o.address_offset}</td><td>${o.size}</td><td>${o.block_size}</td>` +
-              `<td>${o.address_epoch}</td><td>${o.flags}</td><td>${o.payload_digest}</td></tr>`;
-    document.getElementById('objs').innerHTML = objs + '</table>';
+    adv.appendChild(at);
+    const objs = document.getElementById('objs');
+    objs.textContent = '';
+    const ot = el('table');
+    const oh = el('tr');
+    for (const h of ['id','gen','pool','offset','size','block','epoch','flags','digest'])
+      oh.appendChild(el('th', null, h));
+    ot.appendChild(oh);
+    for (const o of sn.objects){
+      const row = el('tr');
+      for (const v of [o.object_id, o.generation, o.pool_id, o.address_offset,
+                       o.size, o.block_size, o.address_epoch, o.flags,
+                       o.payload_digest])
+        row.appendChild(el('td', null, String(v)));
+      ot.appendChild(row);
+    }
+    objs.appendChild(ot);
     document.getElementById('res').textContent =
       JSON.stringify(s.last_result, null, 1);
-    document.getElementById('log').innerHTML =
-      s.log.slice(-30).map(r=>JSON.stringify(r)).reverse().join('<br>');
+    const log = document.getElementById('log');
+    log.textContent = s.log.slice(-30).map(r=>JSON.stringify(r)).reverse().join('\n');
   });
 }
 refresh(); setInterval(refresh, 400);

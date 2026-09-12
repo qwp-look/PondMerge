@@ -196,6 +196,14 @@ R26 resolve/borrow_begin 失败输出清空 ·
 五值统一结论、可配置阈值、重复提示抑制、估算诚实标注 UNKNOWN）·
 `examples/`：Host 可视化 Demo（host_demo + demo_server.py）与 ESP32-S3
 demo 固件（同一 JSON Lines 快照协议 v1，见 `docs/DEMO_REQUIREMENTS.md`） ·
+**v7 审计轮新增**（`docs/HANDOVER_v9.md`）：R32 建议的 INVALID_REQUEST
+（调用方输入错误与元数据损坏严格区分，建议缓存不被输入错误污染） ·
+R33 建议轮询变化键补全（state/pinned/字节账目/stats_valid/请求
+flags/tag/阈值） · demo 命令解析换内置 JSON 解析器（空白容忍、缺省字段、
+类型/越界拒绝、结构化 INVALID_REQUEST） · `examples/protocol_smoke.py`
+协议回归（58 项检查，无浏览器依赖） ·
+`caller_must_establish_quiescence` 更名（原 external_quiescence_required：
+仅表示调用方义务，0 不代表库已验证外部安全） ·
 R26 resolve/borrow_begin 失败输出清空 ·
 R27 local 绑定语义固定（解析时强制、CROSS_HINT 拒绝、伪造 hint 得 PoolChanged） ·
 R28 维护仅在最终提交发布 Running（失败不留维护态、不建新池、不动 epoch） ·

@@ -33,6 +33,7 @@
 | `COMPACT_BLOCKED` | 有活跃借用（`borrow_count`）或池不在 Running/Paused（`pool_state`） | 排除阻挡来源后再查询 |
 | `COMPACT_UNLIKELY_TO_HELP` | 即使整理成功也放不下预期申请（总空闲不足） | 不要整理；换池 / 换大小 / 扩容设计 |
 | `INVALID_METADATA` | 池 id 无效，或有界审计发现损坏 | 按 CorruptMetadata 处理（validate / 复位） |
+| `INVALID_REQUEST` | **调用方输入错误**（size=0、对齐非法、溢出、超过 FL 上限）——与元数据损坏严格区分，不污染建议缓存 | 修正请求参数后重试（第七轮指南 §3） |
 
 调用方只需读 `verdict` 一个字段即可决策；诊断字段供日志、Demo 与人工分析。
 
@@ -48,7 +49,7 @@
 | `live_objects` / `has_pinned_objects` | 对象数；pinned 屏障存在标记 |
 | `request_can_fit_now` | `largest_free_block >= need`（need 按 alloc 的圆整规则计算） |
 | `request_can_fit_after_compaction_estimate` | **估算**：`(free - fragment) >= need`；pinned 屏障可能使实际值更小 |
-| `external_quiescence_required` | 1 = 执行 compact 前必须先建立外部静默期 |
+| `caller_must_establish_quiescence` | 1 = 执行 compact 前**调用方**必须自行建立并排空外部静默期。这只是义务提醒：**0 不代表库已验证没有外部使用者**——PondMerge 永远不会检测 DMA/ISR/外部库 |
 | `estimated_moved_objects/bytes` | 诚实估算：仅"完全 packed"时给 0，否则 `COMPACTION_ESTIMATE_UNKNOWN`，不伪造精度 |
 
 ## 4. 阈值
@@ -79,9 +80,11 @@ pm::set_compaction_thresholds({200, 1024});   // 按产品负载调整
    抑制。首次查询总是报告。
 
 约束（需求文档 §6.5）：不在中断里做复杂分析；回调/轮询**绝不**自动执行
-`compact()`；调用方停止轮询即关闭提示；提示失败不影响分配器状态
-（缓存写与分配器状态隔离）。抑制键包含 `structure_epoch`——整理、merge、
-split 后一定会再次提示。
+`compact()`；调用方停止轮询即关闭提示；提示失败不影响分配器状态。
+抑制键（第七轮补全）：verdict、pool_state、structure_epoch、borrow_count、
+used/free/live、largest_free_block、fragment_bytes、pinned 存在、stats_valid、
+请求 size/align/flags/tag 以及**阈值**——任一变化即再次提示；`INVALID_REQUEST`
+每次都报告（调用方错误不缓存、不抑制）。
 
 ## 6. 执行整理的标准流程
 
