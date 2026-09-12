@@ -521,8 +521,11 @@ void finalize_layout(Pool& P, uint8_t* start, uint8_t const* end) {
         // The list was audited (precheck) or rebuilt from the plan arrays
         // before this EXECUTION-phase walk, so the cap cannot trip in healthy
         // operation; it is a debug guard over an impossibility, not an error
-        // path (plan A has no failure branch here).
-        PM_ASSERT(++steps <= PM_MAX_OBJECTS + 1);
+        // path (plan A has no failure branch here). `steps` stays referenced
+        // in Release (the trailing (void) below) so the guard compiles out
+        // without an unused-variable warning.
+        ++steps;
+        PM_ASSERT(steps <= PM_MAX_OBJECTS + 1);
         ObjectDesc const& d = g().objects[idx];
         uint8_t* bstart = d.address - BLOCK_HEADER_SIZE;
         uint32_t bsize = d.block_size;
@@ -554,6 +557,7 @@ void finalize_layout(Pool& P, uint8_t* start, uint8_t const* end) {
         count++;
     }
 
+    (void)steps; // Release: the guard above compiles out; keep the counter used
     uint32_t tail = (uint32_t)(end - prev_end);
     if (tail >= PM_MIN_BLOCK) {
         auto* fb = reinterpret_cast<FreeBlock*>(prev_end); // cppcheck-suppress dangerousTypeCast; 8B-aligned block start
@@ -904,6 +908,11 @@ PoolStats get_stats(PoolId id) {
 // ---------------------------------------------------------------------------
 Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
              uint32_t user_tag, RawRef& out) {
+    // Failure must never leave the caller's old reference standing (round-5
+    // guide section 3, same rule as resolve/borrow_begin): a reused RawRef
+    // would otherwise look like a fresh, valid allocation. generation == 0
+    // reads as invalid everywhere.
+    out = RawRef{};
     GlobalState& G = g();
     if (!G.initialized) return Status::CorruptMetadata;
     Pool* P = pool_at(pool_id);

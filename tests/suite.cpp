@@ -649,10 +649,16 @@ static void test_exhaustion() {
     }
     CHECK(kept == 15); // 16384 / 1032B blocks
     pm::RawRef r2{};
-    CHECK_ST(pm::alloc(pools[0], 1024, 8, 0, 99, r2), pm::Status::NoSpace);
+    pm::RawRef probe{};
+    // The NoSpace probes get their own output slot: since the round-5 fix a
+    // failed alloc clears its out reference (R30), so probing into `r2`
+    // would wipe the successful allocation it still has to release below.
+    CHECK_ST(pm::alloc(pools[0], 1024, 8, 0, 99, probe), pm::Status::NoSpace);
+    CHECK(probe.generation == 0);
     CHECK_ST(pm::free(refs[3]), pm::Status::Ok);
     CHECK_ST(pm::alloc(pools[0], 1024, 8, 0, 98, r2), pm::Status::Ok);
-    CHECK_ST(pm::alloc(pools[0], 4096, 8, 0, 97, r2), pm::Status::NoSpace);
+    CHECK_ST(pm::alloc(pools[0], 4096, 8, 0, 97, probe), pm::Status::NoSpace);
+    CHECK(probe.generation == 0);
     VALIDATE(pools[0]);
 
     // Destroy rules: objects present -> Busy; empty -> Ok, segments reusable.
@@ -3171,6 +3177,72 @@ static void test_round4_fault_matrix() {
 }
 
 // ---------------------------------------------------------------------------
+// (R30) round-5 guide section 3: alloc() clears the output reference on EVERY
+// failure path, so a caller that reuses an old RawRef cannot mistake a failed
+// allocation for a fresh one. The old reference itself must stay usable.
+// ---------------------------------------------------------------------------
+static void test_alloc_clears_output_on_failure() {
+    printf("  [R30] alloc clears the output reference on failure\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef old_ref{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, old_ref), pm::Status::Ok);
+    fill(old_ref, 64, 81);
+
+    auto expect_cleared = [&](auto&& call, const char* what) {
+        pm::RawRef out = old_ref; // caller reuses a still-valid reference
+        pm::Status st = call(out);
+        ++g_checks;
+        if (st == pm::Status::Ok) {
+            printf("    CHECK failed %s:%d: %s unexpectedly succeeded\n", __FILE__,
+                   __LINE__, what);
+            ++g_fails;
+            pm::free(out);
+            return;
+        }
+        CHECK(out.generation == 0);   // invalid, never the old value
+        CHECK(out.index == 0 && out.pool_hint == 0 && out.offset == 0);
+    };
+    expect_cleared([&](pm::RawRef& out) { return pm::alloc((pm::PoolId)99, 64, 8, 0, 2, out); },
+                   "alloc(InvalidPool)");
+    expect_cleared([&](pm::RawRef& out) { return pm::alloc(pool, 0, 8, 0, 2, out); },
+                   "alloc(size=0)");
+    expect_cleared([&](pm::RawRef& out) { return pm::alloc(pool, 64, 3, 0, 2, out); },
+                   "alloc(alignment)");
+    expect_cleared([&](pm::RawRef& out) { return pm::alloc(pool, 64, 8, 0xFF00, 2, out); },
+                   "alloc(flags)");
+    expect_cleared([&](pm::RawRef& out) { return pm::alloc(pool, 200 * 1024, 8, 0, 2, out); },
+                   "alloc(NoSpace)");
+    expect_cleared([&](pm::RawRef& out) { return pm::alloc(pool, 0x01000000u, 8, 0, 2, out); },
+                   "alloc(beyond FL range)");
+
+    // The corrupt-metadata path clears the output too (R18's injection).
+    {
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        uint32_t hf = FL_COUNT, hs = SL_COUNT;
+        for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+                if (P.bins.head[f][sl] != NULL_OFF) { hf = f; hs = sl; break; }
+        CHECK(hf < FL_COUNT);
+        uint32_t const saved_head = P.bins.head[hf][hs];
+        P.bins.head[hf][hs] = 0xFFFFFFF0u;
+        pm::RawRef out = old_ref;
+        CHECK_ST(pm::alloc(pool, 64, 8, 0, 2, out), pm::Status::CorruptMetadata);
+        CHECK(out.generation == 0);
+        P.bins.head[hf][hs] = saved_head;
+    }
+
+    // The old reference is untouched by every failed call above and can
+    // still be used and released independently.
+    verify(old_ref, 64, 81);
+    CHECK_ST(pm::free(old_ref), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
 static void run(const char* name, void (*fn)()) {
     printf("[TEST] %s\n", name);
     uint32_t const f0 = g_fails;
@@ -3229,6 +3301,7 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R27_local_binding_semantics", test_local_binding_semantics);
     run("R28_state_publication", test_state_publication);
     run("R29_round4_fault_matrix", test_round4_fault_matrix);
+    run("R30_alloc_clears_output_on_failure", test_alloc_clears_output_on_failure);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

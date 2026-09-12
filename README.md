@@ -44,7 +44,10 @@ docs/              架构说明、代码指导书、各轮修复任务书与交�
 
 1. 只有放入 Auto Zone 的对象被管理；整理 / 合并 / 拆分全部由调用方显式触发。
 2. 普通物理指针只能在借用期间使用；借用期间相关池不可搬迁（`pm_access` RAII，
-   池级 `borrow_count` + 对象级 `active_borrows` 双计数）。
+   池级 `borrow_count` + 对象级 `active_borrows` 双计数）。`resolve`/`peek`
+   是**不计数的高级校验接口**：返回的裸指针只在池静默期内立即使用，禁止
+   跨越任何维护入口或保存；常规访问请走 `try_borrow()`/`pm_access` 或
+   `pm_ptr::operator->`（表达式级 RAII borrow）。
 3. `pm_ptr<T>` 是逻辑引用（对象槽位 + generation + pool_hint + offset），搬迁后
    下次使用时经描述符惰性重解析。**没有地址缓存**：每次借用做完整 O(1) 校验
    （范围 / generation / 状态 / 池）加一次描述符读取，缓存无收益——这是正式
@@ -90,9 +93,19 @@ docs/              架构说明、代码指导书、各轮修复任务书与交�
 结构）并放弃地址序插入（或改为惰性重链）。v1 不做，文档也不再声明 `alloc`
 为 O(1)。
 
-### 并发契约：单所有者 + 静默维护期（修复任务书 §4）
+### 并发契约：单所有者 + 静默维护期（修复任务书 §4；v5 指南 §4 明确化）
 
-- 普通 alloc / 访问 / free 由**一个所有者上下文**执行，不承诺多线程并发安全。
+| 操作 | 并发承诺 |
+|---|---|
+| `alloc` / `free` / `resolve` / `get_stats` / `validate` | **单 owner 上下文**，不承诺多线程并发安全 |
+| `borrow_begin` / `borrow_end` | 内部锁 + token 保护 |
+| `pause` / `resume` | 内部锁保护 |
+| `compact` / `merge` / `split` | 单 owner 串行（不同池之间也不并发）；入口与最终提交持锁 |
+| DMA / ISR / 其他任务 / 外部库 | 由**调用方**在维护前停止并排干——库不发现外部持有者 |
+
+`PM_LOCK` 只保护库已知的借用计数与维护状态发布；`alloc/free/resolve/
+get_stats/validate` 的函数体不在锁内。Host 构建把 `PM_LOCK` 编译为空操作，
+Host 运行**不能证明任何锁语义**，SMP 证据只来自双核设备测试。
 - `borrow_begin/borrow_end` 与池状态翻转（`pause`/`resume`/`compact` 入口）内部
   同步，暂停不会与新的借用产生检查-翻转竞态。
 - 维护（compact/merge/split）前：`pause` → 等待借用计数归零 → 操作 → `resume`。

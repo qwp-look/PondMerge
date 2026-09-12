@@ -231,8 +231,17 @@ bool adjacent(pm::PoolStats const& a, pm::PoolStats const& b) {
 
 // Runs the differential test. Returns the number of failed checks.
 uint32_t pondmerge_run_model(uint32_t zone_bytes, uint32_t ops) {
+#ifdef PM_DEVICE_BUILD
+    // Device build (round-5 guide section 7): static DRAM is too tight for a
+    // second 64 KiB zone, so the model reuses the suite's zone buffer -- it
+    // runs strictly AFTER pondmerge_run_tests(), which has deinited.
+    extern uint8_t g_zone[]; // tests/suite.cpp, 256 KiB, 16-byte aligned
+    uint8_t* zone = g_zone;
+    if (zone_bytes > 256u * 1024u) zone_bytes = 256u * 1024u;
+#else
     static uint8_t zone[64 * 1024] __attribute__((aligned(16)));
     if (zone_bytes > sizeof(zone)) zone_bytes = sizeof(zone);
+#endif
 
     pm::Config cfg{zone, zone_bytes, SEGMENT};
     if (pm::init(cfg) != pm::Status::Ok) {

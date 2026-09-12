@@ -10,6 +10,7 @@
 extern "C" void app_main(void);
 int pondmerge_run_tests(uint32_t stress_ops);
 int pondmerge_run_concurrency_tests(void);
+uint32_t pondmerge_run_model(uint32_t zone_bytes, uint32_t ops);
 
 #ifndef PM_DEVICE_STRESS_OPS
 #define PM_DEVICE_STRESS_OPS 2000
@@ -33,5 +34,13 @@ extern "C" void app_main(void) {
 
     int rc2 = pondmerge_run_concurrency_tests();
     printf("=== concurrency %s (rc=%d) ===\n", rc2 == 0 ? "PASSED" : "FAILED", rc2);
+    fflush(stdout);
+
+    // Reference-model differential on the device (round-5 guide section 7):
+    // same fixed seed and public-API oracle as the host runner, 4000 ops
+    // (the host scale for a 2000-op stress run), over the suite's zone.
+    uint32_t mfail = pondmerge_run_model(64u * 1024u, 4000u);
+    printf("=== model %s (rc=%u) ===\n", mfail == 0 ? "PASSED" : "FAILED",
+           (unsigned)mfail);
     fflush(stdout);
 }

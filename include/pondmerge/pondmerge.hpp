@@ -7,10 +7,11 @@
 //
 // C++17 subset: no exceptions, no RTTI, no dynamic allocation.
 //
-// CONCURRENCY CONTRACT (task-book section 4): v1 is "single owner + quiescent
-// maintenance window".
-//   * Ordinary alloc/access/free run in ONE owner execution context (thread/
-//     task). PondMerge does not make them safe for concurrent callers.
+// CONCURRENCY CONTRACT (task-book section 4; round-5 guide section 4): v1 is
+// "single owner + quiescent maintenance window".
+//   * alloc / free / resolve / get_stats / validate run in ONE owner
+//     execution context (thread/task). PondMerge does not make them safe for
+//     concurrent callers.
 //   * borrow_begin/borrow_end and the pool state flips (pause/resume/compact
 //     entry) are internally synchronized, so pausing can never race a new
 //     borrow into existence.
@@ -19,9 +20,15 @@
 //     (the planning scratch is one shared fixed buffer). Within one owner
 //     they are internally synchronized at entry and at the final commit.
 //   * Before compact/merge/split, the owner pauses the pool(s); all active
-//     borrows must have ended (borrow counters zero). DMA, ISRs and other
-//     threads holding raw pointers must be stopped and drained by the CALLER
-//     beforehand — PondMerge cannot discover external holders.
+//     borrows must have ended (borrow counters zero). DMA, ISRs, other tasks
+//     and external code holding raw pointers must be stopped and drained by
+//     the CALLER beforehand — PondMerge cannot discover external holders.
+//   * SCOPE OF PM_LOCK: it protects only what the library knows -- the borrow
+//     counters and the maintenance state publications. It does NOT cover the
+//     alloc/free/resolve/get_stats/validate bodies, and it cannot see raw
+//     pointers held by DMA, ISRs or external code. Host builds compile
+//     PM_LOCK to nothing, so host runs prove NONE of the lock semantics;
+//     SMP evidence comes from the dual-core device test only.
 //   * Constructors (pm_make) and destroy callbacks must not re-enter the
 //     allocator for the object being constructed/destroyed; re-entrancy for
 //     OTHER objects is allowed but ordering-sensitive.
@@ -166,10 +173,17 @@ Status borrow_begin(RawRef const& ref, uint32_t access_size, uint32_t access_ali
 // section: a duplicate, stale or wrong-pool end can never move a counter
 // (Debug asserts such tokens as caller bugs; Release ignores them).
 void   borrow_end(RawRef const& ref);
-// Validation only, no borrow, no address caching guarantee: safe inside a
-// critical section or when the pool is quiescent. On failure out_addr is
-// ALWAYS nullptr, so a caller that reuses the variable cannot keep a stale
-// address (round-3 guide P2).
+// ADVANCED, NON-BORROWING validation (round-5 guide section 6): resolve
+// returns a raw pointer WITHOUT incrementing any borrow counter. That pointer
+// is valid only while the pool is quiescent (no maintenance entry, no
+// concurrent mutation -- see the concurrency contract) and must NEVER be
+// carried across a compact/merge/split call or stored. The supported way to
+// touch an object is try_borrow()/pm_access or the expression-level RAII
+// operator-> of pm_ptr, which hold a real borrow for their lifetime. There
+// is no address cache behind resolve: the protection comes from the borrow
+// counters and the quiescent window, not from epoch checks. On failure
+// out_addr is ALWAYS nullptr, so a caller that reuses the variable cannot
+// keep a stale address (round-3 guide P2).
 Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align,
                void*& out_addr);
 
@@ -332,7 +346,9 @@ public:
         return {Status::Ok, pm_access<T>(ref_, static_cast<T*>(addr))};
     }
 
-    // Validation without a borrow (quiescent use only).
+    // Advanced, non-borrowing peek: same boundary as resolve() -- the
+    // pointer is for immediate use in a quiescent window only, never stored
+    // or carried across maintenance. Prefer try_borrow()/pm_access.
     Result<T*> peek() const {
         void* addr = nullptr;
         Status st = resolve(ref_, sizeof(T), alignof(T), addr);

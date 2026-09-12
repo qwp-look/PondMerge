@@ -22,6 +22,7 @@
 | object lifetime | 构造（placement-new）、析构（destroy thunk）恰好一次；movable 不带析构 | `pm_make`/`pm_make_pinned`/`detail::destroy_thunk`/`set_destroy_fn()` | movable 拒绝 destroy_fn（NotRelocatable）；pinned 析构在 free 验证后恰好跑一次 | R6、R19、R24 | ✅ |
 | object lifetime | 可搬移类型显式 opt-in 且经审计（不含 Auto Zone 自指针/DMA/同步原语） | `pm_is_relocatable` 特化（tests/suite.cpp 顶部） | 测试中注册的 5 个类型均为 POD；含裸指针的 RawHolder 特化被 static_assert 拒绝 | R5 | ✅ |
 | 统计 | used/free/fragment/live 与物理布局精确互锁 | `validate()` 第三段覆盖审计 | live+free+slack==capacity 且 free_total==free_bytes-fragment_bytes | R21、模型对拍 | ✅ |
+| 失败输出 | 任何公共入口失败时输出引用/指针必为无效（generation 0 / nullptr），旧值绝不残留 | `alloc()` 首语句清空（第五轮）、`resolve()` 入口、`borrow_begin()` 失败分支 | 失败在 `out` 赋值前返回或显式清空；槽位 generation 不动（R1 语义保持） | R26、R29(5)、R30 | ✅（第五轮补齐 alloc） |
 
 ## 2. 遍历有限性清单（第四轮任务书 §7 全量搜索结论）
 
@@ -60,10 +61,11 @@
 | 操作 | 并发承诺 | 证据 |
 |---|---|---|
 | alloc/free | 单 owner | pondmerge.hpp 并发契约；README |
+| resolve/get_stats/validate | 单 owner（后两者只读，仍不承诺并发） | pondmerge.hpp 并发契约（第五轮明确列出）；README 并发表 |
 | resolve/get_stats | 单 owner 或 quiescent | pondmerge.hpp（resolve 注释）；get_stats 为只读统计 |
 | borrow_begin/end | 内部锁 + token | 同一 PM_LOCK 内校验并递减；设备双核测试 |
 | pause/resume | 内部锁 | 状态翻转在 PM_LOCK 内 |
-| compact/merge/split | 单 owner 串行（scratch 共享，跨池并发亦禁止）；入口与最终提交持锁 | pondmerge.hpp 并发契约、README；设备并发测试 |
+| compact/merge/split | 单 owner 串行（scratch 共享，跨池并发亦禁止）；入口与最终提交持锁；搬移在锁外，安全性由单 owner + 外部静默契约承担 | pondmerge.hpp 并发契约（含 PM_LOCK 范围声明）；README 并发表；设备并发测试 |
 | 重复 end / 错误 token | 任何失配不动计数 | host Release R25；设备固件为 Debug 构建，重复 end 属调用方 bug 会断言——**已接受边界**（见 §6） |
 
 ## 5. 复杂度账本（第四轮任务书 §12，与真实循环一一对应）
@@ -93,9 +95,19 @@
    （compact_time_us，任务书 v2 §12.3 要求项）；不引入额外计时设施。
 5. **RawRef 可伪造**：第三轮指南兼容方案（R27 固定语义）；local 绑定在解析期
    强制，伪造无法越界。
+6. **Host PM_LOCK 为空操作**（第五轮指南 P3）：Host 运行不能证明锁语义；
+   SMP 证据只来自双核设备测试；已写入 pondmerge.hpp 并发契约与 README。
+7. **维护期并发模型**：解锁搬移 + 单 owner/外部静默契约是 v1 既定架构
+   （第五轮指南 §4：真正 SMP 安全需重新覆盖全部读写，属重设计，不在 v1）。
+   debug-only owner token 评估后不采用：host 单线程下无执行价值，设备上
+   维护操作本就要求单 owner 调用——本轮交付为契约文档化（头文件 + README 表）。
 
 ## 7. 账本维护记录
 
 - 2026-09-12（第四轮）：建立本账本；登记第四轮发现并修复的两项缺陷
   （order_insert 防环、alloc 损坏可区分）与两项口径更正（alloc 复杂度、
   get_stats valid 字段）；红测探针证据见 HANDOVER_v6 §3。
+- 2026-09-12（第五轮）：新增"失败输出"不变量行（alloc 首语句清空，R30）；
+  并发表补充 resolve/get_stats/validate 行与 PM_LOCK 范围说明；接受边界
+  追加 Host 空锁与维护期并发模型两项；设备侧模型对拍缺口关闭（模型复用
+  suite 的 g_zone，4000 ops，随固件运行）。
