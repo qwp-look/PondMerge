@@ -236,6 +236,12 @@ Status split(PoolId source, uint32_t new_pool_segments, PoolId& out_new);
 
 // Debug hook used by PM_ASSERT.
 void pm_debug_abort(const char* file, int line);
+// Same, with a diagnostic message. This exists because the older
+// `PM_ASSERT(0 && "text")` idiom never actually printed its text -- the
+// assertion macro only forwards the location -- so the message was decorative
+// and additionally tripped cppcheck's incorrectStringBooleanError on newer
+// releases. Here the message is real output.
+void pm_debug_assert_fail(const char* file, int line, const char* msg);
 
 // ---------------------------------------------------------------------------
 // Compaction advice (round-6 requirements doc section 6): a READ-ONLY

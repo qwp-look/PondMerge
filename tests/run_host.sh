@@ -24,6 +24,11 @@ case "$1" in
     exec ./build/pondmerge_tests_san "${2:-3000}"
     ;;
 --cppcheck)
+    # Print the version first: cppcheck's check set has changed across releases
+    # (e.g. incorrectStringBooleanError and unassignedVariable fire on older
+    # builds but not on 2.19.0), so a clean run proves different things on
+    # different toolchains. Comparing the version is part of reading the result.
+    cppcheck --version
     exec cppcheck --enable=warning,style,performance --inline-suppr \
         --error-exitcode=2 -Iinclude -Isrc --suppress=missingIncludeSystem \
         src/core.cpp tests/suite.cpp tests/model.cpp

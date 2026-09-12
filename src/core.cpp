@@ -40,6 +40,9 @@ inline uint32_t log2_floor_u(uint32_t v) {
 namespace internal {
 
 GlobalState& g() {
+    // Zero-initialised by its static storage duration, and init() memsets it
+    // before any field is read, so it is deliberately never assigned here.
+    // cppcheck-suppress unassignedVariable
     static GlobalState G;
     return G;
 }
@@ -767,6 +770,15 @@ void pm_debug_abort(const char* file, int line) {
     abort();
 }
 
+void pm_debug_assert_fail(const char* file, int line, const char* msg) {
+#if defined(PM_ESP32)
+    printf("PondMerge ASSERT %s:%d: %s\n", file, line, msg);
+#else
+    fprintf(stderr, "PondMerge ASSERT %s:%d: %s\n", file, line, msg);
+#endif
+    abort();
+}
+
 // ---------------------------------------------------------------------------
 // init / deinit (doc section 2)
 // ---------------------------------------------------------------------------
@@ -1278,7 +1290,16 @@ void borrow_end(RawRef const& ref) {
         }
     }
     PM_UNLOCK();
-    if (!ok) PM_ASSERT(0 && "borrow_end token does not match its borrow_begin");
+    if (!ok) {
+        // A mismatched end token is a caller bug. Debug aborts with the reason;
+        // Release ignores it -- and either way no counter was touched. Written
+        // as an explicit branch rather than a folded string predicate so the
+        // message is actually printed and the intent survives in Release.
+#if PM_DEBUG
+        pm_debug_assert_fail(__FILE__, __LINE__,
+                             "borrow_end token does not match its borrow_begin");
+#endif
+    }
 }
 
 Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align, void*& out_addr) {
