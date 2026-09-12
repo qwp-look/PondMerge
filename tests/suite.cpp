@@ -3317,8 +3317,10 @@ static void test_compaction_advice() {
         a = pm::analyze_compaction(pool);
         CHECK(a.verdict == Verdict::COMPACT_RECOMMENDED);
         CHECK(a.caller_must_establish_quiescence == 1);
-        CHECK(a.estimated_moved_objects == pm::COMPACTION_ESTIMATE_UNKNOWN);
-        CHECK(a.estimated_moved_bytes == pm::COMPACTION_ESTIMATE_UNKNOWN);
+        // Round-9: the estimate is now EXACT (the packing simulation uses
+        // compact's own cursor/barrier rules): o[2] and the filler relocate.
+        CHECK(a.estimated_moved_objects == 2);
+        CHECK(a.estimated_moved_bytes == 3008 + 4352);
         CHECK(a.free_bytes == 2 * 3008 && a.largest_free_block == 3008);
 
         // (c) active borrow -> BLOCKED (advice never hides the blocker).
@@ -3719,6 +3721,119 @@ static void test_advice_owner_gate() {
 }
 
 // ---------------------------------------------------------------------------
+// (R35) round-9 guide sections 9.1/9.2: the advice move estimate must be
+// computed from a real packing simulation (a pool-start free block DOES move
+// the remaining objects -- the old "one free block => 0" shortcut was wrong),
+// and the verdict arithmetic must never run on damaged counters.
+// ---------------------------------------------------------------------------
+static void test_advice_estimate_and_counters() {
+    printf("  [R35] advice estimate + counter audit\n");
+    using Verdict = pm::CompactionVerdict;
+
+    // (1) exact tiling, then free the FIRST object: the only free block sits
+    //     at the pool START, so every remaining object must relocate.
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok); // 16 KiB
+    pm::RawRef o[16];
+    for (uint32_t i = 0; i < 16; ++i) {                   // 16 x 1024 = tile
+        CHECK_ST(pm::alloc(pool, 1016, 8, 0, i, o[i]), pm::Status::Ok);
+        fill(o[i], 1016, 900 + i);
+    }
+    pm::PoolStats st0 = pm::get_stats(pool);
+    CHECK(st0.free_bytes == 0); // perfectly tiled: no free space at all
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(pool, 1000, 8, 0, 99, r), pm::Status::NoSpace); // full
+    CHECK_ST(pm::free(o[0]), pm::Status::Ok);             // hole at the start
+
+    pm::CompactionAdvice a = pm::analyze_compaction(pool);
+    // The generic verdict is honestly NO_ACTION (relocating the hole to the
+    // tail gains nothing), but the packing simulation must NOT claim zero
+    // moves: all 15 remaining objects would relocate.
+    CHECK(a.verdict == Verdict::NO_ACTION);
+    // The exact packing simulation (round-9): freeing the FIRST block of a
+    // tiled run shifts EVERY remaining object down one slot -- all 15
+    // relocate. The old "one free block => zero moves" shortcut missed this
+    // entirely.
+    CHECK(a.estimated_moved_objects == 15);
+    CHECK(a.estimated_moved_bytes == 15 * 1024);
+
+    // compact relocates exactly the simulated objects (epoch +1 each).
+    CHECK_ST(pm::compact(pool), pm::Status::Ok);
+    for (uint32_t i = 1; i < 16; ++i) {
+        using namespace pm::internal;
+        CHECK(g().objects[o[i].index].address_epoch == 2); // moved exactly once
+        verify(o[i], 1016, 900 + i);                       // payload intact
+    }
+    a = pm::analyze_compaction(pool);
+    CHECK(a.estimated_moved_objects == 0 && a.estimated_moved_bytes == 0);
+    for (uint32_t i = 1; i < 15; ++i) CHECK_ST(pm::free(o[i]), pm::Status::Ok);
+    CHECK_ST(pm::free(o[15]), pm::Status::Ok);
+    done();
+
+    // (2) counter corruption: each damaged field forces INVALID_METADATA with
+    //     zero side effects; repairing restores the verdict.
+    {
+        fresh();
+        pm::PoolId pool_b{};
+        CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        pm::RawRef ob[3];
+        for (uint32_t i = 0; i < 3; ++i) {
+            CHECK_ST(pm::alloc(pool_b, 800, 8, 0, i, ob[i]), pm::Status::Ok);
+            fill(o[i], 800, 800 + i);
+        }
+        CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+        CHECK(pm::analyze_compaction(pool_b).verdict == Verdict::NO_ACTION);
+
+        using namespace pm::internal;
+        Pool& P = g().pools[pool_b];
+        pm::RawRef const refs[3] = {ob[0], ob[2], ob[1]};
+        uint32_t const saved_used = P.used_bytes;
+        uint32_t const saved_free = P.free_bytes;
+        uint32_t const saved_frag = P.fragment_bytes;
+        uint32_t const saved_live = P.live_objects;
+
+        auto expect_invalid = [&](const char* what) {
+            snap_all(pool_b, pool_b, refs, 3, seg_base(P.segment_first), 4 * 4096);
+            CHECK(pm::analyze_compaction(pool_b).verdict == Verdict::INVALID_METADATA);
+            check_all_unchanged(pool_b, pool_b, refs, 3, seg_base(P.segment_first), 4 * 4096);
+        };
+
+        P.used_bytes = saved_used + 8; // used + free > capacity
+        expect_invalid("used inflated");
+        P.used_bytes = saved_used;
+        P.free_bytes = saved_free - 1; // used + free != capacity
+        expect_invalid("free deflated");
+        P.free_bytes = saved_free;
+        P.fragment_bytes = saved_frag + P.free_bytes + 1; // fragment > free
+        expect_invalid("fragment overflow");
+        P.fragment_bytes = saved_frag;
+        P.live_objects = saved_live + 1; // count != walked live
+        expect_invalid("live count");
+        P.live_objects = saved_live;
+
+        // largest_free_block source: a damaged bin head makes get_stats
+        // refuse (stats_valid = 0) -> INVALID_METADATA
+        uint32_t hf = FL_COUNT, hs = SL_COUNT;
+        for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+                if (P.bins.head[f][sl] != NULL_OFF) { hf = f; hs = sl; break; }
+        if (hf < FL_COUNT) {
+            uint32_t const saved_head = P.bins.head[hf][hs];
+            P.bins.head[hf][hs] = 0xFFFFFFF0u;
+            CHECK(pm::analyze_compaction(pool_b).verdict == Verdict::INVALID_METADATA);
+            P.bins.head[hf][hs] = saved_head;
+        }
+        VALIDATE(pool);
+        CHECK(pm::analyze_compaction(pool_b).verdict == Verdict::NO_ACTION);
+
+        CHECK_ST(pm::free(ob[0]), pm::Status::Ok);
+        CHECK_ST(pm::free(ob[2]), pm::Status::Ok);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
 static void run(const char* name, void (*fn)()) {
     printf("[TEST] %s\n", name);
     uint32_t const f0 = g_fails;
@@ -3782,6 +3897,7 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R32_advice_invalid_request", test_advice_invalid_request);
     run("R33_advice_change_key", test_advice_change_key);
     run("R34_advice_owner_gate", test_advice_owner_gate);
+    run("R35_advice_estimate_and_counters", test_advice_estimate_and_counters);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

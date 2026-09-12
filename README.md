@@ -204,6 +204,13 @@ flags/tag/阈值） · demo 命令解析换内置 JSON 解析器（空白容忍�
 协议回归（58 项检查，无浏览器依赖） ·
 `caller_must_establish_quiescence` 更名（原 external_quiescence_required：
 仅表示调用方义务，0 不代表库已验证外部安全） ·
+**v9 审计轮新增**（`docs/HANDOVER_v11.md`）：R35 建议估算与计数器审计
+（打包模拟的精确搬迁估算——池首空闲块场景不再误报 0；计数器关系
+条件校验，损坏即 INVALID_METADATA 且无减法下溢） ·
+demo 物理行分帧（超长行单次拒绝、后缀不执行）、demo 内 cross-ref 句柄
+（merge/split 后按稳定 id 释放/读取）、demo_server 命令串行化与接收
+状态机（协议版本/来源/seq/会话）、`examples/http_smoke.py` HTTP 层
+回归 ·
 R26 resolve/borrow_begin 失败输出清空 ·
 R27 local 绑定语义固定（解析时强制、CROSS_HINT 拒绝、伪造 hint 得 PoolChanged） ·
 R28 维护仅在最终提交发布 Running（失败不留维护态、不建新池、不动 epoch） ·

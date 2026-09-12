@@ -151,4 +151,24 @@ s_slots）——`global_stats().metadata_bytes` 如实上报；核心库零动�
 ## 12. 整理建议
 
 见 `docs/COMPACTION_POLICY.md`。要点：`analyze_compaction` 严格只读、
-统一五值结论、阈值可查询可配置、估算字段诚实标注 UNKNOWN、绝不自动整理。
+统一结论（含 `INVALID_REQUEST`：输入错误与元数据损坏严格区分）、
+阈值可查询可配置、`estimated_moved_*` 为精确估算（以 compact 成功为前提，
+仍非事务规划）、绝不自动整理。
+
+**推荐的调用时机**（第九轮指南 §11）：
+
+1. 分配返回 `NoSpace` 后，用同样的 size/alignment 查询一次；
+2. 业务已知下一阶段要申请大块时，提前用 `CompactionRequest` 查询；
+3. owner 上下文内由低频 monitor 调用 `poll_compaction_advice`，只在
+   `changed=true` 时记录/提示（轮询绝不放 ISR，绝不隐式执行 compact）；
+4. `COMPACT_RECOMMENDED` → 调用方安排 DMA/ISR/其他任务/外部库静默 → 显式
+   `compact` → 失败按状态恢复或重试；
+5. `COMPACT_BLOCKED` 先处理借用/状态；`COMPACT_UNLIKELY_TO_HELP` 不要盲目
+   整理；`INVALID_METADATA` 进入故障处理；`NO_ACTION` 继续分配。
+
+阈值需要按实际分配失败率、碎片率、整理耗时调优——没有适用于所有产品的
+固定百分比。
+
+**Advice 并发边界**（第八轮定案）：analyze/poll/阈值访问器是 owner 上下文
+API——Debug 构建有 owner 门控（跨上下文调用即断言诊断，`examples/
+owner_probe.cpp` 可复现）；Release 不做运行时检查但契约同样禁止。

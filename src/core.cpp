@@ -1391,10 +1391,31 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
     a.fragment_ratio_permille =
         a.capacity ? (uint32_t)(((uint64_t)a.fragment_bytes * 1000) / a.capacity) : 0;
 
-    // Bounded read-only audits: the order list (also collects the pinned
-    // flag) and the free lists (via get_stats' capped walk + valid flag).
+    // Single bounded walk (address order) that simultaneously counts the
+    // live objects, collects the pinned flag and computes the EXACT move
+    // estimate by simulating compact's address-order packing (same cursor
+    // and barrier rules as compact_impl's plan): a movable object "moves"
+    // iff its current block start differs from the packed cursor. Pinned
+    // objects never move. The cursor can never overtake a later block
+    // (packed prefix <= original prefix, proved in compact_impl), so the
+    // simulation is safe on the audited list.
+    uint32_t walked_live = 0;
+    uint32_t moved_objects = 0;
+    uint64_t moved_bytes = 0;
+    uint8_t const* cursor = pool_start(*P);
     if (walk_order(*P, pool_id, [&](ObjectDesc const& d, uint32_t) {
-            if (d.flags & PM_PINNED) a.has_pinned_objects = 1;
+            ++walked_live;
+            uint8_t const* bstart = d.address - BLOCK_HEADER_SIZE;
+            if (d.flags & PM_PINNED) {
+                a.has_pinned_objects = 1;
+                cursor = bstart + d.block_size; // pinned: never moves
+                return Status::Ok;
+            }
+            if (cursor != bstart) { // would be relocated by compact
+                ++moved_objects;
+                moved_bytes += d.block_size;
+            }
+            cursor += d.block_size; // packed end (dst == cursor for movables)
             return Status::Ok;
         }) != Status::Ok) {
         store(P->structure_epoch); // damage is state the caller was told about
@@ -1404,8 +1425,25 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
     a.largest_free_block = st.largest_free_block;
     a.stats_valid = st.valid;
     if (!st.valid) {
-        store(P->structure_epoch); // damaged free list: reported, then cached
+        store(P->structure_epoch); // damaged free list: cached, then suppressed
         return a;
+    }
+
+    // Counter audit (round-9 guide section 9.2): the verdict arithmetic must
+    // never run on damaged counters -- every relation is checked with
+    // conditional (uint64) subtraction; any failure is INVALID_METADATA.
+    uint64_t const cap = a.capacity;
+    uint64_t const used = a.used_bytes;
+    uint64_t const free_b = a.free_bytes;
+    uint64_t const frag = a.fragment_bytes;
+    uint64_t const largest = a.largest_free_block;
+    bool const counters_ok =
+        used <= cap && free_b <= cap && used + free_b == cap &&
+        frag <= free_b && largest <= free_b - frag &&
+        walked_live == a.live_objects;
+    if (!counters_ok) {
+        store(P->structure_epoch); // damaged counters: cached, then suppressed
+        return a;                  // damaged counters: INVALID_METADATA
     }
 
     if (have_request) {
@@ -1445,11 +1483,18 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
     } else {
         a.verdict = CompactionVerdict::NO_ACTION;
     }
-    // Trivially exact estimate: with every free byte in one block and no
-    // slack, a compaction moves nothing.
-    if (a.free_bytes == a.largest_free_block && a.fragment_bytes == 0) {
+    // Exact move estimate (round-9 guide section 9.1): the simulation above
+    // uses the same address order, barrier and cursor rules as compact_impl's
+    // plan, so the counts are exact for the "compact succeeds" case -- but
+    // this is still NOT the final compact transaction plan.
+    if (moved_objects == 0) {
         a.estimated_moved_objects = 0;
         a.estimated_moved_bytes = 0;
+    } else {
+        a.estimated_moved_objects = moved_objects;
+        a.estimated_moved_bytes =
+            (moved_bytes <= 0xFFFFFFFEull) ? (uint32_t)moved_bytes
+                                           : COMPACTION_ESTIMATE_UNKNOWN;
     }
 
     store(P->structure_epoch);

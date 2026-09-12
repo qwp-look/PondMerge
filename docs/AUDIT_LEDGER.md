@@ -120,3 +120,12 @@
   边界（owner 上下文、禁 ISR、非并发一致快照）写入公共 API 文档；
   external_quiescence_required 更名为 caller_must_establish_quiescence；
   demo 换内置 JSON 解析器 + protocol_smoke.py 协议回归（58 项检查）。
+- 2026-09-12（第九轮）：Advice 估算改为打包模拟的精确计算（池首空闲块
+  场景不再误报 0——旧行为被 R35 复现）；新增计数器审计（条件减法，损坏
+  即 INVALID_METADATA，R35 故障注入覆盖 used/free/fragment/live/largest）；
+  host_demo 物理行分帧（超长行单次拒绝、后缀不执行）；demo 全操作改用
+  cross-ref（merge/split 后按稳定 id 释放/读取，pool hint 不再是身份证明）；
+  demo_server 命令串行化（COMMAND_LOCK）+ 接收状态机（协议版本/来源/seq/
+  会话）+ ESP32 display-only 显式拒绝 + degraded 状态；UI 增加 before/after
+  diff（含 epoch/generation/digest 不变量断言）与静默期模拟标注；
+  examples/http_smoke.py（15 项 HTTP 层检查）+ protocol_smoke 扩至 95 项。

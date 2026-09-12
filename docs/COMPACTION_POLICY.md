@@ -50,7 +50,7 @@
 | `request_can_fit_now` | `largest_free_block >= need`（need 按 alloc 的圆整规则计算） |
 | `request_can_fit_after_compaction_estimate` | **估算**：`(free - fragment) >= need`；pinned 屏障可能使实际值更小 |
 | `caller_must_establish_quiescence` | 1 = 执行 compact 前**调用方**必须自行建立并排空外部静默期。这只是义务提醒：**0 不代表库已验证没有外部使用者**——PondMerge 永远不会检测 DMA/ISR/外部库 |
-| `estimated_moved_objects/bytes` | 诚实估算：仅"完全 packed"时给 0，否则 `COMPACTION_ESTIMATE_UNKNOWN`，不伪造精度 |
+| `estimated_moved_objects/bytes` | **精确估算**（第九轮）：对已审计的地址序 live 链模拟 compact 的打包规则（同一游标/屏障语义），给出确定会搬迁的对象数与字节数——以"compact 成功"为前提，仍不是最终 compact 事务规划 |
 
 ## 4. 阈值
 
@@ -68,13 +68,21 @@ pm::set_compaction_thresholds({200, 1024});   // 按产品负载调整
 "碎片化"，通用建议给 `COMPACT_RECOMMENDED`。阈值可查询、可配置，没有写死的
 通用百分比。
 
+**计数器审计**（第九轮）：判定算术运行前先验证
+`used ≤ capacity`、`free ≤ capacity`、`used + free == capacity`、
+`fragment ≤ free`、`largest ≤ free − fragment`、walk_order 的 live 计数等于
+`live_objects`——全部使用条件减法（uint64），任一失败即 `INVALID_METADATA`
+（R35 故障注入覆盖）。这意味着 Advice 能发现统计字段损坏，且**永不发生
+减法下溢**。
+
 ## 5. 自动提示（可选，不自动执行）
 
 两种受支持的方式：
 
 1. **同步更新**：每次 `analyze_compaction` 都刷新该池的"最近建议"缓存
    （独立固定存储，不是分配器元数据）。
-2. **轮询**：监控循环里调用 `poll_compaction_advice(pool, &req, &changed)`；
+2. **轮询**：监控循环里调用 `poll_compaction_advice(pool, &req, &changed)`
+   （owner 上下文、低频、只读；绝不在 ISR 中调用）；
    当 verdict、structure_epoch、borrow_count、largest_free_block、
    fragment_bytes、请求参数**全部不变**时 `changed == false`，实现重复提示
    抑制。首次查询总是报告。

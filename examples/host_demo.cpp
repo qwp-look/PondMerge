@@ -25,6 +25,34 @@
 namespace {
 
 constexpr uint32_t ZONE_BYTES = 64 * 1024;
+// Physical line framing (round-9 guide section 3): a frame is one line
+// WITHOUT the LF (CRLF tolerated); the payload limit is MAX_LINE_BYTES.
+// Overlong lines are consumed to the LF and produce exactly ONE rejection;
+// their suffix is never parsed or executed. A final line without LF at EOF
+// is accepted (documented in DEMO_REQUIREMENTS section 3).
+constexpr uint32_t MAX_LINE_BYTES = 1024;
+
+// Returns 1 = frame in buf (NUL-terminated), 0 = EOF, -1 = line too long
+// (buffer holds the truncated prefix; the rest of the line was discarded).
+int read_frame(char* buf, uint32_t cap) {
+    uint32_t used = 0;
+    bool too_long = false;
+    while (true) {
+        int c = fgetc(stdin);
+        if (c == EOF) {
+            if (used == 0) return 0;
+            buf[used] = 0;
+            return too_long ? -1 : 1; // final line without LF: accepted
+        }
+        if (c == '\n') {
+            if (used > 0 && buf[used - 1] == '\r') --used; // CRLF
+            buf[used] = 0;
+            return too_long ? -1 : 1;
+        }
+        if (used < cap) buf[used++] = (char)c;
+        else too_long = true; // keep consuming to the LF; never re-parse
+    }
+}
 constexpr uint32_t SEGMENT = 4096;
 constexpr uint32_t POOL0_SEGS = 6;
 constexpr uint32_t POOL1_SEGS = 4;
@@ -60,9 +88,10 @@ void emit_info(char const* event, char const* detail) {
 // duplicate keys: first occurrence wins. Anything malformed fails the whole
 // parse -- no partial results, no silent defaults.
 constexpr uint32_t JSON_MAX_PAIRS = 16;
+enum class JKind : uint8_t { INT, STR, BOOL, NUL };
 struct JPair {
     char key[24];
-    bool is_str;
+    JKind kind;
     char sval[48];
     long long nval;
 };
@@ -74,9 +103,11 @@ struct JObj {
             if (strcmp(pairs[i].key, key) == 0) return &pairs[i];
         return nullptr;
     }
+    // Only a real INTEGER token counts (round-9 guide section 7.1):
+    // bool/null are their own kinds and are never silently treated as numbers.
     bool num(char const* key, long long& out) const {
         JPair const* p = find(key);
-        if (!p || p->is_str) return false;
+        if (!p || p->kind != JKind::INT) return false;
         out = p->nval;
         return true;
     }
@@ -119,26 +150,40 @@ bool json_parse_flat(char const* line, JObj& obj) {
         json_skip_ws(s);
         if (obj.n >= JSON_MAX_PAIRS) return false;
         JPair& p = obj.pairs[obj.n];
-        p.is_str = false; p.nval = 0; p.sval[0] = 0;
+        p.kind = JKind::INT; p.nval = 0; p.sval[0] = 0;
         if (!json_parse_string(s, p.key, sizeof(p.key))) return false;
         json_skip_ws(s);
         if (*s != ':') return false;
         ++s;
         json_skip_ws(s);
         if (*s == '"') {
-            p.is_str = true;
+            p.kind = JKind::STR;
             if (!json_parse_string(s, p.sval, sizeof(p.sval))) return false;
-        } else {
-            char* end = nullptr;
-            long long v = strtoll(s, &end, 10);
-            if (end == s) { // not a number: true/false/null
-                if (strncmp(s, "true", 4) == 0) { v = 1; s += 4; }
-                else if (strncmp(s, "false", 5) == 0) { v = 0; s += 5; }
-                else if (strncmp(s, "null", 4) == 0) { v = 0; s += 4; }
-                else return false;
+        } else if (*s == '-' || *s == '+') {
+            return false; // the subset is unsigned decimal integers only
+        } else if (*s == '0' && s[1] >= '0' && s[1] <= '9') {
+            return false; // no leading zeros ("01" rejected)
+        } else if (*s >= '0' && *s <= '9') {
+            // strict decimal integer, <= 10 digits, <= UINT32_MAX
+            long long v = 0;
+            uint32_t digits = 0;
+            while (*s >= '0' && *s <= '9') {
+                v = v * 10 + (*s - '0');
+                if (v > 0xFFFFFFFFll) return false;
+                ++digits;
+                ++s;
             }
+            (void)digits;
+            p.kind = JKind::INT;
             p.nval = v;
-            s = end;
+        } else if (strncmp(s, "true", 4) == 0) {
+            p.kind = JKind::BOOL; p.nval = 1; s += 4;
+        } else if (strncmp(s, "false", 5) == 0) {
+            p.kind = JKind::BOOL; p.nval = 0; s += 5;
+        } else if (strncmp(s, "null", 4) == 0) {
+            p.kind = JKind::NUL; p.nval = 0; s += 4;
+        } else {
+            return false;
         }
         ++obj.n;
         json_skip_ws(s);
@@ -340,13 +385,13 @@ void do_reset() {
     emit_snapshot();
 }
 
-void do_alloc(uint32_t pool_id, uint32_t size, uint16_t flags) {
+void do_alloc(uint32_t pool_id, uint32_t size, uint16_t flags, uint32_t align) {
     Entry* slot = nullptr;
     for (auto& e : g_entries)
         if (!e.live) { slot = &e; break; }
     if (!slot) { emit_result("alloc", pm::Status::NoSpace); return; }
     pm::RawRef ref{};
-    pm::Status st = pm::alloc((pm::PoolId)pool_id, size, 8, flags, 0, ref);
+    pm::Status st = pm::alloc((pm::PoolId)pool_id, size, align, flags, 0, ref);
     if (st == pm::Status::Ok) {
         slot->live = true; slot->id = g_next_id++; slot->ref = ref;
         slot->size = size; slot->seed = 1 + (g_next_id & 0xFF);
@@ -364,10 +409,25 @@ void do_alloc(uint32_t pool_id, uint32_t size, uint16_t flags) {
     }
 }
 
+// Object identity is index + generation; the pool hint from creation is NOT
+// a permanent home (merge/split move objects). Every demo operation that
+// follows an object uses a cross ref, and the CURRENT pool is read from the
+// audited descriptor -- never from the stale hint (round-9 guide section 5).
+pm::RawRef cross_ref(Entry const& e) {
+    pm::RawRef r = e.ref;
+    r.pool_hint = pm::CROSS_HINT;
+    return r;
+}
+
+pm::PoolId current_pool(Entry const& e) {
+    using namespace pm::internal;
+    return g().objects[e.ref.index].pool_id; // audited descriptor field
+}
+
 void do_free(uint32_t id) {
     Entry* e = find_entry(id);
     if (!e) { emit_result("free", pm::Status::InvalidRef); return; }
-    pm::Status st = pm::free(e->ref);
+    pm::Status st = pm::free(cross_ref(*e));
     if (st == pm::Status::Ok) e->live = false;
     emit_result("free", st);
 }
@@ -377,12 +437,14 @@ void do_free(uint32_t id) {
 // Protocol discipline: exactly ONE result + ONE snapshot per command -- the
 // refill alloc is inlined WITHOUT its own emission (do_alloc would emit).
 void do_fragment() {
+    // the lowest CURRENT pool (from the audited descriptors), not the stale
+    // creation-time hint (round-9 guide section 5)
     uint32_t lowest = 0xFFFF, freed = 0, pos = 0;
     for (auto const& e : g_entries)
-        if (e.live && e.ref.pool_hint < lowest) lowest = e.ref.pool_hint;
+        if (e.live && current_pool(e) < lowest) lowest = current_pool(e);
     for (auto& e : g_entries) {
-        if (e.live && e.ref.pool_hint == lowest) {
-            if ((pos & 1) == 0 && pm::free(e.ref) == pm::Status::Ok) {
+        if (e.live && current_pool(e) == lowest) {
+            if ((pos & 1) == 0 && pm::free(cross_ref(e)) == pm::Status::Ok) {
                 e.live = false;
                 ++freed;
             }
@@ -442,34 +504,45 @@ int main() {
     emit_info("ready", "host demo process");
     do_reset();
 
+    // Field accessors (round-9 guide sections 7.1/7.2): required fields must
+    // be present INTEGER tokens; optional fields fall back to DOCUMENTED
+    // defaults; explicit values are range-checked before any narrowing.
     auto num_field = [](JObj const& o, char const* key, uint32_t& out,
-                        uint32_t def, bool required) -> bool {
+                        uint32_t def, bool required, uint32_t max) -> bool {
         long long v = 0;
         if (!o.num(key, v)) {
             if (required) return false;
             out = def;
             return true;
         }
-        if (v < 0 || v > 0xFFFFFFFFll) return false;
+        if (v < 0 || v > (long long)max) return false;
         out = (uint32_t)v;
         return true;
     };
     auto reject = [](char const* op, char const* why) {
+        // fixed whitelisted strings only: user text is never echoed into the
+        // JSON record (round-9 guide section 7.3)
         printf("{\"t\":\"result\",\"protocol\":1,\"op\":\"%s\","
                "\"status\":\"INVALID_REQUEST\",\"why\":\"%s\"}\n",
                op, why);
         fflush(stdout);
     };
 
-    char line[1024];
-    while (fgets(line, sizeof(line), stdin)) {
+    char line[MAX_LINE_BYTES + 1];
+    while (true) {
+        int const fr = read_frame(line, MAX_LINE_BYTES);
+        if (fr == 0) break;
+        if (fr < 0) { // overlong physical line: ONE rejection, never parsed
+            reject("line", "line too long");
+            continue;
+        }
         JObj cmd;
         if (!json_parse_flat(line, cmd)) {
             reject("parse", "malformed json");
             continue;
         }
         JPair const* c = cmd.find("cmd");
-        if (!c || !c->is_str) {
+        if (!c || c->kind != JKind::STR) {
             reject("parse", "missing cmd");
             continue;
         }
@@ -477,27 +550,30 @@ int main() {
         uint32_t a = 0, b = 0, d = 0, e = 0;
         if (strcmp(op, "reset") == 0) { do_reset(); continue; }
         if (strcmp(op, "alloc") == 0) {
-            // pool/size required; align/flags optional with documented defaults
-            if (!num_field(cmd, "pool", a, 0, true) ||
-                !num_field(cmd, "size", b, 0, true) ||
-                !num_field(cmd, "align", d, 8, false) ||
-                !num_field(cmd, "flags", e, 0, false)) {
+            // pool/size required; align defaults to 8 and flags to 0;
+            // EXPLICIT invalid values are rejected, never silently defaulted
+            // (round-9 guide section 7.2)
+            if (!num_field(cmd, "pool", a, 0, true, PM_MAX_POOLS - 1) ||
+                !num_field(cmd, "size", b, 0, true, 1u << 20) ||
+                !num_field(cmd, "align", d, 8, false, 8) ||
+                d == 0 || (d & (d - 1)) != 0 || // power of two, non-zero
+                !num_field(cmd, "flags", e, 0, false, 0xFFFF)) { // no truncation
                 reject(op, "bad or out-of-range fields");
                 continue;
             }
-            do_alloc(a, b, (uint16_t)e);
+            do_alloc(a, b, (uint16_t)e, (uint32_t)d);
             continue;
         }
         if (strcmp(op, "free") == 0) {
-            if (!num_field(cmd, "id", a, 0, true)) { reject(op, "bad id"); continue; }
+            if (!num_field(cmd, "id", a, 0, true, 0xFFFFFFFF)) { reject(op, "bad id"); continue; }
             do_free(a);
             continue;
         }
         if (strcmp(op, "fragment") == 0) { do_fragment(); continue; }
         if (strcmp(op, "advice") == 0) {
-            if (!num_field(cmd, "pool", a, 0, true) ||
-                !num_field(cmd, "size", b, 0, false) ||
-                !num_field(cmd, "align", d, 8, false)) {
+            if (!num_field(cmd, "pool", a, 0, true, 0xFFFF) ||
+                !num_field(cmd, "size", b, 0, false, 1u << 20) ||
+                !num_field(cmd, "align", d, 8, false, 8)) {
                 reject(op, "bad fields");
                 continue;
             }
@@ -505,13 +581,13 @@ int main() {
             continue;
         }
         if (strcmp(op, "compact") == 0) {
-            if (!num_field(cmd, "pool", a, 0, true)) { reject(op, "bad pool"); continue; }
+            if (!num_field(cmd, "pool", a, 0, true, 0xFFFF)) { reject(op, "bad pool"); continue; }
             emit_result("compact", pm::compact((pm::PoolId)a));
             continue;
         }
         if (strcmp(op, "merge") == 0) {
-            if (!num_field(cmd, "source", a, 0, true) ||
-                !num_field(cmd, "target", b, 0, true)) {
+            if (!num_field(cmd, "source", a, 0, true, 0xFFFF) ||
+                !num_field(cmd, "target", b, 0, true, 0xFFFF)) {
                 reject(op, "bad pools");
                 continue;
             }
@@ -519,8 +595,8 @@ int main() {
             continue;
         }
         if (strcmp(op, "split") == 0) {
-            if (!num_field(cmd, "source", a, 0, true) ||
-                !num_field(cmd, "segments", b, 2, false)) {
+            if (!num_field(cmd, "source", a, 0, true, 0xFFFF) ||
+                !num_field(cmd, "segments", b, 2, false, 64)) {
                 reject(op, "bad fields");
                 continue;
             }
@@ -529,17 +605,23 @@ int main() {
             continue;
         }
         if (strcmp(op, "thresholds") == 0) {
+            // round-9 guide section 10: no arguments = query; ratio AND min
+            // together = update; exactly one of them = INVALID_REQUEST
             long long ratio = 0, minb = 0;
             bool has_ratio = cmd.find("ratio") != nullptr;
             bool has_min = cmd.find("min") != nullptr;
-            if (has_ratio && has_min) {
-                if (!cmd.num("ratio", ratio) || !cmd.num("min", minb) ||
-                    ratio < 0 || ratio > 1000 || minb < 0 || minb > 0xFFFFFFFFll) {
-                    reject(op, "bad thresholds");
-                    continue;
-                }
-                pm::set_compaction_thresholds({(uint32_t)ratio, (uint32_t)minb});
+            if (has_ratio != has_min) {
+                reject(op, "thresholds need both ratio and min");
+                continue;
             }
+            if (has_ratio &&
+                (!cmd.num("ratio", ratio) || !cmd.num("min", minb) ||
+                 ratio < 0 || ratio > 1000 || minb < 0 || minb > 0xFFFFFFFFll)) {
+                reject(op, "bad thresholds");
+                continue;
+            }
+            if (has_ratio)
+                pm::set_compaction_thresholds({(uint32_t)ratio, (uint32_t)minb});
             pm::CompactionThresholds t = pm::get_compaction_thresholds();
             printf("{\"t\":\"result\",\"protocol\":1,\"op\":\"thresholds\","
                    "\"status\":\"OK\",\"fragment_ratio_permille\":%u,"
