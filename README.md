@@ -60,6 +60,39 @@ docs/               架构说明、代码指导书、各轮任务书与交接文
 块格式：每块 8 字节头（`[0..4)` 自身大小 | 空闲位，`[4..8)` 前块大小），
 最小块 16 字节，对齐 8 字节，负载 8 字节对齐。
 
+### 元数据（静态 RAM）预算
+
+这是把 PondMerge 放到小目标上时**第一件要算的事**：元数据全部在静态存储里，
+不占 Auto Zone，但也**不会被释放**。`PM_MAX_OBJECTS` 是绝对主导项。
+
+`global_stats().metadata_bytes` 精确等于（实测 6 组配置全部吻合）：
+
+```
+metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 构建）
+                 ↑ 其中 98 = 64（ObjectDesc）+ 34（维护计划 scratch）
+                 Debug 构建再加 9 字节（advice owner 门控：上下文 id + 标志）
+```
+
+实测值（`metadata_bytes` 与链接器看到的真实 `.bss` 对照）：
+
+| `PM_MAX_OBJECTS` | `PM_MAX_POOLS` | `metadata_bytes` | 真实 `.bss` | 适用 |
+|---|---|---|---|---|
+| 64 | 2 | 7,296 | 7,296 | 极小目标 |
+| 128 | 4 | 14,520 | 14,528 | 小型 MCU |
+| 256 | 4 | 27,064 | 27,072 | 小型 MCU（推荐起点） |
+| **256** | **16** | **32,776** | **32,768** | **ESP32-S3 验收固件所用配置** |
+| 512 | 8 | 54,056 | 54,048 | 中型 |
+| 1024 | 16 | 108,040 | 108,032 | 默认（Host / 大内存目标） |
+
+读法：
+
+- **默认 1024/16 约吃掉 105 KiB 静态 RAM。** 多数 MCU 承受不起，务必下调。
+  在 ESP-IDF 里把 `PM_MAX_OBJECTS` 设为 256 可降至约 31 KiB。
+- `metadata_bytes` 已与真实 `.bss` 吻合到 ±8 字节；两者差异只来自对齐填充。
+  **预算时仍留一点余量。**
+- 该字段在 v1.0.0 之前**漏计了整理建议缓存**（随 `PM_MAX_POOLS` 增长，实测少报
+  128 B @2 pools 到 960 B @16 pools），现已计入，并以上表代替原来的口头描述。
+
 ## 关键语义
 
 1. 只有放入 Auto Zone 的对象被管理；整理 / 合并 / 拆分全部由调用方显式触发。
@@ -154,6 +187,69 @@ pm::CompactionAdvice a = pm::analyze_compaction(pool, &req);
 if (a.verdict == pm::CompactionVerdict::COMPACT_RECOMMENDED) { /* 安排静默期 */ }
 pm::set_compaction_thresholds({100, 512});   // 碎片阈值（可查询可配置）
 ```
+
+## 集成方式
+
+四种消费路径，**同一份源码，不复制**——根 `CMakeLists.txt` 是一个双形态入口
+（按 `ESP_PLATFORM` 分流到 IDF 组件注册或普通 CMake 库）。
+
+### 1. ESP-IDF 组件（MCU 用这条）
+
+把仓库放进工程的 `components/` 下即可。
+
+> **目录名必须是小写 `pondmerge`。** IDF 的组件名来自**目录名**，而仓库名是
+> `PondMerge`——同名克隆会让 `REQUIRES pondmerge` 报 `unknown name`（已实测）。
+
+```sh
+cd <你的工程>/components
+git clone https://github.com/qwp-look/PondMerge.git pondmerge
+```
+
+```cmake
+idf_component_register(SRCS "main.cpp" REQUIRES pondmerge)
+```
+
+在工程 CMakeLists 里缩小元数据预算（数值见上一节的表）：
+
+```cmake
+set(PM_MAX_OBJECTS 256)   # 约 105 KiB → 约 31 KiB 静态 RAM
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(your_app)
+```
+
+已在 **ESP-IDF v6.0.2 / esp32s3** 实测构建通过（含 `PM_MAX_OBJECTS` 覆盖生效）。
+
+### 2. CMake 子目录
+
+```cmake
+add_subdirectory(external/PondMerge)
+target_link_libraries(your_app PRIVATE pondmerge::pondmerge)
+```
+
+### 3. 安装后用 find_package
+
+```sh
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/your/prefix
+cmake --build build && cmake --install build
+```
+
+```cmake
+find_package(pondmerge 1.0 REQUIRED)
+target_link_libraries(your_app PRIVATE pondmerge::pondmerge)
+```
+
+路径 2/3 由 `tests/consumer_smoke.sh` 端到端验证（配置 → 构建 → 安装 →
+`find_package` → 链接 → 运行），CI 每次执行。
+
+### 4. 手工编译（最小路径）
+
+```sh
+g++ -std=c++17 -Iinclude your_app.cpp src/core.cpp -o your_app
+```
+
+> **尚未发布到 Espressif Component Registry。** `idf_component.yml` 已就位，但发布
+> 需要仓库所有者本人的 Espressif 账号与 token（命令为 `compote component upload`），
+> 不属于自动化范围。
 
 ## 构建与测试
 

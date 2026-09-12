@@ -1,0 +1,21 @@
+version: "1.0.0"
+description: >-
+  Managed memory for MMU-less MCUs: a fixed Auto Zone split into pools, a
+  TLSF-style segregated-fit allocator, stable logical references that survive
+  relocation, RAII physical-pointer borrows, and caller-triggered
+  compaction / merge / split. No exceptions, no RTTI, no dynamic allocation.
+url: "https://github.com/qwp-look/PondMerge"
+repository: "https://github.com/qwp-look/PondMerge.git"
+documentation: "https://github.com/qwp-look/PondMerge/blob/main/README.md"
+issues: "https://github.com/qwp-look/PondMerge/issues"
+license: "Apache-2.0"
+tags:
+  - memory
+  - allocator
+  - tlsf
+  - fragmentation
+  - pool
+  - heap
+  - embedded
+dependencies:
+  idf: ">=5.0"

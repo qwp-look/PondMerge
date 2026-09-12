@@ -130,8 +130,10 @@ Host 运行不能证明锁语义，SMP 证据来自双核设备测试（`tests/c
 - `PoolStats` 字段：state、segment_first/count、used/free/largest_free_block、
   fragment_bytes、object_count、borrow_count、structure_epoch、objects_moved、
   bytes_moved、compact_time_us。
-- `GlobalStats`：高水位统计 + `metadata_bytes`（静态元数据 + scratch，
-  如实计入）。
+- `GlobalStats`：高水位统计 + `metadata_bytes`——库自有静态对象的总量
+  （GlobalState + 维护计划 scratch + 整理建议状态），按 C++ 类型计算。实测与链接器
+  看到的真实 `.bss` 相差 ±8 字节。公式与分档表见 `README.md` 的"元数据（静态 RAM）
+  预算"一节：**默认 1024 对象约 105 KiB，MCU 上务必下调 `PM_MAX_OBJECTS`。**
 
 ## 11. 复杂度与资源
 

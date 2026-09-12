@@ -1,0 +1,80 @@
+name: CI
+
+# Every job below runs a gate that this repository already ships and that has
+# been verified locally; CI exists to make those gates automatic on every change
+# rather than depending on someone remembering to run them.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  host-acceptance:
+    name: host acceptance (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: debug
+            cmd: tests/run_host.sh 10000
+          - mode: release
+            cmd: tests/run_host.sh --release 10000
+          - mode: sanitizers
+            cmd: tests/run_host.sh --san 3000
+    steps:
+      - uses: actions/checkout@v4
+      - name: ${{ matrix.cmd }}
+        run: ${{ matrix.cmd }}
+
+  static-analysis:
+    name: static analysis (cppcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+      - name: cppcheck (warning, style, performance)
+        run: tests/run_host.sh --cppcheck
+
+  config-matrix:
+    name: TLSF configuration matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/run_host.sh --configs
+
+  demo-protocol:
+    name: demo protocol + HTTP smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the host demo
+        run: |
+          mkdir -p build
+          g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc \
+              examples/host_demo.cpp src/core.cpp -o build/host_demo
+      - name: Protocol regression (95 checks)
+        run: python3 examples/protocol_smoke.py build/host_demo
+      - name: HTTP layer regression (15 checks)
+        run: python3 examples/http_smoke.py build/host_demo
+
+  consumer-smoke:
+    name: cmake consumer (install + find_package)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, install, then consume via find_package
+        run: tests/consumer_smoke.sh

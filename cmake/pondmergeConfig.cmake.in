@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(NOT MSVC)
+    # The host port layer uses pthread_self() (see include/pondmerge/pm_port.h).
+    find_dependency(Threads)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/pondmergeTargets.cmake")
+
+check_required_components(pondmerge)

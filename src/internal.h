@@ -119,6 +119,7 @@ struct GlobalState {
 
 GlobalState& g();
 uint32_t metadata_scratch_bytes(); // compaction plan scratch size
+uint32_t metadata_advice_bytes();  // compaction-advice state (scales with pools)
 
 // --- helpers implemented in core.cpp ----------------------------------------
 // fl_index() saturates at PM_FL_MAX-1 and is therefore only valid for sizes

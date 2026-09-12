@@ -133,7 +133,13 @@ struct GlobalStats {
     uint32_t max_fragment_bytes;
     uint32_t max_bytes_moved;
     uint64_t max_compact_time_us;
-    uint32_t metadata_bytes;   // size of all static metadata
+    // sizeof every static object the library owns: the global state, the
+    // maintenance plan scratch and the compaction-advice state -- as sized by
+    // their C++ types. The linker may add up to about 1 KiB of alignment
+    // padding on top of this, so budget with a margin (README.md carries a
+    // measured .bss table). Counted in full even though most of it is unused
+    // when PM_MAX_OBJECTS is larger than a program needs.
+    uint32_t metadata_bytes;
 };
 
 // --- lifecycle --------------------------------------------------------------

@@ -737,6 +737,22 @@ uint32_t metadata_scratch_bytes() {
                       sizeof(s_slots));
 }
 
+// The compaction-advice state is fixed static storage the library owns just
+// like the plan scratch, but it scales with PM_MAX_POOLS rather than
+// PM_MAX_OBJECTS, so it is reported separately. It used to be omitted from
+// global_stats().metadata_bytes entirely, which made that field under-report a
+// quantity its own documentation calls "size of all static metadata": the
+// measured shortfall was 128 B at PM_MAX_POOLS=2 and 960 B at 16.
+uint32_t metadata_advice_bytes() {
+    uint32_t bytes =
+        (uint32_t)(sizeof(s_advice_cache) + sizeof(s_advice_thresholds));
+#if PM_DEBUG
+    // Debug-only advice owner gate: the bound context id and its flag.
+    bytes += (uint32_t)(sizeof(s_advice_owner) + sizeof(s_advice_owner_bound));
+#endif
+    return bytes;
+}
+
 } // namespace internal
 
 // ---------------------------------------------------------------------------
@@ -819,7 +835,8 @@ GlobalStats global_stats() {
     s.max_fragment_bytes = G.max_fragment_bytes;
     s.max_bytes_moved = G.max_bytes_moved;
     s.max_compact_time_us = G.max_compact_time_us;
-    s.metadata_bytes = (uint32_t)sizeof(GlobalState) + metadata_scratch_bytes();
+    s.metadata_bytes = (uint32_t)sizeof(GlobalState) + metadata_scratch_bytes() +
+                       metadata_advice_bytes();
     return s;
 }
 
