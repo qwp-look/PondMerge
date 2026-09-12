@@ -591,6 +591,23 @@ struct MovePlanEntry {
 MovePlanEntry s_plan[PM_MAX_OBJECTS];    // lower-side packing (ascending moves)
 MovePlanEntry s_upper[PM_MAX_OBJECTS];   // upper-side packing (descending moves)
 uint8_t* s_barriers[PM_MAX_OBJECTS]; // pinned block starts (address order)
+
+// --- compaction advice state (round-6 doc section 6) --------------------------
+// ADVICE state, separate fixed storage -- never allocator metadata. The
+// zero-side-effect guarantee of analyze_compaction covers every Pool,
+// ObjectDesc and Auto Zone byte (R31 snapshots prove it).
+CompactionThresholds s_advice_thresholds = {100, 512}; // documented defaults
+struct AdviceCache {
+    uint8_t valid;
+    uint8_t verdict;
+    uint32_t structure_epoch;
+    uint32_t borrow_count;
+    uint32_t largest_free_block;
+    uint32_t fragment_bytes;
+    uint32_t request_size;
+    uint32_t request_alignment;
+};
+AdviceCache s_advice_cache[PM_MAX_POOLS];
 uint16_t s_slots[PM_MAX_OBJECTS];    // audited address-order slot list
 
 // --- compaction core ---------------------------------------------------------
@@ -730,6 +747,7 @@ Status init(Config const& cfg) {
 
     // All checks passed: only now may global state be (re)initialized.
     memset(&G, 0, sizeof(G));
+    memset(s_advice_cache, 0, sizeof(s_advice_cache)); // advice state reset
     G.zone = cfg.zone;
     G.segment_size = cfg.segment_size;
     G.segment_count = seg_count;
@@ -1215,6 +1233,142 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align, v
     Status st = check_ref(ref, access_size, access_align, rc, /*require_running=*/true, &addr);
     if (st == Status::Ok) out_addr = addr;
     return st;
+}
+
+// ---------------------------------------------------------------------------
+// Compaction advice (round-6 requirements doc section 6): strictly read-only
+// analysis. The per-pool "last advice" cache below is ADVICE state -- it is
+// separate fixed storage, never allocator metadata, and is the only thing
+// analyze/poll write. The zero-side-effect guarantee covers every Pool,
+// ObjectDesc and Auto Zone byte (R31 snapshots prove it).
+// ---------------------------------------------------------------------------
+CompactionThresholds get_compaction_thresholds() { return s_advice_thresholds; }
+
+void set_compaction_thresholds(CompactionThresholds const& t) {
+    s_advice_thresholds = t; // single-owner configuration, taken as-is
+}
+
+CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* expected) {
+    CompactionAdvice a{};
+    a.verdict = CompactionVerdict::INVALID_METADATA;
+    a.estimated_moved_objects = COMPACTION_ESTIMATE_UNKNOWN;
+    a.estimated_moved_bytes = COMPACTION_ESTIMATE_UNKNOWN;
+    a.expected_request_size = expected ? expected->requested_size : 0;
+    a.expected_request_alignment = expected ? expected->requested_alignment : 0;
+
+    GlobalState& G = g();
+    if (!G.initialized) return a;
+    Pool* P = pool_at(pool_id);
+    if (!P) return a;
+
+    a.pool_state = (uint8_t)P->state;
+    a.capacity = pool_capacity(*P);
+    a.used_bytes = P->used_bytes;
+    a.free_bytes = P->free_bytes;
+    a.live_objects = P->live_objects;
+    a.borrow_count = P->borrow_count;
+    a.fragment_bytes = P->fragment_bytes;
+    a.fragment_ratio_permille =
+        a.capacity ? (uint32_t)(((uint64_t)a.fragment_bytes * 1000) / a.capacity) : 0;
+
+    // Bounded read-only audits: the order list (also collects the pinned
+    // flag) and the free lists (via get_stats' capped walk + valid flag).
+    if (walk_order(*P, pool_id, [&](ObjectDesc const& d, uint32_t) {
+            if (d.flags & PM_PINNED) a.has_pinned_objects = 1;
+            return Status::Ok;
+        }) != Status::Ok)
+        return a; // damaged order list: INVALID_METADATA, nothing written
+    PoolStats st = get_stats(pool_id);
+    a.largest_free_block = st.largest_free_block;
+    a.stats_valid = st.valid;
+    if (!st.valid) return a; // damaged free list
+
+    // Expected-request arithmetic mirrors alloc() exactly (same rounding).
+    if (expected && expected->requested_size != 0) {
+        uint32_t align = expected->requested_alignment;
+        if (align == 0) align = PM_ALIGNMENT;
+        if (align == 0 || (align & (align - 1)) != 0 || align > PM_MAX_ALIGNMENT)
+            return a; // malformed request: INVALID_METADATA
+        uint32_t payload = align_up_u(expected->requested_size, PM_ALIGNMENT);
+        if (payload > UINT32_MAX - BLOCK_HEADER_SIZE) return a;
+        uint32_t need = payload + BLOCK_HEADER_SIZE;
+        if (need < PM_MIN_BLOCK) need = PM_MIN_BLOCK;
+        if (need >= (1u << PM_FL_MAX)) return a; // unservable by the allocator
+        a.request_can_fit_now = (a.largest_free_block >= need) ? 1 : 0;
+        // Honest estimate of the post-compaction largest block: slack
+        // (fragment_bytes) cannot be merged by compaction; pinned barriers
+        // may reduce it further -- this field is an ESTIMATE, documented.
+        uint64_t after = (uint64_t)a.free_bytes - a.fragment_bytes;
+        a.request_can_fit_after_compaction_estimate = (after >= need) ? 1 : 0;
+    }
+
+    bool const blocked = (P->borrow_count != 0) ||
+                         (P->state != PoolState::Running && P->state != PoolState::Paused);
+    // Stranded free bytes: free space split across secondary holes that a
+    // compaction could consolidate (see CompactionThresholds for the
+    // definition; fragment_bytes alone stays near zero in normal operation).
+    uint64_t const stranded =
+        (uint64_t)a.free_bytes - a.fragment_bytes - a.largest_free_block;
+    bool const fragmented =
+        (stranded >= s_advice_thresholds.fragment_min_bytes) &&
+        (a.capacity != 0 &&
+         stranded * 1000 / a.capacity >= s_advice_thresholds.fragment_ratio_permille);
+    if (blocked) {
+        a.verdict = CompactionVerdict::COMPACT_BLOCKED;
+    } else if (expected && expected->requested_size != 0) {
+        if (a.request_can_fit_now) {
+            a.verdict = CompactionVerdict::NO_ACTION;
+        } else if (!a.request_can_fit_after_compaction_estimate) {
+            a.verdict = CompactionVerdict::COMPACT_UNLIKELY_TO_HELP;
+        } else {
+            a.verdict = CompactionVerdict::COMPACT_RECOMMENDED;
+            a.external_quiescence_required = 1; // caller still owes the window
+        }
+    } else if (fragmented) {
+        a.verdict = CompactionVerdict::COMPACT_RECOMMENDED;
+        a.external_quiescence_required = 1;
+    } else {
+        a.verdict = CompactionVerdict::NO_ACTION;
+    }
+    // Trivially exact estimate: with every free byte in one block and no
+    // slack, a compaction moves nothing.
+    if (a.free_bytes == a.largest_free_block && a.fragment_bytes == 0) {
+        a.estimated_moved_objects = 0;
+        a.estimated_moved_bytes = 0;
+    }
+
+    AdviceCache& c = s_advice_cache[pool_id];
+    c.valid = 1;
+    c.verdict = (uint8_t)a.verdict;
+    c.structure_epoch = P->structure_epoch;
+    c.borrow_count = a.borrow_count;
+    c.largest_free_block = a.largest_free_block;
+    c.fragment_bytes = a.fragment_bytes;
+    c.request_size = a.expected_request_size;
+    c.request_alignment = a.expected_request_alignment;
+    return a;
+}
+
+CompactionAdvice poll_compaction_advice(PoolId pool_id, CompactionRequest const* expected,
+                                        bool* changed) {
+    // Snapshot the PREVIOUS cache first: analyze_compaction refreshes it, and
+    // the suppression verdict must compare the fresh result against what the
+    // caller was last told, not against the refresh itself.
+    AdviceCache prev{};
+    if (pool_id < PM_MAX_POOLS) prev = s_advice_cache[pool_id];
+    CompactionAdvice a = analyze_compaction(pool_id, expected);
+    bool is_changed = !prev.valid || prev.verdict != (uint8_t)a.verdict ||
+                      prev.structure_epoch != [&] {
+                          Pool const* P = pool_at(pool_id);
+                          return P ? P->structure_epoch : 0;
+                      }() ||
+                      prev.borrow_count != a.borrow_count ||
+                      prev.largest_free_block != a.largest_free_block ||
+                      prev.fragment_bytes != a.fragment_bytes ||
+                      prev.request_size != a.expected_request_size ||
+                      prev.request_alignment != a.expected_request_alignment;
+    if (changed) *changed = is_changed;
+    return a;
 }
 
 // ---------------------------------------------------------------------------

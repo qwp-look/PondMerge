@@ -232,6 +232,98 @@ Status split(PoolId source, uint32_t new_pool_segments, PoolId& out_new);
 void pm_debug_abort(const char* file, int line);
 
 // ---------------------------------------------------------------------------
+// Compaction advice (round-6 requirements doc section 6): a READ-ONLY
+// analysis answering "is compaction worth trying now / would my next
+// allocation of size X fit". It never moves objects, never changes pool
+// state, generation, address_epoch or any allocator byte, and never calls
+// compact() itself. Executing a compaction stays an explicit caller action
+// under the full maintenance contract (state, borrows, external quiescence).
+// ---------------------------------------------------------------------------
+enum class CompactionVerdict : uint8_t {
+    NO_ACTION = 0,            // nothing to gain right now
+    COMPACT_RECOMMENDED,      // fragmentation and/or the expected request
+                              // would benefit from a compaction
+    COMPACT_BLOCKED,          // borrows active or pool not Running/Paused
+                              // (see borrow_count / pool_state diagnostics)
+    COMPACT_UNLIKELY_TO_HELP, // even a successful compaction could not satisfy
+                              // the expected request, or there is nothing to
+                              // move (no fragmentation)
+    INVALID_METADATA,         // invalid pool id or damaged metadata detected
+                              // by the advice's bounded audit
+};
+
+// What the caller intends to allocate next (all optional). size 0 = "no
+// specific request": the advice then judges general fragmentation only.
+struct CompactionRequest {
+    uint32_t requested_size;
+    uint32_t requested_alignment; // 0 = default PM_ALIGNMENT
+    uint16_t requested_flags;     // informational (PM_MOVABLE / PM_PINNED / ...)
+    uint32_t user_tag;
+};
+
+// Tunable advice thresholds. Defaults are documented in
+// docs/COMPACTION_POLICY.md; query them, do not assume them. Both apply to
+// the STRANDED free bytes -- free_bytes - fragment_bytes - largest_free_block,
+// i.e. the bytes stuck in secondary holes that a compaction could consolidate
+// (fragment_bytes alone is only the sub-minimal slack and stays near zero in
+// normal operation).
+struct CompactionThresholds {
+    uint32_t fragment_ratio_permille; // fragmented when stranded*1000 /
+                                      // capacity >= this (default 100 = 10%)
+    uint32_t fragment_min_bytes;      // ... AND stranded >= this (default 512 B)
+};
+
+CompactionThresholds get_compaction_thresholds();
+void set_compaction_thresholds(CompactionThresholds const& t);
+
+// Marker for diagnostic fields the implementation cannot estimate honestly.
+static constexpr uint32_t COMPACTION_ESTIMATE_UNKNOWN = 0xFFFFFFFFu;
+
+struct CompactionAdvice {
+    CompactionVerdict verdict;
+    // ---- diagnostics (informational; the verdict alone is sufficient for
+    // ---- callers that do not want to reason about internals)
+    uint8_t  pool_state;            // raw PoolState value (doc section 3)
+    uint32_t capacity;
+    uint32_t used_bytes;
+    uint32_t free_bytes;
+    uint32_t largest_free_block;    // 0 when the walk was refused (valid == 0)
+    uint32_t fragment_bytes;
+    uint32_t fragment_ratio_permille; // fragment_bytes * 1000 / capacity
+    uint32_t live_objects;
+    uint32_t borrow_count;
+    uint8_t  has_pinned_objects;
+    uint32_t estimated_moved_objects; // COMPACTION_ESTIMATE_UNKNOWN unless the
+                                      // estimate is trivially exact (see
+                                      // docs/COMPACTION_POLICY.md)
+    uint32_t estimated_moved_bytes;   // same honesty rule as above
+    uint8_t  stats_valid;             // 0 = free-list walk refused
+    // ---- expected-request echo (0 when no request was given)
+    uint32_t expected_request_size;
+    uint32_t expected_request_alignment;
+    uint8_t  request_can_fit_now;     // largest_free_block >= need
+    uint8_t  request_can_fit_after_compaction_estimate; // free - fragment >= need
+    uint8_t  external_quiescence_required; // 1 = stop DMA/ISR/external users
+                                           // before calling compact()
+};
+
+// Read-only analysis; may be called in any pool state. Returns INVALID_METADATA
+// for an unknown pool id or when the bounded audit detects damage.
+CompactionAdvice analyze_compaction(PoolId pool,
+                                    CompactionRequest const* expected = nullptr);
+
+// Same analysis plus repeat-prompt suppression: the per-pool "last advice"
+// cache (separate fixed storage, never allocator metadata) is compared against
+// the fresh result; *changed is false when verdict, structure_epoch,
+// borrow_count, largest_free_block and fragment_bytes are all unchanged.
+// Suppression is the ONLY supported auto-prompt mechanism: polling this from
+// a monitor loop is safe, calling it from an ISR is not, and nothing here
+// ever executes a compaction.
+CompactionAdvice poll_compaction_advice(PoolId pool,
+                                        CompactionRequest const* expected,
+                                        bool* changed);
+
+// ---------------------------------------------------------------------------
 // Generic result wrapper
 // ---------------------------------------------------------------------------
 template <class T>

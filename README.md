@@ -192,6 +192,11 @@ R24 free 物理头故障（块头/prev_size/后继/bin 成员资格，验证先�
 R25 borrow_end 单临界区 token 校验（Release 下重复/陈旧/错池 end 不动计数；双核
 真并发由设备侧 `tests/concurrency_esp32.cpp` 覆盖） ·
 R26 resolve/borrow_begin 失败输出清空 ·
+**v6 需求轮新增**（`docs/HANDOVER_v8.md`）：R31 整理建议（只读分析零副作用、
+五值统一结论、可配置阈值、重复提示抑制、估算诚实标注 UNKNOWN）·
+`examples/`：Host 可视化 Demo（host_demo + demo_server.py）与 ESP32-S3
+demo 固件（同一 JSON Lines 快照协议 v1，见 `docs/DEMO_REQUIREMENTS.md`） ·
+R26 resolve/borrow_begin 失败输出清空 ·
 R27 local 绑定语义固定（解析时强制、CROSS_HINT 拒绝、伪造 hint 得 PoolChanged） ·
 R28 维护仅在最终提交发布 Running（失败不留维护态、不建新池、不动 epoch） ·
 **v4 长程审查新增**（`docs/HANDOVER_v6.md`）：R29 扩展故障矩阵（互逆链接 /
@@ -295,6 +300,9 @@ max_live=55 max_borrow=1 max_moved=30960 max_compact_us=2509 meta=27704
 引用（如上，含提交号/App version/ELF SHA/编译时间）。`HANDOVER_v3.md` 中
 `1176` 与旧 README 的 `2487` 均出自 `a9232c7` 时代不同次运行的记录，引用时
 必须带上各自运行日志的完整证据链，不得互相替代。
+
+可视化 Demo（Host + ESP32，快照协议 v1）：`examples/demo_server.py`、
+`examples/esp32_demo/`，规范见 `docs/DEMO_REQUIREMENTS.md`。
 
 复现方式（复位 USB-Serial-JTAG、抓完整启动日志与测试输出）：
 

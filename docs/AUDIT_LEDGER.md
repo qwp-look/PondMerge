@@ -23,6 +23,7 @@
 | object lifetime | 可搬移类型显式 opt-in 且经审计（不含 Auto Zone 自指针/DMA/同步原语） | `pm_is_relocatable` 特化（tests/suite.cpp 顶部） | 测试中注册的 5 个类型均为 POD；含裸指针的 RawHolder 特化被 static_assert 拒绝 | R5 | ✅ |
 | 统计 | used/free/fragment/live 与物理布局精确互锁 | `validate()` 第三段覆盖审计 | live+free+slack==capacity 且 free_total==free_bytes-fragment_bytes | R21、模型对拍 | ✅ |
 | 失败输出 | 任何公共入口失败时输出引用/指针必为无效（generation 0 / nullptr），旧值绝不残留 | `alloc()` 首语句清空（第五轮）、`resolve()` 入口、`borrow_begin()` 失败分支 | 失败在 `out` 赋值前返回或显式清空；槽位 generation 不动（R1 语义保持） | R26、R29(5)、R30 | ✅（第五轮补齐 alloc） |
+| 整理建议 | analyze/poll 严格只读：Pool/ObjectDesc/Auto Zone 逐字节不变；verdict 五值；估算不伪造 | `analyze_compaction()`/`poll_compaction_advice()`（建议缓存为独立建议态，非分配器元数据） | 快照比对 + walk_order/get_stats 有界审计 | R31 | ✅（第六轮新增） |
 
 ## 2. 遍历有限性清单（第四轮任务书 §7 全量搜索结论）
 
@@ -111,3 +112,5 @@
   并发表补充 resolve/get_stats/validate 行与 PM_LOCK 范围说明；接受边界
   追加 Host 空锁与维护期并发模型两项；设备侧模型对拍缺口关闭（模型复用
   suite 的 g_zone，4000 ops，随固件运行）。
+- 2026-09-12（第六轮）：新增整理建议不变量行；R31 钉住只读性与判定矩阵；
+  examples/ 双端 Demo 与快照协议 v1（docs/DEMO_REQUIREMENTS.md）。

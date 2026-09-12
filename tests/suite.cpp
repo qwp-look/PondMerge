@@ -3243,6 +3243,254 @@ static void test_alloc_clears_output_on_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// (R31) round-6 requirements doc section 6/11: compaction advice. The advice
+// must be strictly read-only (every Pool, ObjectDesc and Auto Zone byte
+// unchanged), distinguish advice/Busy-class/invalid-metadata, honour
+// queryable thresholds, suppress repeat prompts, and never fake estimates.
+// ---------------------------------------------------------------------------
+static void test_compaction_advice() {
+    printf("  [R31] compaction advice: read-only, verdicts, thresholds\n");
+
+    using Verdict = pm::CompactionVerdict;
+    pm::CompactionThresholds const def = pm::get_compaction_thresholds();
+    CHECK(def.fragment_ratio_permille == 100 && def.fragment_min_bytes == 512);
+
+    // ---- (1) zero side effects on a fragmented pool ----
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        pm::RawRef o[5];
+        for (uint32_t i = 0; i < 5; ++i) {
+            CHECK_ST(pm::alloc(pool, 1000, 8, 0, i, o[i]), pm::Status::Ok);
+            fill(o[i], 1000, 500 + i);
+        }
+        CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[3]), pm::Status::Ok);
+        VALIDATE(pool);
+
+        pm::RawRef const refs[5] = {o[0], o[2], o[4], o[1], o[3]};
+        using namespace pm::internal;
+        snap_all(pool, pool, refs, 5, seg_base(g().pools[pool].segment_first), 4 * 4096);
+        pm::CompactionRequest req{600, 8, 0, 42};
+        pm::CompactionAdvice a1 = pm::analyze_compaction(pool);
+        pm::CompactionAdvice a2 = pm::analyze_compaction(pool, &req);
+        bool changed = true;
+        pm::CompactionAdvice a3 = pm::poll_compaction_advice(pool, &req, &changed);
+        (void)a1; (void)a2; (void)a3;
+        check_all_unchanged(pool, pool, refs, 5, seg_base(g().pools[pool].segment_first), 4 * 4096);
+        CHECK_ST(pm::validate(pool), pm::Status::Ok);
+        CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[4]), pm::Status::Ok);
+        done();
+    }
+
+    // ---- (2) verdict matrix ----
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok); // 16 KiB
+        // Four 3000 B objects + a filler that consumes the tail, so the only
+        // free space after the frees below is the two 3008 B holes.
+        pm::RawRef o[4], filler{};
+        for (uint32_t i = 0; i < 4; ++i) {
+            CHECK_ST(pm::alloc(pool, 3000, 8, 0, i, o[i]), pm::Status::Ok);
+            fill(o[i], 3000, 500 + i);
+        }
+        uint32_t const used = 4 * 3008;
+        CHECK_ST(pm::alloc(pool, 4 * 4096 - used - 16, 8, 0, 9, filler),
+                 pm::Status::Ok);
+        // (a) packed pool: no free space at all -> NO_ACTION, and the
+        //     trivially exact move estimate is 0.
+        pm::CompactionAdvice a = pm::analyze_compaction(pool);
+        CHECK(a.verdict == Verdict::NO_ACTION);
+        CHECK(a.estimated_moved_objects == 0 && a.estimated_moved_bytes == 0);
+        CHECK(a.external_quiescence_required == 0);
+        CHECK(a.capacity == 4 * 4096 && a.live_objects == 5);
+        CHECK(a.stats_valid == 1 && a.has_pinned_objects == 0);
+
+        // (b) two 3008 B holes: stranded 3008 B = 183 permille >= defaults
+        //     -> RECOMMENDED.
+        CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[3]), pm::Status::Ok);
+        a = pm::analyze_compaction(pool);
+        CHECK(a.verdict == Verdict::COMPACT_RECOMMENDED);
+        CHECK(a.external_quiescence_required == 1);
+        CHECK(a.estimated_moved_objects == pm::COMPACTION_ESTIMATE_UNKNOWN);
+        CHECK(a.estimated_moved_bytes == pm::COMPACTION_ESTIMATE_UNKNOWN);
+        CHECK(a.free_bytes == 2 * 3008 && a.largest_free_block == 3008);
+
+        // (c) active borrow -> BLOCKED (advice never hides the blocker).
+        void* p = nullptr;
+        CHECK_ST(pm::borrow_begin(o[0], 3000, 1, p), pm::Status::Ok);
+        a = pm::analyze_compaction(pool);
+        CHECK(a.verdict == Verdict::COMPACT_BLOCKED);
+        CHECK(a.borrow_count == 1);
+        pm::borrow_end(o[0]);
+
+        // (d) maintenance state -> BLOCKED (white-box state injection).
+        {
+            using namespace pm::internal;
+            pm::internal::PoolState saved = g().pools[pool].state;
+            g().pools[pool].state = pm::internal::PoolState::Compacting;
+            a = pm::analyze_compaction(pool);
+            CHECK(a.verdict == Verdict::COMPACT_BLOCKED);
+            g().pools[pool].state = saved;
+        }
+
+        // (e) request that fits a 3008 B hole right now -> NO_ACTION.
+        pm::CompactionRequest req{600, 8, 0, 7};
+        a = pm::analyze_compaction(pool, &req);
+        CHECK(a.verdict == Verdict::NO_ACTION);
+        CHECK(a.request_can_fit_now == 1);
+        CHECK(a.expected_request_size == 600 && a.expected_request_alignment == 8);
+
+        CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+        CHECK_ST(pm::free(filler), pm::Status::Ok);
+        done();
+    }
+
+    // ---- (3) request that needs compaction / can never fit ----
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        pm::RawRef o[4], filler{};
+        for (uint32_t i = 0; i < 4; ++i) {
+            CHECK_ST(pm::alloc(pool, 3000, 8, 0, i, o[i]), pm::Status::Ok);
+        }
+        CHECK_ST(pm::alloc(pool, 4 * 4096 - 4 * 3008 - 16, 8, 0, 9, filler),
+                 pm::Status::Ok);
+        CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[3]), pm::Status::Ok);
+        // 4000 B request: does not fit a 3008 B hole, but the stranded
+        // 6016 B would cover it after compaction -> RECOMMENDED.
+        pm::CompactionRequest req{4000, 8, 0, 8};
+        pm::CompactionAdvice a = pm::analyze_compaction(pool, &req);
+        CHECK(a.verdict == Verdict::COMPACT_RECOMMENDED);
+        CHECK(a.request_can_fit_now == 0);
+        CHECK(a.request_can_fit_after_compaction_estimate == 1);
+        CHECK(a.external_quiescence_required == 1);
+        // 15000 B request: free_bytes ~ 6016 -- can never fit ->
+        // UNLIKELY_TO_HELP (no fake optimism).
+        pm::CompactionRequest big{15000, 8, 0, 9};
+        a = pm::analyze_compaction(pool, &big);
+        CHECK(a.verdict == Verdict::COMPACT_UNLIKELY_TO_HELP);
+        CHECK(a.request_can_fit_after_compaction_estimate == 0);
+        CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+        CHECK_ST(pm::free(filler), pm::Status::Ok);
+        done();
+    }
+
+    // ---- (4) pinned objects are reported ----
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef pin{};
+        CHECK_ST(pm::alloc(pool, 256, 8, pm::PM_PINNED, 1, pin), pm::Status::Ok);
+        pm::CompactionAdvice a = pm::analyze_compaction(pool);
+        CHECK(a.has_pinned_objects == 1);
+        CHECK_ST(pm::free(pin), pm::Status::Ok);
+        done();
+    }
+
+    // ---- (5) INVALID_METADATA: bad pool, malformed request, damaged bins ----
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef a_ref{};
+        CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, a_ref), pm::Status::Ok);
+        CHECK_ST(pm::free(a_ref), pm::Status::Ok);
+        CHECK(pm::analyze_compaction((pm::PoolId)77).verdict ==
+              Verdict::INVALID_METADATA);
+        pm::CompactionRequest bad{64, 3, 0, 1}; // alignment not a power of two
+        CHECK(pm::analyze_compaction(pool, &bad).verdict == Verdict::INVALID_METADATA);
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        uint32_t hf = FL_COUNT, hs = SL_COUNT;
+        for (uint32_t f = 0; f < FL_COUNT && hf == FL_COUNT; ++f)
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl)
+                if (P.bins.head[f][sl] != NULL_OFF) { hf = f; hs = sl; break; }
+        if (hf < FL_COUNT) { // guard: a healthy pool always has one, but do
+                             // not index out of bounds even on a failed CHECK
+            uint32_t const saved = P.bins.head[hf][hs];
+            P.bins.head[hf][hs] = 0xFFFFFFF0u;
+            CHECK(pm::analyze_compaction(pool).verdict == Verdict::INVALID_METADATA);
+            P.bins.head[hf][hs] = saved;
+        }
+        VALIDATE(pool);
+        done();
+    }
+
+    // ---- (6) thresholds are queryable/configurable + poll suppression ----
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        pm::RawRef o[5];
+        for (uint32_t i = 0; i < 5; ++i) {
+            CHECK_ST(pm::alloc(pool, 1000, 8, 0, i, o[i]), pm::Status::Ok);
+        }
+        CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[3]), pm::Status::Ok);
+        // State: two 1008 B holes + the 11344 B tail; stranded 2016 B
+        // (123 permille) -> above the default thresholds.
+
+        // (a) suppression: the first poll after init always reports (the
+        //     advice cache starts empty); an unchanged state is suppressed.
+        bool changed = false;
+        pm::poll_compaction_advice(pool, nullptr, &changed);
+        CHECK(changed == true);
+        pm::poll_compaction_advice(pool, nullptr, &changed);
+        CHECK(changed == false);
+        // (b) merging a hole with the next one does NOT move the largest
+        //     block (the tail dominates), nor the epoch -> no repeat prompt.
+        CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+        pm::poll_compaction_advice(pool, nullptr, &changed);
+        CHECK(changed == false);
+        // (c) a compaction bumps structure_epoch and (here) clears the
+        //     stranded bytes -> the verdict changes -> reports.
+        CHECK_ST(pm::compact(pool), pm::Status::Ok);
+        pm::poll_compaction_advice(pool, nullptr, &changed);
+        CHECK(changed == true);
+        pm::poll_compaction_advice(pool, nullptr, &changed);
+        CHECK(changed == false);
+
+        // (d) thresholds: defaults make the (re-fragmented) pool RECOMMENDED;
+        //     a stricter ratio silences it; a looser one keeps it.
+        CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[4]), pm::Status::Ok);
+        // Re-fragment: refill the packed area and free alternating objects.
+        pm::RawRef n[5];
+        for (uint32_t i = 0; i < 5; ++i) {
+            CHECK_ST(pm::alloc(pool, 1000, 8, 0, 20 + i, n[i]), pm::Status::Ok);
+        }
+        CHECK_ST(pm::free(n[1]), pm::Status::Ok);
+        CHECK_ST(pm::free(n[3]), pm::Status::Ok);
+        pm::CompactionThresholds t = pm::get_compaction_thresholds();
+        CHECK(t.fragment_ratio_permille == 100 && t.fragment_min_bytes == 512);
+        pm::set_compaction_thresholds({5000, 512}); // 500%: never reached
+        CHECK(pm::analyze_compaction(pool).verdict == Verdict::NO_ACTION);
+        pm::set_compaction_thresholds({10, 100}); // 1% / 100 B
+        CHECK(pm::analyze_compaction(pool).verdict == Verdict::COMPACT_RECOMMENDED);
+        pm::set_compaction_thresholds(t);
+        CHECK(pm::get_compaction_thresholds().fragment_ratio_permille == 100);
+        CHECK(pm::analyze_compaction(pool).verdict == Verdict::COMPACT_RECOMMENDED);
+
+        CHECK_ST(pm::free(n[0]), pm::Status::Ok);
+        CHECK_ST(pm::free(n[2]), pm::Status::Ok);
+        CHECK_ST(pm::free(n[4]), pm::Status::Ok);
+        VALIDATE(pool);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
 static void run(const char* name, void (*fn)()) {
     printf("[TEST] %s\n", name);
     uint32_t const f0 = g_fails;
@@ -3302,6 +3550,7 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R28_state_publication", test_state_publication);
     run("R29_round4_fault_matrix", test_round4_fault_matrix);
     run("R30_alloc_clears_output_on_failure", test_alloc_clears_output_on_failure);
+    run("R31_compaction_advice", test_compaction_advice);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;
