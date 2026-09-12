@@ -213,19 +213,28 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align,
 //                  Running and the source becomes Empty).
 //
 // COMPLEXITY (task-book v2 section 7.3; worst case, not amortised). alloc is
-// NOT O(1): the TLSF bitmap locates a bin, and several block sizes share one
-// SL bin, so the allocator walks that bin for a first fit. The honest bounds
-// are: alloc O(bin chain length + live objects) -- the TLSF bitmap locates a
-// bin and walks it first-fit, then the descriptor is linked into the
-// address-order list (bounded walk, round-4 task book section 7);
-// free O(1 + the bin chain lengths of its free neighbours), upper bound
-// O(zone_size / PM_MIN_BLOCK) -- free proves the neighbours' free-list
-// membership before merging instead of trusting their headers (round-3
-// guide 6.2); pause/resume O(1); compact/merge/split O(objects + moved
-// bytes) plus the read-only audits (merge audits both pools' order lists,
-// descriptors, statistics and bins: O(objects + free blocks)); validate
-// O((live + free)^2); get_stats O(free_blocks) with a step cap (a refused
-// walk on a corrupted list is reported via PoolStats::valid == 0).
+// still NOT O(1), but the term that used to dominate it is gone. The honest
+// bound is now O(bin chain length): the TLSF bitmap locates a bin and the
+// allocator walks that bin for a first fit, because several block sizes share
+// one SL bin. The live-object term disappeared when the live-slot list stopped
+// being kept in address order -- maintaining that sort inside alloc measured as
+// essentially 100% of alloc's cost and grew linearly with the live count (see
+// bench/RESULTS.md), so the ordering is now established once per maintenance
+// call, on the cold path, instead of on every allocation. The upper bound is
+// still O(zone_size / PM_MIN_BLOCK), for a corrupted (cyclic) bin chain.
+//   free            O(1 + the bin chain lengths of its free neighbours), upper
+//                   bound O(zone_size / PM_MIN_BLOCK) -- free proves the
+//                   neighbours' free-list membership before merging instead of
+//                   trusting their headers (round-3 guide 6.2)
+//   pause/resume    O(1)
+//   compact/split   O(objects + moved bytes), plus O(objects log objects) to
+//                   re-establish address order, plus the read-only audits
+//   merge           O(objects + free blocks + moved bytes) -- audits both
+//                   pools' live slots, descriptors, statistics and bins
+//   validate        O((live + free)^2)
+//   get_stats       O(free_blocks) with a step cap (a refused walk on a
+//                   corrupted list is reported via PoolStats::valid == 0)
+//   analyze_compaction O(objects log objects + free blocks)
 Status compact(PoolId pool);
 Status merge(PoolId source, PoolId target);
 // Splits `source` after `new_pool_segments` segments; the new pool owns the

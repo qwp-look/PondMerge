@@ -14,8 +14,9 @@
 | block | 块间与池尾 slack 首 4 字节 poison 为 0 | `finalize_layout()` | free 的前向合并只读 free 位，slack 头为 0 时不会误合并 | R15(c)、R20 | ✅ |
 | free-list | 每个 free block 恰好属于其 size class 选中的 bin，双向链接互逆 | `audit_pool_bins()`（validate 阶段 2 共用） | 位图/链一致 + fl/sl 类匹配 + prev/next 互逆 + 有界步数 | R18、R21、R29(2) | ✅ |
 | free-list | free 合并前证明邻块成员资格与互逆链接 | `free_block_binned()` | 有界遍历找到节点后核对其 prev/next 指回自身 | R24、R29(1) | ✅ |
-| order-list | 地址有序、双向、有限、无重复、全为对应池的 Live 描述符 | `walk_order()`、`precheck_pool()`、`validate()` 阶段 1 | 步数上限 PM_MAX_OBJECTS+1 + index 界 + addr_prev 链核对 | R8、R21、R22(7)(8) | ✅ |
-| order-list | alloc 自己的插入走链有防环上限，环链时有界拒绝且零副作用 | `order_insert_sorted()`（返回 bool）+ `alloc()` 先链后改块 | 步数上限在改任何链接前触发；alloc 回滚只释放槽位（第四轮红测探针：旧实现挂死） | R29(5) | ✅（第四轮修复） |
+| live-slot list | 是一个**无序的活对象袋**：双向链接、有限、无重复、全为对应池的 Live 描述符 | `collect_live_sorted()`、`precheck_pool()`、`validate()` 阶段 1 | 步数上限 PM_MAX_OBJECTS+1 + index 界 + state/pool/generation 核对 + addr_prev 链核对 | R8、R21、R22(7)(8) | ✅（本轮搬迁，见 §6.8） |
+| live-slot list | **地址序只在维护入口成立**：收集后按 (address, index) heapsort，重复地址即 `CorruptMetadata` | `collect_live_sorted()` + `sort_slots_by_address()` | 排序只读元数据值，不解引用不受信地址；重复地址按排序后的相邻对拒绝；heapsort 无递归无分配，最坏 O(n log n) | R21(5)、R22(7)、模型对拍、validate | ✅（本轮新增） |
+| live-slot list | alloc 的追加是 **O(1) 且不可能失败**，故 alloc 在任何物理字节变更之后**已无失败路径** | `order_append()` + `alloc()` | 三条指针写入，无遍历；环链/断链改由每个维护入口与 `validate()` 有界拒绝（R29(5) 已按新语义重写） | R29(5) | ✅（本轮） |
 | state | 池状态机 Entry(Running/Paused) → Merging/Splitting/Compacting → 提交发布；失败恢复入口状态 | `compact()`/`merge()`/`split()` 的 arming 与最终提交锁段 | 所有发布在锁内一次性完成；计划失败仅恢复状态、其余字节不动 | R7、R16、R22、R28 | ✅ |
 | state | 新池在最终提交前不可观测为可用 | `split()` arming 段（认领为 Splitting） | state ∉ {Running} 时 alloc/borrow 全部 Busy | R16(C)、R28(c) | ✅ |
 | borrow | begin/end 一一对应；token（index+generation+pool）在锁内校验；任何失配不动计数 | `borrow_begin()`/`borrow_end()` | 全部校验与递减在同一 PM_LOCK 内；active_borrows/borrow_count 双计数下溢不可能 | R10、R16、R25、设备并发测试 | ✅ |
@@ -30,15 +31,15 @@
 | 遍历 | 步数上限 / 防护 | 位置 | 备注 |
 |---|---|---|---|
 | bins_find | max_hops = zone_size/PM_MIN_BLOCK+1 + 游标判界 | core.cpp | ✅ |
-| precheck_pool | PM_MAX_OBJECTS+1 + index 界 + prev 链 | core.cpp | ✅ |
-| walk_order | 同上（merge/split/compact 规划共用） | core.cpp | ✅ |
+| **collect_live_sorted** | PM_MAX_OBJECTS+1 + index 界 + state/pool/gen + addr_prev 链核对 | core.cpp | ✅ **本轮取代 `walk_order`，成为唯一受认可的活对象枚举入口**（compact/merge/split/validate/advice 共用） |
+| sort_slots_by_address | 原地 heapsort；输入规模已由 collect 界定，无自身遍历上限需求 | core.cpp | ✅ 本轮新增（无递归、无分配、最坏 O(n log n)） |
 | audit_pool_bins | capacity/PM_MIN_BLOCK+1 + head_ok + 互逆链接 | core.cpp | ✅ |
-| validate 阶段 1 / 阶段 2 / 覆盖段 | PM_MAX_OBJECTS+1 / capacity 上限 / 阶段 1 已证无环后复用 | core.cpp | ✅ |
+| validate 阶段 1 / 阶段 2 / 覆盖段 | collect 的上限 / capacity 上限 / 阶段 1 已证无环后复用 | core.cpp | ✅ |
 | get_stats | capacity 上限 + 越界判界，拒绝时 valid=0 | core.cpp | ✅ |
 | free_block_binned | capacity 上限 + 越界判界 | core.cpp | ✅ |
-| **order_insert_sorted（alloc 路径）** | **PM_MAX_OBJECTS+1（第四轮新增）** | core.cpp | 修复前无上限：环链挂死（红测探针 2 证实）；修复后有界拒绝且零副作用 |
+| ~~order_insert_sorted（alloc 路径）~~ | **本轮删除** —— alloc 不再遍历任何链表，改为 O(1) `order_append` | core.cpp | 该遍历及其防环上限需求随之消失；同类损坏的保护由 `collect_live_sorted` 承接（见 §6.8） |
 | order_unlink | O(1)，无遍历 | core.cpp | ✅ |
-| finalize_layout | 执行阶段走链，前置已审计/刚重建；Debug 步数断言（第四轮新增） | core.cpp | 计划 A 无失败分支，断言为"不可能性"守卫 |
+| finalize_layout | **不再遍历链表**：迭代已审计的地址序槽位数组，超出 [start,end) 的条目按范围跳过 | core.cpp | ✅ 本轮简化（split 因此不再依赖"边界以下即前缀"的未验证假设） |
 | 模型/测试侧遍历 | 不触及库内部（模型仅用公共 API） | tests/model.cpp | ✅ |
 
 ## 3. 故障注入矩阵覆盖（第四轮任务书 §11）
@@ -73,15 +74,16 @@
 
 | 操作 | 声明 | 依据循环 | 变化 |
 |---|---|---|---|
-| alloc | O(SL bin 链长 + live_objects)，上界 O(zone/PM_MIN_BLOCK) | `bins_find`（链内 first-fit）+ `order_insert_sorted`（地址序插入，有界） | **第四轮更正**：旧声明漏掉地址序插入的 O(live) 项 |
+| alloc | **O(SL bin 链长)**，上界 O(zone/PM_MIN_BLOCK) | `bins_find`（链内 first-fit）+ `order_append`（O(1) 追加，无遍历） | **本轮**：地址序插入移出热路径后 O(live) 项消失（实测 799→38 ns @1024，232→38 ns @256；`bench/RESULTS.md`） |
 | free | O(1 + 邻块空闲 bin 链长)，上界 O(zone/PM_MIN_BLOCK) | `free_block_binned` 有界遍历 × 2 邻块 | 第三轮已更正 |
-| compact | O(objects + moved bytes)（含审计 O(objects)） | precheck + walk_order + 计划 + 搬移 + finalize | — |
-| merge | O(objects + free_blocks + moved bytes) | 两池 precheck + audit_pool_bins + 计划 + 搬移 + finalize | — |
-| split | O(objects + moved bytes)（含审计） | 同上 | — |
-| validate | O((live + free)²) | gap_before 嵌套 | 如实保留 |
+| compact | O(objects log objects + moved bytes) | precheck→collect（有界遍历 + heapsort）+ 计划 + 搬移 + finalize | **本轮**：审计由 O(objects) 变为 O(objects log objects)，换来 alloc 与 live 数解耦 |
+| merge | O(objects log objects + free_blocks + moved bytes) | 两池 collect（各含一次排序）+ audit_pool_bins + 计划 + 搬移 + finalize | **本轮**同上 |
+| split | O(objects log objects + moved bytes) | 同上 | **本轮**同上 |
+| validate | O((live + free)²) | gap_before 嵌套（collect 的排序项被二次项支配） | 如实保留 |
+| analyze_compaction | O(objects log objects + free_blocks) | collect（含排序）+ 打包模拟 + get_stats | **本轮**补登记（此前未列入本表） |
 | get_stats | O(free_blocks)，步数上限 | bins 全遍历 | + valid 字段 |
-| 固定 scratch | O(PM_MAX_OBJECTS)：s_plan/s_upper/s_barriers/s_slots(uint16) | — | 设备侧 512 B×4 级别 |
-| 栈使用 | 维护路径无递归；最大局部为 snapshot lambda 与 verify_neighbours（均 O(1) 栈） | — | — |
+| 固定 scratch | O(PM_MAX_OBJECTS)：s_plan/s_upper/s_barriers/s_slots(uint16) | — | 设备侧 512 B×4 级别；本轮**未**新增 scratch（排序原地进行） |
+| 栈使用 | 维护路径无递归；heapsort 的 sift 为尾递归式循环（O(1) 栈）；最大局部为 snapshot lambda 与 verify_neighbours（均 O(1) 栈） | — | — |
 
 ## 6. 已接受的边界（明确决策，非遗漏）
 
@@ -102,6 +104,15 @@
    （第五轮指南 §4：真正 SMP 安全需重新覆盖全部读写，属重设计，不在 v1）。
    debug-only owner token 评估后不采用：host 单线程下无执行价值，设备上
    维护操作本就要求单 owner 调用——本轮交付为契约文档化（头文件 + README 表）。
+8. **alloc 不再检测 live-slot 链损坏**（本轮不变量搬迁，见 §1 与 §2）：
+   alloc 的追加是 O(1) 且不遍历该链，因此环链 / 断链不再由 alloc 报
+   `CorruptMetadata`——该职责移至每个维护入口与 `validate()`，仍为有界时间、
+   零副作用（R29(5) 已按新语义重写，并断言失败维护后池状态回到 Running）。
+   alloc 的追加会写入既有结构的一个链接字段（新节点的 `addr_next`、旧头的
+   `addr_prev`）：在已损坏的结构上这是"不加重、也不修复"的写入。
+   **换来的**是 alloc 与 live 数解耦（实测 799→38 ns @1024，232→38 ns @256）
+   以及地址序维护成本的冷路径化（每次维护一次 O(n log n)，在 memmove 面前可忽略）。
+   若将来需要"alloc 也拒绝损坏结构"，须先恢复一次遍历，届时会重新引入 O(live)。
 
 ## 7. 账本维护记录
 
@@ -129,3 +140,17 @@
   会话）+ ESP32 display-only 显式拒绝 + degraded 状态；UI 增加 before/after
   diff（含 epoch/generation/digest 不变量断言）与静默期模拟标注；
   examples/http_smoke.py（15 项 HTTP 层检查）+ protocol_smoke 扩至 95 项。
+- 2026-09-12（第十轮，性能轮）：**先测量再改**。新增 `bench/`（alloc 延迟、
+  validate 标度、碎片 A/B 三套基准 + RESULTS.md），实测确认 alloc 的成本
+  ≈100% 是 live-slot 链的**地址序插入**且线性于 live 数（斜率 1.42 ns/live），
+  同时用**负结果**排除了两个看似可疑的候选（调大 `PM_SL_COUNT` 无效、
+  `get_stats` 本来就便宜）。据此实施不变量搬迁：`order_insert_sorted` 删除，
+  改为 O(1) `order_append`；新增 `collect_live_sorted()`（唯一受认可枚举入口，
+  承接环链/断链检测）与原地 heapsort `sort_slots_by_address()`；
+  `precheck_pool` 改为输出地址序槽位数组；`walk_order` 删除；`finalize_layout`
+  改为迭代数组并按范围过滤（split 不再依赖"边界以下即前缀"的未假设）；
+  R21(5)/R22(7) 修正了两处**测试自身**在新语义下失效的假设（注入点恰好已是
+  尾部、修复时硬编码了 NO_ORDER）；R29(5) 按新语义重写并断言失败维护后状态
+  回到 Running。实测收益：稳态 alloc 799→**37.6 ns** @1024、232→**38.5 ns** @256
+  （均与 live 数解耦）；free 与 validate 标度不变；碎片基准 A/B 结果逐项不变
+  （无行为回归）。接受边界新增 §6.8。

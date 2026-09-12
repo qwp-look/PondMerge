@@ -139,12 +139,19 @@ Host 运行不能证明锁语义，SMP 证据来自双核设备测试（`tests/c
 
 | 操作 | 最坏复杂度 |
 |---|---|
-| alloc | O(SL bin 链长 + live_objects) |
+| alloc | O(SL bin 链长) —— **与 live 对象数无关**（见下） |
 | free | O(1 + 邻块空闲 bin 链长) |
-| compact / split | O(objects + moved bytes) |
+| compact / split | O(objects + moved bytes) + O(objects log objects) 恢复地址序 |
 | merge | O(objects + free blocks + moved bytes) |
 | validate | O((live + free)²) |
-| get_stats / analyze_compaction | O(free blocks + objects) |
+| get_stats | O(free blocks) |
+| analyze_compaction | O(objects log objects + free blocks) |
+
+**关于 `alloc`**：早先它把描述符**按地址序插入** live 链，那一步被实测为 ≈100% 的
+alloc 成本且随 live 数线性增长。地址序只在维护路径上被需要，因此改为 alloc 做 O(1)
+追加、维护入口一次性重建地址序。实测 232 ns @256 → **38 ns**，799 ns @1024 → **38 ns**
+（`bench/RESULTS.md`）。**不变量搬迁与其检测边界变化见 `docs/AUDIT_LEDGER.md`**：
+alloc 不再检测 live 链损坏，该职责移到每个维护入口与 `validate()`。API 与错误码不变。
 
 固定元数据：描述符表、池表、bins、计划 scratch（s_plan/s_upper/s_barriers/
 s_slots）——`global_stats().metadata_bytes` 如实上报；核心库零动态分配、

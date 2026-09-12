@@ -175,31 +175,101 @@ void order_unlink(Pool& P, uint32_t idx) {
     D.addr_prev = D.addr_next = NO_ORDER;
 }
 
-// Bounded address-order insertion (round-4 task book section 7: validate's
-// cycle guard cannot substitute alloc's own). Returns false when the walk
-// trips the step cap -- the list is cyclic/corrupted and NOTHING has been
-// linked yet, so the caller can fail without undoing link changes. On a
-// healthy list the walk length is bounded by the live-object count, which
-// is part of alloc's documented O(bin chain + live objects) bound.
-bool order_insert_sorted(Pool& P, uint32_t idx) {
+// O(1) append to the pool's live-slot list.
+//
+// The list is deliberately NOT kept in address order any more. Keeping it
+// sorted inside alloc() was ~100% of alloc's total cost and grew linearly with
+// the live-object count (measured: 232 ns at live=256, 799 ns at live=1024, of
+// which the walk is essentially all -- see bench/RESULTS.md). Address order is
+// needed only by the maintenance paths, which can afford one O(n log n) sort
+// per invocation on the cold path while alloc sits on the hot path.
+//
+// Consequence, recorded in docs/AUDIT_LEDGER.md: alloc no longer detects a
+// damaged list. Detection moved to collect_live_sorted(), which every
+// maintenance entry and validate() go through. Appending cannot fail, so alloc
+// now has NO failure path at all after its block/bin mutation begins -- which
+// is strictly stronger than the previous "link first, then mutate" ordering
+// that round-4 R29 was written to guarantee.
+void order_append(Pool& P, uint32_t idx) {
     ObjectDesc* D = g().objects;
-    uint32_t cur = P.order_head;
+    D[idx].addr_prev = NO_ORDER;
+    D[idx].addr_next = P.order_head;
+    if (P.order_head != NO_ORDER) D[P.order_head].addr_prev = idx;
+    P.order_head = idx;
+}
+
+// In-place heapsort of descriptor indices by block address, tie-broken by index
+// so the result is deterministic.
+//
+// Heapsort is chosen deliberately over std::sort: the core has no <algorithm>
+// dependency, and this needs no recursion, no allocation, an O(n log n) worst
+// case, and about twenty lines that can be audited by eye.
+void sort_slots_by_address(uint16_t* a, uint32_t n) {
+    GlobalState const& G = g();
+    auto key = [&](uint16_t i) { return (uintptr_t)G.objects[i].address; };
+    auto less = [&](uint16_t x, uint16_t y) {
+        return key(x) != key(y) ? key(x) < key(y) : x < y;
+    };
+    auto sift = [&](uint32_t root, uint32_t end) {
+        for (;;) {
+            uint32_t child = 2 * root + 1;
+            if (child > end) return;
+            if (child + 1 <= end && less(a[child], a[child + 1])) ++child;
+            if (!less(a[root], a[child])) return;
+            uint16_t const t = a[root];
+            a[root] = a[child];
+            a[child] = t;
+            root = child;
+        }
+    };
+    if (n < 2) return;
+    for (uint32_t i = n / 2; i-- > 0;) sift(i, n - 1);
+    for (uint32_t i = n - 1; i > 0; --i) {
+        uint16_t const t = a[0];
+        a[0] = a[i];
+        a[i] = t;
+        sift(0, i - 1);
+    }
+}
+
+// Collect a pool's live descriptors into `out` in address order.
+//
+// This is the ONLY sanctioned way to enumerate a pool: every maintenance entry,
+// validate() and the advice analysis go through it. It re-establishes, on the
+// cold path, the ordering that alloc() no longer maintains -- and it is
+// therefore also where a damaged live-slot list is detected, with the same
+// bounded walk and structural checks the traversal always had:
+//   * a step cap (cycle / overrun guard),
+//   * index range and descriptor state / pool / generation checks,
+//   * the addr_prev link must agree with the walk,
+//   * duplicate addresses are refused (they would be an overlap).
+// Sorting reads metadata VALUES only; nothing here dereferences an address
+// derived from untrusted metadata.
+Status collect_live_sorted(Pool const& P, PoolId pid, uint16_t* out,
+                           uint32_t out_cap, uint32_t& out_n) {
+    GlobalState const& G = g();
     uint32_t prev = NO_ORDER;
     uint32_t steps = 0;
-    while (cur != NO_ORDER && D[cur].address < D[idx].address) {
-        if (++steps > PM_MAX_OBJECTS + 1) {
-            D[idx].addr_prev = D[idx].addr_next = NO_ORDER;
-            return false; // cyclic order list: refuse, nothing linked
-        }
-        prev = cur;
-        cur = D[cur].addr_next;
+    uint32_t n = 0;
+    for (uint32_t idx = P.order_head; idx != NO_ORDER;
+         idx = G.objects[idx].addr_next) {
+        if (++steps > PM_MAX_OBJECTS + 1) return Status::CorruptMetadata;
+        if (idx >= PM_MAX_OBJECTS) return Status::CorruptMetadata;
+        ObjectDesc const& d = G.objects[idx];
+        if (d.state != ObjState::Live || d.pool_id != pid || d.generation == 0)
+            return Status::CorruptMetadata;
+        if (d.addr_prev != prev) return Status::CorruptMetadata;
+        if (n >= out_cap) return Status::CorruptMetadata;
+        out[n++] = (uint16_t)idx;
+        prev = idx;
     }
-    D[idx].addr_prev = prev;
-    D[idx].addr_next = cur;
-    if (prev != NO_ORDER) D[prev].addr_next = idx;
-    else P.order_head = idx;
-    if (cur != NO_ORDER) D[cur].addr_prev = idx;
-    return true;
+    sort_slots_by_address(out, n);
+    for (uint32_t i = 1; i < n; ++i) {
+        if (G.objects[out[i]].address == G.objects[out[i - 1]].address)
+            return Status::CorruptMetadata;
+    }
+    out_n = n;
+    return Status::Ok;
 }
 
 // --- descriptor slots --------------------------------------------------------
@@ -342,83 +412,57 @@ bool free_block_binned(Pool const& P, FreeBlock const* fb) {
 }
 
 // --- maintenance pre-check (task-book v2 section 8) --------------------------
-// Full descriptor audit before ANY maintenance planning. Plan A's "execution
-// cannot fail" rests on this function: order list, descriptor fields and
-// physical block relationships are all verified here, with bounded walks so
-// corrupted (cyclic) metadata is refused instead of hanging. Runs in Release
-// too -- its verdict gates every memmove. All range math uses zone offsets,
-// never raw pointer differences on possibly-corrupted values. The prev_size
-// chain is deliberately NOT checked: after a pool merge the physical
-// predecessor of a block may come from the other pool until the post-merge
-// compaction rewrites all headers (validate() enforces the chain on settled
-// layouts).
-Status precheck_pool(Pool const& P, PoolId pid, uint8_t const* start, uint8_t const* end) {
+// Full descriptor audit before ANY maintenance planning, expressed over the
+// address-ordered slot array produced by collect_live_sorted(). Plan A's
+// "execution cannot fail" rests on this function: descriptor fields, ordering,
+// overlap, pool range and the byte statistics are all verified here with
+// bounded work, so corrupted (cyclic) metadata is refused instead of hanging.
+// Runs in Release too -- its verdict gates every memmove. All range math uses
+// uint64 zone offsets, never raw pointer differences on possibly-corrupted
+// values. The prev_size chain is deliberately NOT checked: after a pool merge
+// the physical predecessor of a block may come from the other pool until the
+// post-merge compaction rewrites all headers (validate() enforces the chain on
+// settled layouts).
+//
+// `out` / `out_cap` / `out_n` receive the audited, address-sorted slot array.
+// Every caller plans from THAT array and never re-traverses the (untrusted)
+// list -- which is what makes collect_live_sorted the single detection point
+// for a damaged live-slot list.
+Status precheck_pool(Pool const& P, PoolId pid, uint8_t const* start,
+                     uint8_t const* end, uint16_t* out, uint32_t out_cap,
+                     uint32_t& out_n) {
     GlobalState const& G = g();
     const uint64_t zone_base = (uint64_t)(uintptr_t)G.zone;
     const uint64_t start_off = (uint64_t)(uintptr_t)start - zone_base;
     const uint64_t end_off = (uint64_t)(uintptr_t)end - zone_base;
-    const uint32_t max_steps = PM_MAX_OBJECTS + 1;
 
-    uint32_t count = 0, used = 0;
-    uint32_t prev_idx = NO_ORDER;
+    Status st = collect_live_sorted(P, pid, out, out_cap, out_n);
+    if (st != Status::Ok) return st;
+
+    uint32_t used = 0;
     uint64_t prev_end = start_off;
-
-    for (uint32_t idx = P.order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
-        if (++count > max_steps) return Status::CorruptMetadata; // cycle/overrun
-        if (idx >= PM_MAX_OBJECTS) return Status::CorruptMetadata;
-        ObjectDesc const& d = G.objects[idx];
-        if (d.state != ObjState::Live || d.pool_id != pid || d.generation == 0)
-            return Status::CorruptMetadata;
-        if (d.addr_prev != prev_idx) return Status::CorruptMetadata;
+    for (uint32_t i = 0; i < out_n; ++i) {
+        ObjectDesc const& d = G.objects[out[i]];
         if (d.block_size < PM_MIN_BLOCK || (d.block_size & (PM_ALIGNMENT - 1)) != 0)
             return Status::CorruptMetadata;
         if (d.size > d.block_size - BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
-        uint64_t aabs = (uint64_t)(uintptr_t)d.address;
+        uint64_t const aabs = (uint64_t)(uintptr_t)d.address;
         if (aabs < zone_base + BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
         if ((aabs & (PM_ALIGNMENT - 1)) != 0) return Status::CorruptMetadata;
-        uint64_t aoff = aabs - zone_base;         // payload offset in zone
-        uint64_t boff = aoff - BLOCK_HEADER_SIZE; // block start, zone offset
+        uint64_t const aoff = aabs - zone_base;         // payload offset in zone
+        uint64_t const boff = aoff - BLOCK_HEADER_SIZE; // block start, zone offset
         if (boff < start_off || aoff + d.size > end_off) return Status::CorruptMetadata;
         if (boff + d.block_size > end_off) return Status::CorruptMetadata;
-        if (boff < prev_end) return Status::CorruptMetadata; // order + overlap
+        if (boff < prev_end) return Status::CorruptMetadata; // ordering + overlap
         // Physical header must already agree with the descriptor.
-        uint32_t own = load32(G.zone + boff);
+        uint32_t const own = load32(G.zone + boff);
         if ((own & BLOCK_FREE_BIT) != 0 || (own & ~BLOCK_FREE_BIT) != d.block_size)
             return Status::CorruptMetadata;
         prev_end = boff + d.block_size;
         used += d.block_size;
-        prev_idx = idx;
     }
-    if (prev_idx != NO_ORDER && G.objects[prev_idx].addr_next != NO_ORDER)
-        return Status::CorruptMetadata;
-    if (count != P.live_objects || used != P.used_bytes) return Status::CorruptMetadata;
+    if (out_n != P.live_objects || used != P.used_bytes) return Status::CorruptMetadata;
     if (P.free_bytes != (uint32_t)(end_off - start_off) - used) return Status::CorruptMetadata;
-    return Status::Ok;
-}
-
-// --- bounded order-list walk (round-3 guide section 4) -----------------------
-// The ONLY sanctioned way for maintenance paths to traverse an address-order
-// list: every cursor is range-checked before dereference, the walk is capped
-// at PM_MAX_OBJECTS + 1 steps (cycle/overrun guard) and each node must be a
-// live descriptor of the expected pool whose addr_prev link agrees with the
-// walk. "validate() already checked this list" is NOT a licence to traverse:
-// validate is neither a lock nor a mandatory precondition.
-template <class Visitor>
-Status walk_order(Pool const& P, PoolId pid, Visitor&& visit) {
-    GlobalState const& G = g();
-    uint32_t prev = NO_ORDER;
-    uint32_t steps = 0;
-    for (uint32_t idx = P.order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
-        if (++steps > PM_MAX_OBJECTS + 1) return Status::CorruptMetadata;
-        if (idx >= PM_MAX_OBJECTS) return Status::CorruptMetadata;
-        ObjectDesc const& d = G.objects[idx];
-        if (d.state != ObjState::Live || d.pool_id != pid || d.generation == 0)
-            return Status::CorruptMetadata;
-        if (d.addr_prev != prev) return Status::CorruptMetadata;
-        Status st = visit(d, idx);
-        if (st != Status::Ok) return st;
-        prev = idx;
-    }
     return Status::Ok;
 }
 
@@ -503,35 +547,35 @@ Status audit_pool_bins(Pool const& P, uint64_t* free_total_out) {
 
 // --- layout finalization -----------------------------------------------------
 // Rebuild block headers, free blocks and TLSF bins for the physical range
-// [start, end) from the pool's address-ordered live blocks. Shared by
-// compact, merge and split. Sub-minimal gaps become poisoned slack
-// (prev_size 0) so free()'s physical walk can never run into them.
+// [start, end) from an address-ordered slot array. Shared by compact, merge and
+// split. Sub-minimal gaps become poisoned slack (prev_size 0) so free()'s
+// physical walk can never run into them.
 //
 // Transactional contract (task-book 3.6, plan A): this function runs in the
 // EXECUTION phase, after the callers' read-only planning has verified object
 // placement, pinned barriers, alignment and range bounds. It only writes
 // already-validated metadata, so it cannot fail; the internal checks are
 // debug assertions. No maintenance op may move data and then report an error.
-void finalize_layout(Pool& P, uint8_t* start, uint8_t const* end) {
+//
+// The array is address-ascending and covers every live descriptor of the
+// pool(s) being finalized. Entries outside [start, end) belong to the other
+// side of a split and are skipped -- so split can hand BOTH halves the same
+// array instead of relying on "everything below the boundary is a prefix",
+// which would be an unverified assumption inside an execution phase that is
+// not allowed to fail.
+void finalize_layout(Pool& P, uint8_t* start, uint8_t const* end,
+                     uint16_t const* slots, uint32_t nslot) {
     P.bins.reset();
     uint32_t capacity = (uint32_t)(end - start);
     uint8_t* prev_end = start;
     uint32_t prev_own = 0; // predecessor's own size, 0 = none/slack
     uint32_t used = 0, fragment = 0, count = 0;
 
-    uint32_t steps = 0;
-    for (uint32_t idx = P.order_head; idx != NO_ORDER; idx = g().objects[idx].addr_next) {
-        // The list was audited (precheck) or rebuilt from the plan arrays
-        // before this EXECUTION-phase walk, so the cap cannot trip in healthy
-        // operation; it is a debug guard over an impossibility, not an error
-        // path (plan A has no failure branch here). `steps` stays referenced
-        // in Release (the trailing (void) below) so the guard compiles out
-        // without an unused-variable warning.
-        ++steps;
-        PM_ASSERT(steps <= PM_MAX_OBJECTS + 1);
-        ObjectDesc const& d = g().objects[idx];
+    for (uint32_t i = 0; i < nslot; ++i) {
+        ObjectDesc const& d = g().objects[slots[i]];
         uint8_t* bstart = d.address - BLOCK_HEADER_SIZE;
         uint32_t bsize = d.block_size;
+        if (bstart < start || bstart + bsize > end) continue; // other side
         // Invariants guaranteed by planning; a violation here is a bug, not
         // a runtime condition.
         PM_ASSERT(bstart >= prev_end);
@@ -560,7 +604,6 @@ void finalize_layout(Pool& P, uint8_t* start, uint8_t const* end) {
         count++;
     }
 
-    (void)steps; // Release: the guard above compiles out; keep the counter used
     uint32_t tail = (uint32_t)(end - prev_end);
     if (tail >= PM_MIN_BLOCK) {
         auto* fb = reinterpret_cast<FreeBlock*>(prev_end); // cppcheck-suppress dangerousTypeCast; 8B-aligned block start
@@ -661,16 +704,10 @@ Status compact_impl(Pool& P) {
     PoolId const pid = (PoolId)(&P - G.pools);
     uint32_t nslot = 0, nbar = 0, nplan = 0;
 
-    // Gate every memmove on a full descriptor audit (bounded walks).
-    st = precheck_pool(P, pid, start, end);
-    if (st != Status::Ok) return st;
-
-    // One audited walk collects the live slots in address order; every later
-    // loop iterates this trusted array instead of the (untrusted) list.
-    st = walk_order(P, pid, [&](ObjectDesc const&, uint32_t idx) {
-        s_slots[nslot++] = idx;
-        return Status::Ok;
-    });
+    // Gate every memmove on a full descriptor audit; it also produces the
+    // address-ordered slot array, and every later loop iterates THAT array
+    // rather than re-traversing the (untrusted) live-slot list.
+    st = precheck_pool(P, pid, start, end, s_slots, PM_MAX_OBJECTS, nslot);
     if (st != Status::Ok) return st;
 
     for (uint32_t i = 0; i < nslot; ++i) {
@@ -720,7 +757,7 @@ Status compact_impl(Pool& P) {
     }
     // Execution phase: cannot fail (plan A). Planning verified every
     // placement; finalize only writes already-validated metadata.
-    finalize_layout(P, start, end);
+    finalize_layout(P, start, end, s_slots, nslot);
 
     P.objects_moved = moved_objs;
     P.bytes_moved = moved_bytes;
@@ -1050,15 +1087,14 @@ Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
     ObjectDesc& d = G.objects[slot];
     memset(&d, 0, sizeof(d));
     // The payload address is final already (a later split only moves the
-    // remainder), so the address-order link happens BEFORE any block byte or
-    // bin membership changes: if the order list is corrupt, alloc fails here
-    // with an exact rollback -- only the slot needs to be released (round-4
-    // task book section 7). After the link there is no failure path left.
+    // remainder), so the live-slot link is established BEFORE any block byte or
+    // bin membership changes. That link is now a pure O(1) append which cannot
+    // fail, so this is the last possible failure point and the rollback is
+    // still exactly "release the slot, change nothing else". See order_append()
+    // for why the list is no longer kept in address order, and
+    // docs/AUDIT_LEDGER.md for the invariant this relocates.
     d.address = reinterpret_cast<uint8_t*>(blk) + BLOCK_HEADER_SIZE;
-    if (!order_insert_sorted(*P, slot)) {
-        slot_release(slot);
-        return Status::CorruptMetadata;
-    }
+    order_append(*P, slot);
     bins_remove(P->bins, blk);
 
     uint8_t* blkaddr = reinterpret_cast<uint8_t*>(blk);
@@ -1429,35 +1465,38 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
     a.fragment_ratio_permille =
         a.capacity ? (uint32_t)(((uint64_t)a.fragment_bytes * 1000) / a.capacity) : 0;
 
-    // Single bounded walk (address order) that simultaneously counts the
-    // live objects, collects the pinned flag and computes the EXACT move
-    // estimate by simulating compact's address-order packing (same cursor
-    // and barrier rules as compact_impl's plan): a movable object "moves"
-    // iff its current block start differs from the packed cursor. Pinned
-    // objects never move. The cursor can never overtake a later block
-    // (packed prefix <= original prefix, proved in compact_impl), so the
-    // simulation is safe on the audited list.
+    // One address-ordered pass that simultaneously counts the live objects,
+    // records the pinned flag and computes the EXACT move estimate by simulating
+    // compact's packing (same cursor and barrier rules as compact_impl's plan):
+    // a movable object "moves" iff its current block start differs from the
+    // packed cursor. Pinned objects never move. The cursor can never overtake a
+    // later block (packed prefix <= original prefix, proved in compact_impl), so
+    // the simulation is safe on the array. collect_live_sorted is the single
+    // sanctioned enumeration and is also where a damaged list is detected.
     uint32_t walked_live = 0;
     uint32_t moved_objects = 0;
     uint64_t moved_bytes = 0;
-    uint8_t const* cursor = pool_start(*P);
-    if (walk_order(*P, pool_id, [&](ObjectDesc const& d, uint32_t) {
-            ++walked_live;
-            uint8_t const* bstart = d.address - BLOCK_HEADER_SIZE;
-            if (d.flags & PM_PINNED) {
-                a.has_pinned_objects = 1;
-                cursor = bstart + d.block_size; // pinned: never moves
-                return Status::Ok;
-            }
-            if (cursor != bstart) { // would be relocated by compact
-                ++moved_objects;
-                moved_bytes += d.block_size;
-            }
-            cursor += d.block_size; // packed end (dst == cursor for movables)
-            return Status::Ok;
-        }) != Status::Ok) {
+    uint32_t nslot = 0;
+    if (collect_live_sorted(*P, pool_id, s_slots, PM_MAX_OBJECTS, nslot) !=
+        Status::Ok) {
         store(P->structure_epoch); // damage is state the caller was told about
-        return a;                  // damaged order list: INVALID_METADATA
+        return a;                  // damaged live-slot list: INVALID_METADATA
+    }
+    uint8_t const* cursor = pool_start(*P);
+    for (uint32_t i = 0; i < nslot; ++i) {
+        ObjectDesc const& d = G.objects[s_slots[i]];
+        ++walked_live;
+        uint8_t const* bstart = d.address - BLOCK_HEADER_SIZE;
+        if (d.flags & PM_PINNED) {
+            a.has_pinned_objects = 1;
+            cursor = bstart + d.block_size; // pinned: never moves
+            continue;
+        }
+        if (cursor != bstart) { // would be relocated by compact
+            ++moved_objects;
+            moved_bytes += d.block_size;
+        }
+        cursor += d.block_size; // packed end (dst == cursor for movables)
     }
     PoolStats st = get_stats(pool_id);
     a.largest_free_block = st.largest_free_block;
@@ -1682,34 +1721,28 @@ Status merge(PoolId source_id, PoolId target_id) {
     uint8_t* const end = pool_end(*upper);
     Status st = Status::Ok;
     uint32_t nslot = 0, nbar = 0, nplan = 0;
-    // The combined sequence is (lower pool, upper pool); the source objects
-    // are therefore one contiguous run of the plan -- the prefix when the
-    // source is the lower pool, the suffix otherwise (precheck audited the
-    // live counts). No per-entry pool field is needed.
-    uint32_t const n_lower = (uint32_t)lower->live_objects;
+    uint32_t n_lower = 0, n_upper = 0;
 
-    // Full audit of BOTH pools before any planning: order lists, descriptor
-    // ranges, physical header agreement and statistics (precheck_pool), then
-    // the free-list structure (audit_pool_bins). Bounded walks throughout.
-    st = precheck_pool(*S, source_id, pool_start(*S), pool_end(*S));
-    if (st == Status::Ok)
-        st = precheck_pool(*T, target_id, pool_start(*T), pool_end(*T));
-    if (st == Status::Ok) st = audit_pool_bins(*S, nullptr);
-    if (st == Status::Ok) st = audit_pool_bins(*T, nullptr);
-    // The planning traversals go through walk_order (index, prev-link and
-    // step-cap protection; guide section 4) and collect the combined slot
-    // sequence into trusted scratch -- no untrusted list is ever followed.
-    if (st == Status::Ok)
-        st = walk_order(*lower, lower_id, [&](ObjectDesc const&, uint32_t idx) {
-            s_slots[nslot++] = idx;
-            return Status::Ok;
-        });
-    if (st == Status::Ok)
-        st = walk_order(*upper, upper_id, [&](ObjectDesc const&, uint32_t idx) {
-            s_slots[nslot++] = idx;
-            return Status::Ok;
-        });
+    // Full audit of BOTH pools before any planning: the descriptor audit first
+    // (which also yields each pool's address-ordered slots), then the free-list
+    // structure. Bounded work throughout.
+    //
+    // The LOWER pool is collected first on purpose. Its blocks all precede the
+    // upper pool's (the ranges are adjacent), so appending upper's sorted slots
+    // after lower's leaves the combined array address-ascending -- which is what
+    // the plan and finalize_layout both require. That also makes the source's
+    // objects one contiguous run of the plan: the prefix when the source is the
+    // lower pool, the suffix otherwise. No per-entry pool field is needed.
+    st = precheck_pool(*lower, lower_id, pool_start(*lower), pool_end(*lower),
+                       s_slots, PM_MAX_OBJECTS, n_lower);
     if (st != Status::Ok) goto fail_restore;
+    st = precheck_pool(*upper, upper_id, pool_start(*upper), pool_end(*upper),
+                       s_slots + n_lower, PM_MAX_OBJECTS - n_lower, n_upper);
+    if (st != Status::Ok) goto fail_restore;
+    st = audit_pool_bins(*S, nullptr);
+    if (st == Status::Ok) st = audit_pool_bins(*T, nullptr);
+    if (st != Status::Ok) goto fail_restore;
+    nslot = n_lower + n_upper;
 
     {
         // Pinned barriers over the combined range (address order).
@@ -1777,9 +1810,11 @@ Status merge(PoolId source_id, PoolId target_id) {
                 bump_epoch(d.address_epoch); // even if the address is unchanged
             }
         }
-        // Rebuild the target order list straight from the audited plan --
-        // splicing through order_unlink/order_insert_sorted would re-walk a
-        // list that nothing re-validated after planning (guide section 4).
+        // Rebuild the target's live-slot list straight from the audited plan.
+        // The list carries no ordering guarantee any more (see order_append),
+        // but it must still be a well-formed, consistently linked bag: building
+        // it by splicing would re-walk a structure nothing re-validated after
+        // planning (guide section 4), whereas the plan array is already trusted.
         for (uint32_t i = 0; i < nplan; ++i) {
             ObjectDesc& d = G.objects[s_plan[i].slot];
             d.addr_prev = (i == 0) ? NO_ORDER : s_plan[i - 1].slot;
@@ -1792,8 +1827,9 @@ Status merge(PoolId source_id, PoolId target_id) {
         T->segment_count = (uint16_t)(S->segment_count + T->segment_count);
         T->live_objects = nplan; // == S.live + T.live, audited by precheck
         // finalize_layout rebuilds headers, bins and the byte statistics for
-        // the combined range from the freshly rebuilt (trusted) order list.
-        finalize_layout(*T, start, end);
+        // the combined range from the address-ordered slot array. Every entry
+        // is inside [start, end) here, so nothing is skipped.
+        finalize_layout(*T, start, end, s_slots, nslot);
     }
 
     // ---- final commit (single locked publish; guide section 3.1) ------------
@@ -1864,17 +1900,10 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
     Status st = Status::Ok;
     uint32_t nslot = 0, nbar = 0, nlow = 0, nup = 0, n_right = 0;
 
-    // Gate every memmove on a full descriptor audit (bounded walks); a
-    // pre-check failure restores Running with zero side effects.
-    st = precheck_pool(*S, source_id, start, end);
-    if (st != Status::Ok) goto fail_restore;
-
-    // One audited walk collects the live slots; planning iterates the array
-    // instead of re-walking the (untrusted) list (guide section 4).
-    st = walk_order(*S, source_id, [&](ObjectDesc const&, uint32_t idx) {
-        s_slots[nslot++] = idx;
-        return Status::Ok;
-    });
+    // Gate every memmove on a full descriptor audit, which also yields the
+    // address-ordered slot array. A pre-check failure restores Running with zero
+    // side effects.
+    st = precheck_pool(*S, source_id, start, end, s_slots, PM_MAX_OBJECTS, nslot);
     if (st != Status::Ok) goto fail_restore;
 
     // Collect pinned barriers (address order).
@@ -2023,9 +2052,12 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
         N->live_objects = moved_count;
 
         S->segment_count = (uint16_t)keep;
-        // Execution phase: cannot fail (plan A, task-book 3.6).
-        finalize_layout(*S, start, boundary);
-        finalize_layout(*N, boundary, end);
+        // Execution phase: cannot fail (plan A, task-book 3.6). Both halves get
+        // the SAME address-ordered array; finalize_layout skips the entries that
+        // fall outside each half's range, so neither half depends on an
+        // unverified "below the boundary is a prefix" assumption.
+        finalize_layout(*S, start, boundary, s_slots, nslot);
+        finalize_layout(*N, boundary, end, s_slots, nslot);
 
         PM_LOCK();
         S->structure_epoch++;
@@ -2084,7 +2116,6 @@ Status validate(PoolId id) {
     const uint32_t capacity = pool_capacity(*P);
     const uint64_t start_off = (uint64_t)(uintptr_t)pool_start(*P) - zbase;
     const uint64_t end_off = start_off + capacity;
-    const uint32_t max_order_steps = PM_MAX_OBJECTS + 1;
 
     // [off, off+len) lies inside the pool byte range. len is added in 64-bit
     // so a hostile offset cannot wrap.
@@ -2097,18 +2128,21 @@ Status validate(PoolId id) {
         return prev_link_ok(boff, start_off);
     };
 
-    // 1) address_order list: bounded walk, descriptor consistency, strictly
-    //    increasing non-overlapping blocks, header and prev_size agreement.
-    uint32_t count = 0, used = 0;
-    uint32_t prev_idx = NO_ORDER;
+    // 1) live slots. collect_live_sorted is the single sanctioned enumeration
+    //    (bounded walk, index/state/pool/generation checks, addr_prev agreement,
+    //    cycle cap) and therefore the sole detection point for a damaged
+    //    live-slot list. What remains here is descriptor/block agreement,
+    //    strictly increasing non-overlapping placement, header agreement and
+    //    the prev_size chain.
+    uint32_t nslots = 0;
+    if (collect_live_sorted(*P, id, s_slots, PM_MAX_OBJECTS, nslots) !=
+        Status::Ok)
+        return Status::CorruptMetadata;
+
+    uint32_t used = 0;
     uint64_t prev_end = start_off;
-    for (uint32_t idx = P->order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
-        if (++count > max_order_steps) return Status::CorruptMetadata;
-        if (idx >= PM_MAX_OBJECTS) return Status::CorruptMetadata;
-        ObjectDesc const& d = G.objects[idx];
-        if (d.state != ObjState::Live || d.pool_id != id || d.generation == 0)
-            return Status::CorruptMetadata;
-        if (d.addr_prev != prev_idx) return Status::CorruptMetadata;
+    for (uint32_t i = 0; i < nslots; ++i) {
+        ObjectDesc const& d = G.objects[s_slots[i]];
         if (!desc_block_consistent(d)) return Status::CorruptMetadata;
 
         uint64_t aabs = (uint64_t)(uintptr_t)d.address;
@@ -2117,18 +2151,15 @@ Status validate(PoolId id) {
         uint64_t boff = aoff - BLOCK_HEADER_SIZE;
         if (!in_pool(boff, d.block_size) || !in_pool(aoff, d.size))
             return Status::CorruptMetadata;
-        if (boff < prev_end) return Status::CorruptMetadata; // order/overlap
+        if (boff < prev_end) return Status::CorruptMetadata; // ordering/overlap
 
         if (blk_is_free(G.zone + boff) || blk_size_of(G.zone + boff) != d.block_size)
             return Status::CorruptMetadata; // used block header must agree
         if (check_prev(boff) != Status::Ok) return Status::CorruptMetadata;
         prev_end = boff + d.block_size;
         used += d.block_size;
-        prev_idx = idx;
     }
-    if (prev_idx != NO_ORDER && G.objects[prev_idx].addr_next != NO_ORDER)
-        return Status::CorruptMetadata;
-    if (count != P->live_objects || used != P->used_bytes) return Status::CorruptMetadata;
+    if (nslots != P->live_objects || used != P->used_bytes) return Status::CorruptMetadata;
     if (P->free_bytes != capacity - used) return Status::CorruptMetadata;
 
     // 2) bins: delegated to audit_pool_bins -- bounded walks, bitmap/list
@@ -2156,9 +2187,8 @@ Status validate(PoolId id) {
     //    block straddling `s`, which would make that value meaningless.
     auto gap_before = [&](uint64_t s, bool& overlap) -> uint64_t {
         uint64_t prev = start_off;
-        for (uint32_t idx = P->order_head; idx != NO_ORDER;
-             idx = G.objects[idx].addr_next) {
-            ObjectDesc const& d = G.objects[idx];
+        for (uint32_t i = 0; i < nslots; ++i) {
+            ObjectDesc const& d = G.objects[s_slots[i]];
             uint64_t ls = ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
             uint64_t le = ls + d.block_size;
             if (ls < s && le > s) {
@@ -2188,8 +2218,8 @@ Status validate(PoolId id) {
         return Status::Ok;
     };
 
-    for (uint32_t idx = P->order_head; idx != NO_ORDER; idx = G.objects[idx].addr_next) {
-        ObjectDesc const& d = G.objects[idx];
+    for (uint32_t i = 0; i < nslots; ++i) {
+        ObjectDesc const& d = G.objects[s_slots[i]];
         uint64_t ls = ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
         if (audit_block(ls, ls + d.block_size) != Status::Ok)
             return Status::CorruptMetadata;

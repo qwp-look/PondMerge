@@ -2137,11 +2137,29 @@ static void test_metadata_domain_corruption() {
     P.live_objects = saved_live;
     VALIDATE(pool);
 
-    // (5) address-order link hiding the second object
-    uint32_t const saved_next = g().objects[a.index].addr_next;
-    g().objects[a.index].addr_next = NO_ORDER;
-    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
-    g().objects[a.index].addr_next = saved_next;
+    // (5) a live-slot link that hides another live object.
+    // The live-slot list is no longer kept in address order (see the
+    // order-list entry in docs/AUDIT_LEDGER.md), so the node to cut has to be
+    // FOUND rather than assumed: under the old ordered-insert semantics the
+    // first object always had a successor, whereas with O(1) append the head
+    // may already be the tail. Detection itself is unchanged -- the walk ends
+    // early and the live-object count stops matching.
+    {
+        uint32_t cut = NO_ORDER;
+        for (uint32_t idx = P.order_head; idx != NO_ORDER;
+             idx = g().objects[idx].addr_next)
+            if (g().objects[idx].addr_next != NO_ORDER) { cut = idx; break; }
+        CHECK(cut != NO_ORDER);
+        // The guard is explicit rather than left to CHECK, which records a
+        // failure but does not stop. It also keeps static analysis satisfied
+        // that `cut` is a valid index (NO_ORDER would be out of bounds).
+        if (cut != NO_ORDER) {
+            uint32_t const saved_next = g().objects[cut].addr_next;
+            g().objects[cut].addr_next = NO_ORDER;
+            CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+            g().objects[cut].addr_next = saved_next;
+        }
+    }
     VALIDATE(pool);
 
     // (6) sl_bitmap bit with no list behind it
@@ -2409,14 +2427,22 @@ static void test_merge_transaction_faults() {
         pm::RawRef const refs[3] = {ot, os, pin};
         using namespace pm::internal;
         ObjectDesc& d_os = g().objects[os.index];
-        uint32_t const saved_next = d_os.addr_next;
+        ObjectDesc& d_pin = g().objects[pin.index];
+        // Save BOTH links and restore the exact values: the repair must not
+        // assume any node is the tail, because the live-slot list is no longer
+        // kept in address order (see the order-list entry in AUDIT_LEDGER.md).
+        // Hardcoding `pin.addr_next = NO_ORDER` here used to be correct under
+        // ordered insertion and silently cut a live object out of the list
+        // afterwards.
+        uint32_t const saved_os_next = d_os.addr_next;
+        uint32_t const saved_pin_next = d_pin.addr_next;
         d_os.addr_next = pin.index;                    // os -> pin -> os -> ...
-        g().objects[pin.index].addr_next = os.index;
+        d_pin.addr_next = os.index;
         snap_all(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
         CHECK_ST(pm::merge(src, tgt), pm::Status::CorruptMetadata);
         check_all_unchanged(tgt, src, refs, 3, seg_base(g().pools[tgt].segment_first), 2 * 4096);
-        d_os.addr_next = saved_next;
-        g().objects[pin.index].addr_next = NO_ORDER;
+        d_os.addr_next = saved_os_next;
+        d_pin.addr_next = saved_pin_next;
         VALIDATE(src); VALIDATE(tgt);
     }
     // (8) order_head
@@ -3135,10 +3161,19 @@ static void test_round4_fault_matrix() {
         done();
     }
 
-    // (5) alloc's own cycle guard: a cyclic order list is refused with
-    //     CorruptMetadata in bounded time (previously alloc could hang in
-    //     the unbounded insertion walk), the slot is conserved, and the
-    //     pool recovers after repair.
+    // (5) the live-slot list is a BAG, not an ordered structure.
+    //
+    // alloc appends in O(1) and no longer traverses the list at all, so:
+    //   (a) a cyclic list can neither hang alloc nor be reported BY alloc
+    //       (it used to return CorruptMetadata here, from an insertion walk
+    //       that existed only to keep the list address-sorted), and
+    //   (b) the detection boundary moved to every maintenance entry and to
+    //       validate(), which still refuse the cycle with CorruptMetadata in
+    //       bounded time and with zero side effects.
+    //
+    // See the order-list entry in docs/AUDIT_LEDGER.md for the invariant this
+    // relocates, and bench/RESULTS.md for why it was moved: maintaining the
+    // sort inside alloc was ~100% of alloc's cost, linear in the live count.
     {
         fresh();
         pm::PoolId pool{};
@@ -3147,28 +3182,24 @@ static void test_round4_fault_matrix() {
         CHECK_ST(pm::alloc(pool, 3584, 8, 0, 1, lo), pm::Status::Ok);
         CHECK_ST(pm::alloc(pool, 3584, 8, 0, 2, hi), pm::Status::Ok);
         using namespace pm::internal;
-        ObjectDesc& dlo = g().objects[lo.index];
-        uint32_t const saved_next = dlo.addr_next;
-        dlo.addr_next = lo.index; // cycle at the list head
-        // A fresh allocation lands in the tail block (above both objects),
-        // so the insertion walk runs into the cycle and must trip its cap.
+        uint32_t const saved_next = g().objects[lo.index].addr_next;
+        g().objects[lo.index].addr_next = lo.index; // self-cycle
+
+        // (a) alloc is O(1) and succeeds: it does not look at the list.
         pm::RawRef r{};
-        CHECK_ST(pm::alloc(pool, 64, 8, 0, 3, r), pm::Status::CorruptMetadata);
-        {
-            // the refused alloc rolled its slot back: the free chain holds
-            // every slot except the two live objects lo and hi
-            uint32_t nfree = 0;
-            for (uint16_t s = g().free_slot_head;
-                 s != NO_SLOT && nfree <= PM_MAX_OBJECTS;
-                 s = g().objects[s].next_free_slot)
-                ++nfree;
-            CHECK(nfree == PM_MAX_OBJECTS - 2);
-        }
-        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata); // still sick
-        dlo.addr_next = saved_next;                                // repair
         CHECK_ST(pm::alloc(pool, 64, 8, 0, 3, r), pm::Status::Ok);
-        VALIDATE(pool);
+
+        // (b) the damage is still detected, on the maintenance boundary, and a
+        //     refused compact restores the entry state (Running) untouched.
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        CHECK_ST(pm::compact(pool), pm::Status::CorruptMetadata);
+        CHECK(get_stats_state(pool) == 1); // back to Running, not left Paused
+
+        // Repair. free(r) unlinks r (alloc made it the head), which restores
+        // order_head by itself, so the only value left to fix is lo's link.
         CHECK_ST(pm::free(r), pm::Status::Ok);
+        g().objects[lo.index].addr_next = saved_next;
+        VALIDATE(pool);
         CHECK_ST(pm::free(lo), pm::Status::Ok);
         CHECK_ST(pm::free(hi), pm::Status::Ok);
         CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);

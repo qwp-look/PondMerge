@@ -128,15 +128,31 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 
 
 | 操作 | 最坏复杂度 | 说明 |
 |---|---|---|
-| `alloc` | O(SL bin 链长 + live_objects)，上界 O(zone_size / PM_MIN_BLOCK) | TLSF 位图定位到 bin 后链内 first-fit（R2）；新描述符按地址序插入 order 链（有界防环，R29）。**不是严格 O(1)**。 |
+| `alloc` | **O(SL bin 链长)**，上界 O(zone_size / PM_MIN_BLOCK) | TLSF 位图定位到 bin 后链内 first-fit（R2），再加 O(1) 追加到 live-slot 表。**不是严格 O(1)**，但**已与 live 对象数无关** —— 见下方说明。 |
 | `free` | O(1 + 邻块空闲 bin 链长)，上界 O(zone_size / PM_MIN_BLOCK) | 合并前只读证明：自身块头、prev_size 链、后继块、邻块 bin 成员资格与互逆链接（R24）。损坏时 `CorruptMetadata` 且零副作用。 |
 | `pause` / `resume` | O(1) | 单次状态翻转。 |
-| `compact` / `split` | O(objects + moved_bytes) | 地址序只读规划（`walk_order` 有限遍历）+ 按序搬移与重建。 |
-| `merge` | O(objects + free_blocks + moved_bytes) | 两池只读审计（order 链 / 描述符 / 统计 / bins）+ 合并区间规划 + 不可失败执行；规划失败两池逐字节不变（R22）。 |
+| `compact` / `split` | O(objects + moved_bytes)，另加 O(objects log objects) 恢复地址序 | 只读规划（有界收集 + heapsort）+ 按序搬移与重建。 |
+| `merge` | O(objects + free_blocks + moved_bytes) | 两池只读审计（live-slot 表 / 描述符 / 统计 / bins）+ 合并区间规划 + 不可失败执行；规划失败两池逐字节不变（R22）。 |
 | `validate` | O(live_objects × free_blocks) | live 块与 binned 空闲块两两重叠检查与 gap 归账；所有遍历有步数上限。 |
-| `get_stats` | O(free_blocks) | 步数上限；损坏链表有限返回，`valid = 0` 与“真的没有空闲块”可区分（R18/R29）。 |
+| `get_stats` | O(free_blocks) | 步数上限；损坏链表有限返回，`valid = 0` 与"真的没有空闲块"可区分（R18/R29）。 |
 | `borrow_begin` / `resolve` / `borrow_end` | O(1) | 描述符校验（含池范围证明，R23）+ 一次描述符读取。`borrow_end` 的 token 校验与递减在同一临界区（R25）；失败输出指针必为空（R26）。 |
-| `analyze_compaction` | O(objects + free_blocks) | 打包模拟精确估算搬迁对象数/字节数（R35）+ 计数器审计（损坏即 `INVALID_METADATA`）。 |
+| `analyze_compaction` | O(objects log objects + free_blocks) | 打包模拟精确估算搬迁对象数/字节数（R35）+ 计数器审计（损坏即 `INVALID_METADATA`）。 |
+
+#### `alloc` 为什么与 live 对象数无关了
+
+早先 `alloc` 把新描述符**按地址序插入** live 链，这一步被实测为 **≈100% 的 alloc
+总成本，且随 live 数线性增长**（232 ns @256 → 799 ns @1024，见 `bench/RESULTS.md`）。
+地址序只在维护路径上被需要，于是改为：**alloc 做 O(1) 追加**，地址序由每次维护调用
+在冷路径上一次性重建（heapsort）。改后 alloc 在两种规模下都是 **~38 ns 稳态**，
+与 live 数无关。
+
+代价与取舍（完整记录在 `docs/AUDIT_LEDGER.md`）：
+
+- **不变量搬迁**：live 链不再是"始终有序的地址序表"，而是一个**无序的活对象袋**；
+  地址序在维护入口由 `collect_live_sorted()` 重建。
+- **检测边界随之移动**：alloc 不再检测 live 链损坏（它不再遍历该链）。环链等损坏改由
+  每个维护入口与 `validate()` 在有界时间内拒绝，且**零副作用**（R29 已按新语义重写）。
+- 对调用方 API 无变化，错误码集合不变。
 
 ### 并发契约：单所有者 + 静默维护期
 

@@ -3,6 +3,43 @@
 All notable changes to PondMerge are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`alloc` is no longer linear in the live-object count.** It used to insert
+  each new descriptor into an address-ordered list, and that insertion measured
+  as essentially 100% of alloc's cost, growing linearly with the live count
+  (232 ns at 256 objects, 799 ns at 1024). Address order is needed only by the
+  maintenance paths, so it is now re-established once per maintenance call on
+  the cold path: alloc does an O(1) append, and `collect_live_sorted()` performs
+  a bounded collection plus an in-place heapsort. Measured after the change:
+  alloc is ~86-88 ns during fill and **37.6 ns steady state at 1024 objects**,
+  with **no dependence on the live count** (see `bench/RESULTS.md`). `free` and
+  `validate` show no regression, and the fragmentation benchmark's A/B results
+  are byte-identical, so only the cost moved, not the behaviour.
+
+  The honest complexity statement changes accordingly: `alloc` is now
+  O(bin chain length) rather than O(bin chain length + live objects);
+  `compact` / `split` / `merge` / `analyze_compaction` gain an
+  O(objects log objects) sort term, which is negligible next to their memmove.
+
+  **One detection boundary moves with it.** Because alloc no longer traverses
+  the live-slot list, it no longer reports `CorruptMetadata` for a damaged one
+  (cyclic or truncated). That detection now belongs to every maintenance entry
+  and to `validate()`, still in bounded time and still with zero side effects.
+  The API and the set of status codes are unchanged. This is recorded as an
+  accepted boundary in `docs/AUDIT_LEDGER.md` section 6.8.
+
+### Added
+
+- `bench/` with three reproducible benchmarks and their measured results
+  (`bench/RESULTS.md`), so that statements about performance are measurements
+  rather than guesses: alloc latency against live count, `validate` / `get_stats`
+  scaling, and a fragmentation A/B (compaction on vs off, same allocator).
+- `tests/consumer_smoke.sh`, an end-to-end proof of the install + `find_package`
+  consumption path.
+
 ## [1.0.0] - 2026-09-12
 
 First released version. The library is feature-complete for its stated scope and
