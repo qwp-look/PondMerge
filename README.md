@@ -476,6 +476,7 @@ advice 即断言诊断）；`PM_DEBUG=0` 时断言编译为空，但 generation�
 
 | 文档 | 内容 |
 |---|---|
+| [CONTRIBUTING.md](CONTRIBUTING.md) | **给贡献者与 AI 助手**：铁律、怎么跑门禁、怎么加设备目标、文档地图 |
 | [README.en.md](README.en.md) | 英文概览（一页；深挖指向本文件与 docs/） |
 | [QUICKSTART.md](QUICKSTART.md) | 快速入门：最小示例 → compact 全流程 → 常见错误 |
 | [docs/USAGE_GUIDE.md](docs/USAGE_GUIDE.md) | 完整使用指南：三区模型、API 契约表、并发、错误码、复杂度 |
