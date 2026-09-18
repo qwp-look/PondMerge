@@ -115,14 +115,14 @@ jobs:
       # longer compiles or no longer runs is a claim that quietly stops being
       # true. This job is a correctness gate, not a performance gate: runners
       # are shared and noisy, so no threshold is asserted on any timing. What it
-      # does check is that all three benchmarks compile clean under -Werror, run
+      # does check is that all four benchmarks compile clean under -Werror, run
       # to completion, and pass their own internal consistency check.
       - name: Build (host, Release, -Werror)
         run: |
           set -e
           F="-std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra -Wno-unused-parameter -Werror -Iinclude -Isrc"
           mkdir -p build/bench
-          for b in alloc_latency validate_scaling fragmentation; do
+          for b in alloc_latency validate_scaling fragmentation compaction_window; do
             g++ $F bench/$b.cpp src/core.cpp -o build/bench/$b
           done
       - name: Run, and require each benchmark to report a consistent structure
@@ -131,6 +131,7 @@ jobs:
           ./build/bench/alloc_latency  | tee build/bench/alloc.log
           ./build/bench/validate_scaling | tee build/bench/validate.log
           ./build/bench/fragmentation | tee build/bench/frag.log
+          ./build/bench/compaction_window | tee build/bench/cw.log
           # The fragmentation benchmark's own audit must pass in both variants,
           # and neither run may be confounded.
           ok_count=$(grep -cE "structure audit +: OK" build/bench/frag.log)
@@ -142,6 +143,12 @@ jobs:
           grep -qE "^validate: OK$" build/bench/alloc.log
           # validate_scaling must actually have measured something.
           grep -q "fitted exponent" build/bench/validate.log
+          # The compaction-window benchmark must record its full run of
+          # events with a clean audit, and the advice's move estimate must
+          # have matched the actual compaction on every compared event.
+          grep -qE "compaction windows recorded: 512 events" build/bench/cw.log
+          grep -qE "structure audit +: OK" build/bench/cw.log
+          grep -qE "advice estimate vs actual +: max dev 0 objects / 0 bytes" build/bench/cw.log
       - name: Upload raw benchmark logs
         if: always()
         uses: actions/upload-artifact@v4

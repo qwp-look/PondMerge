@@ -35,8 +35,9 @@
 //
 //   phase 1  fill the region to exhaustion with a steep size mix, allocating
 //            every PINNED_EVERY-th object as pinned (the fence posts)
-//   phase 2  release every SCATTER_MOD-th *movable* object, leaving holes
-//            fenced in by live and pinned neighbours
+//   phase 2  release every SCATTER_MOD-th slot -- which includes the pinned
+//            posts, since 16 is a multiple of 4 -- leaving dispersed holes
+//            fenced in by live neighbours
 //   phase 3  churn + probe: free a movable object and re-allocate the SAME
 //            size, and every PROBE_EVERY steps demand one large contiguous
 //            block
@@ -198,13 +199,19 @@ Report run_pondmerge(const char* name, bool compact_on_failure) {
     printf("  %-32s filled=%u (pinned=%u)\n", name, (unsigned)live,
            (unsigned)r.pinned);
 
-    // ---- phase 2: scatter holes, fenced in by live + pinned neighbours ----
+    // ---- phase 2: scatter holes between live neighbours -------------------
     {
         uint32_t w = 0;
         for (uint32_t i = 0; i < live; ++i) {
-            // The movable objects are appended after the pinned ones in fill
-            // order, but a simple "every Nth slot" is enough: PID ordering does
-            // not matter here, only that released blocks are separated.
+            // NOTE (measured, kept as-is): this releases every (i+1) % 4-th
+            // SLOT, and the pinned posts sit at every 16th slot -- a subset.
+            // So the scatter frees the pinned objects too, and the measured
+            // phases below run on a pool with NO pins (a probe run of this
+            // exact sequence reports has_pinned=0 after the scatter). The
+            // pins shape the fill; the sustained fragmentation comes from the
+            // dispersed-hole pattern that the same-size churn cannot heal.
+            // compaction_window.cpp states this in its header and measures
+            // the pinned-barrier regime separately.
             if (((i + 1) % SCATTER_MOD) == 0) {
                 (void)pm::free(refs[i]);
                 continue;

@@ -1,6 +1,6 @@
 # bench/ — 性能与碎片基准
 
-四个可复现基准，用来把"性能/复杂度能不能优化"从猜想题变成工程题，外加一个
+五个可复现基准，用来把"性能/复杂度能不能优化"从猜想题变成工程题，外加一个
 **设备专属**的独立分配器基线（见 §4 末）。**所有数字都必须在目标平台上实测后
 才能对外引用**；Host 数据只能说明形状（线性/二次/常数），不能外推绝对值。
 完整实测结果见 `RESULTS.md`（§5 是设备端）。
@@ -196,8 +196,8 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
 | B | PondMerge，**仅当 probe 分配失败时**触发 `compact` |
 
 **负载**：三段 —— ①用陡尺寸谱填充区段，每 PINNED_EVERY 个对象中一个设为
-**pinned**（搬迁屏障）；②释放每 SCATTER_MOD 个**可搬迁**对象，留下被存活/ pinned
-邻居围住的孤立空洞；③churn + probe。
+**pinned**（搬迁屏障）；②释放每 SCATTER_MOD 个槽位（**pinned 槽位也会被释放**
+——16 是 4 的倍数，见下方"对 pinned 叙述的更正"）；③churn + probe。
 
 **头条指标**：`probe FAILURES`（A 与 B 的对比）。**这两个计数不涉及时钟，
 是刻意为之**——本基准要确立的结论不能依赖仪器。
@@ -224,12 +224,30 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
 能持续维持碎片的是 **pinned** 对象——这正是 pinnded 在现实中的含义（DMA 缓冲
 不能移动）。两次失败都保留在本文件的注释里。
 
+### 对 pinned 叙述的更正（2026-09-18，实测证伪，原文保留于上）
+
+上面那段"能持续维持碎片的是 pinned 对象"的归因**读代码即可证伪，且已用探针
+实测**：scatter 按 `(i+1) % 4 == 0` 释放槽位，而 pinned 在 `(i+1) % 16 == 0`
+——是其子集 ⇒ **scatter 把全部 pinned 屏障一起释放了**，其后的所有测量都在
+一个 `has_pinned=0` 的池上进行（同序列探针实测；整合后搬迁 189 对象 /
+184,296 B，与 host 记录逐字节一致，证明记录里的那次整理确实无 pin）。所以：
+
+- pin 只在**填充阶段**起作用（塑造了初始地址布局）；
+- 负载能维持碎片的真正原因是**分散洞 + 同尺寸 churn 无法愈合**这个结构，
+  不是 pin；
+- 负载本身**不改**（改了就废掉全部已测记录与两颗芯片的可比性），只改注释
+  与这段叙述。`fragmentation.cpp` 的 phase-2 注释已同步更正。
+
+pinned 屏障密集时的真实行为（整理被屏障切段、整合后空间只剩 ~1 KiB 级碎片
+口袋）由 `compaction_window.cpp`（§5）的开发版实测：512 次事件中 probe 重试
+**全部失败**。那是一个真实的产品性质，属于 §5 的记录范围。
+
 ### 计时的处理
 
 `compact` 每次约 53 µs，而单区间偏置 ~7.5 µs（场景值 ~12 µs），所以打印的是
 **原始值 + 偏置 + 修正值**三者，并**不报告逐次最大值**——该主机上一次时钟读取
 实测可达 2.7 ms，此处报"最坏 compact"只会是时钟的产物而非分配器的。
-**百分位属于设备端**（mcycle 免费）。
+**百分位属于设备端**（mcycle 免费）——已经取到，见 §5 与 `RESULTS.md` §5.8。
 
 ```sh
 g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
@@ -237,6 +255,58 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
 ./build/bench_frag
 # 调参（默认值不保证一定能压出失败；A 若零失败说明负载太松）：
 #   -DPM_BENCH_POPULATION / -DPM_BENCH_PROBE_BYTES / -DPM_BENCH_STEPS / -DPM_BENCH_PROBE_EVERY
+```
+
+## 5. `compaction_window.cpp` — 一次 `compact()` 到底多少钱（分布，不是单点）
+
+**问题**：`fragmentation.cpp` 整轮只触发 **1 次**整理（第一次整理把散洞合并后，
+同尺寸 churn 无法再碎片化），只能给一个单点数。它回答不了"碎片形态不同时窗口
+多大"，也给不出百分位。而**百分位本来就只该在设备上取**（mcycle 读一次 59 ns，
+对几 ms 的窗口是五个数量级的余量）——`bench_timer.h` 从第一版就这么写。
+
+**方法**：先复现 `fragmentation.cpp` 的状态（同常数 fill → scatter，pinned 随
+scatter 一起被释放，见 §4 的更正），做**一次不计时**的整合（即被记录的那次
+整理事件）并回填到满池；然后循环：
+
+```text
+free K 个随机可搬迁对象（K=14..20） → probe 10/12 KiB（失败，产品的触发路径）
+→ 只读建议 → 计时一次 compact()（这就是"整理窗口"）→ 重试 probe → 按释放
+顺序回填同样的尺寸（池回到满，只有洞的分布不同）
+```
+
+回填是能反复出事件的关键：不回填，第一次整理后池里有一整块大尾部空闲，
+其后 probe 永远直接成功（整轮又会只剩 1 次事件）。K_MIN=14 的取法让整理后的
+尾部（K 个被释放块 ≈ K×~1 KiB）通常仍装得下 probe 重试（host 12 KiB、
+设备 10 KiB）；装不下的事件照样记录（rescued/still_failed 分开报），那也是
+真实的产品结局。
+
+**测量过并刻意排除的另一个 regime**：开发版让 pin 在循环中存活（只释放
+可搬迁对象）。pin 每 16 个对象一道屏障时，`compact` 按屏障分段打包，每道
+屏障下方都搁浅一段空闲，整合结果是一堆 ~1 KiB 级口袋而不是一整块尾部
+⇒ 512 次事件 probe 重试**全部失败**（rescued=0）。这与 COMPACTION_POLICY §7
+"屏障过密时整理可能失败"的定性预告一致，是真实性质，但不是被记录的
+fragmentation 数字所在的 regime——所以正式版把 pin 留在 fill 里、测量前移除。
+
+**自校验**（每次运行打印，缺一不可引用）：
+- `advice estimate vs actual`：建议层的搬迁估算与 `compact` 实际搬迁之差
+  （策略文档声称"成功情形下精确"，本基准是这条声明迄今最强的检验场合）；
+- `library self-timing vs mcycle`：库自带的 esp_timer 微秒与 mcycle 纳秒
+  两台独立时钟之差；
+- `structure audit`：`validate()` 必须通过。
+
+**引用规则**：百分位**仅设备端可引用**（host 每事件区间带仪器偏置，只说
+形状）；必须给出两次运行的数字——**状态层**（moved bytes 聚合、rescued/
+refusal 计数、估算校验）跨运行逐字节一致，**计时层**有 tick 相位级波动
+（S3 实测 p50/p99 差 ≤0.003%、max 差 ≤0.05%），单次运行的逐字节复现不再
+成立（上一轮"三次运行逐字节相同"只属于当时的构建；重建固件即把该基准的
+单点整理从 7,583 移到 7,587/7,590 µs——代码布局敏感）。
+
+```sh
+g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
+    bench/compaction_window.cpp src/core.cpp -o build/bench_cw
+./build/bench_cw
+# 调参：-DPM_BENCH_CW_EVENTS（记录的事件数；经典 ESP32 因 .bss 余量取 128）
+#       -DPM_BENCH_CW_K_MIN / -DPM_BENCH_CW_K_SPAN
 ```
 
 ### `esp32/` — 设备端工程、独立基线，以及三个必须知道的坑
@@ -340,6 +410,8 @@ GlobalState)` 与元数据三项分解。这就是发现 `README.md` 那条闭�
 - 若是 `fragmentation.cpp`：**两个变体的** `churn_refusals` 是否为 0
 - 若是独立基线：它是 TLSF 且**本次拒绝过同尺寸重分配**（标记 `CONFOUNDED`），
   以及填充对象数与 PondMerge 不同（per-allocation 开销不同 ⇒ 不可按字节对比）
+- 若是 `compaction_window.cpp`：**两次运行**的百分位（状态层逐字节一致、计时层
+  有 ≤0.05% 级波动，见 §5）；估算校验与双时钟校验的偏差值；且 host 数字不可引用
 - 若是设备端：`PM_DEBUG`（基准固件为 0，验收固件为 1）、看门狗已关闭、
   使用的是共享 region 中的哪一块
 - 若是逐次计时：**已减去的偏置值**及其不确定性

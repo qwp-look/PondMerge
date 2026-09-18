@@ -38,6 +38,7 @@ int pm_bench_alloc_latency();
 int pm_bench_churn_overhead();
 int pm_bench_fragmentation();
 int pm_bench_validate_scaling();
+int pm_bench_compaction_window();
 // Device-only: where the cycles go, read off the Xtensa performance counters.
 int pm_bench_perfcount();
 // Device-only: the ESP-IDF heap baseline. It has no host counterpart, and it
@@ -119,17 +120,21 @@ extern "C" void app_main(void) {
         int (*fn)();
     };
     Step const steps[] = {
-        {"1/6 alloc latency", pm_bench_alloc_latency},
-        {"2/6 churn harness decomposition", pm_bench_churn_overhead},
+        {"1/7 alloc latency", pm_bench_alloc_latency},
+        {"2/7 churn harness decomposition", pm_bench_churn_overhead},
         // Right after the decomposition, because it explains that file's rows:
         // the same three workloads, with the Xtensa counters saying where the
         // cycles went instead of one guess about it.
-        {"3/6 where the cycles go (perf counters)", pm_bench_perfcount},
-        {"4/6 fragmentation A/B", pm_bench_fragmentation},
-        {"5/6 validate / get_stats scaling", pm_bench_validate_scaling},
+        {"3/7 where the cycles go (perf counters)", pm_bench_perfcount},
+        {"4/7 fragmentation A/B", pm_bench_fragmentation},
+        // Right after the A/B, whose single compaction event this benchmark
+        // turns into a distribution over hundreds of events (see its header:
+        // same fill/scatter regime, then re-fragmented cycles).
+        {"5/7 compaction window distribution", pm_bench_compaction_window},
+        {"6/7 validate / get_stats scaling", pm_bench_validate_scaling},
         // Last, because it takes g_zone over as a heap region once PondMerge is
         // done with it. See idf_heap_baseline.cpp.
-        {"6/6 baseline: ESP-IDF own heap (TLSF)", pm_bench_idf_heap_baseline},
+        {"7/7 baseline: ESP-IDF own heap (TLSF)", pm_bench_idf_heap_baseline},
     };
     for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]); ++i) {
         std::printf("\n########## %s ##########\n", steps[i].title);

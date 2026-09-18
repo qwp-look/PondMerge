@@ -30,9 +30,11 @@
 if(CONFIG_IDF_TARGET STREQUAL "esp32")
     set(PM_BENCH_SHARED_ZONE_BYTES 114688)  # 112 KiB: one region for all four
     set(PM_BENCH_POPULATION 128)
+    set(PM_BENCH_CW_EVENTS 128)
 else()
     set(PM_BENCH_SHARED_ZONE_BYTES 196608)  # 192 KiB
     set(PM_BENCH_POPULATION 192)
+    set(PM_BENCH_CW_EVENTS 512)
 endif()
 set(PM_BENCH_SEGMENT 4096)
 # Derived, not hand-maintained: the pool claims the whole region, and a segment
@@ -46,6 +48,7 @@ idf_component_register(
          "../../../src/core.cpp"
          "../../alloc_latency.cpp"
          "../../churn_overhead.cpp"
+         "../../compaction_window.cpp"
          "../../fragmentation.cpp"
          "../../validate_scaling.cpp"
     INCLUDE_DIRS "../../../include"
@@ -102,4 +105,9 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PM_BENCH_PROBE_EVERY=200
     PM_BENCH_PINNED_EVERY=16
     PM_BENCH_SCATTER_MOD=4
-    PM_BENCH_PHASE1_TRIALS=50)
+    PM_BENCH_PHASE1_TRIALS=50
+    # compaction window: 512 recorded events on the S3 (16 B of sample state
+    # each, ~12 KiB including the report arrays -- the S3 has the headroom).
+    # The classic part's .bss margin is ~12 KiB in TOTAL, so it records 128
+    # events (~3 KiB) -- enough for a coarse distribution, not for a p99.
+    PM_BENCH_CW_EVENTS=${PM_BENCH_CW_EVENTS})
