@@ -1,5 +1,7 @@
 # PondMerge v1
 
+**English overview: [README.en.md](README.en.md)**
+
 面向无 MMU 的 32 位 MCU（C++17 子集：无异常 / 无 RTTI / 无动态分配 / 不依赖
 OS 线程）的**用户态托管内存系统**。在一段固定 Auto Zone 上实现：TLSF 风格
 分离适配分配器、稳定逻辑引用（`pm_ptr`）、RAII 物理指针借用、调用方显式触发
@@ -7,16 +9,21 @@ OS 线程）的**用户态托管内存系统**。在一段固定 Auto Zone 上�
 
 实现依据《PondMerge v1 代码指导书》与《PondMerge v1 架构说明》。
 
+> **英文 `README.en.md` 刻意只做概览层，深挖一律指向本文件与 `docs/`** ——
+> 避免两份文档长期漂移。
+
 ## 快速入口
 
 | 我想要… | 去哪里 |
 |---|---|
+| 英文概览（一页读完） | [README.en.md](README.en.md) |
 | 5 分钟跑起第一个示例 | [QUICKSTART.md](QUICKSTART.md) |
 | 完整 API / 生命周期 / 并发契约 | [docs/USAGE_GUIDE.md](docs/USAGE_GUIDE.md) |
 | 何时整理、如何解读建议 | [docs/COMPACTION_POLICY.md](docs/COMPACTION_POLICY.md) |
 | 跑可视化 Demo（浏览器 + 设备） | [examples/](examples/) 与 [docs/DEMO_REQUIREMENTS.md](docs/DEMO_REQUIREMENTS.md) |
 | 审计与不变量证据 | [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) |
-| 历史轮次报告 | [docs/HANDOVER_v11.md](docs/HANDOVER_v11.md)（含 v2–v10 索引） |
+| **实测性能数字与仪器限制** | [bench/RESULTS.md](bench/RESULTS.md) |
+| 历史轮次报告 | [docs/HANDOVER_v12.md](docs/HANDOVER_v12.md)（含 v2–v11 索引） |
 
 ## 目录结构
 
@@ -45,6 +52,12 @@ examples/           Demo 与协议回归
     protocol_smoke.py   Demo 协议回归（95 项检查，无浏览器依赖）
     http_smoke.py       HTTP 层回归（15 项检查）
     owner_probe.cpp     Advice owner 门控违约诊断示例
+bench/              可复现基准 + 实测结果（见 README.md 与 RESULTS.md）
+    bench_timer.h       计时仪器：按批计时 + 自报 + 拒绝不可支持的逐次计时
+    alloc_latency.cpp   alloc/free 与 live 数的标度（含对历史 core 的 A/B）
+    validate_scaling.cpp  validate / get_stats 标度
+    fragmentation.cpp   碎片治理 A/B（同一分配器，compact 开/关）
+    esp32/              同一份基准源码的设备端 IDF 工程（独立于验收固件）
 esp32/              ESP32-S3 (n16r8) IDF 验收工程（v6.0.2，组件强制 gnu++17）
 docs/               架构说明、代码指导书、各轮任务书与交接文档（见文末索引）
 ```
@@ -141,10 +154,16 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 
 #### `alloc` 为什么与 live 对象数无关了
 
 早先 `alloc` 把新描述符**按地址序插入** live 链，这一步被实测为 **≈100% 的 alloc
-总成本，且随 live 数线性增长**（232 ns @256 → 799 ns @1024，见 `bench/RESULTS.md`）。
-地址序只在维护路径上被需要，于是改为：**alloc 做 O(1) 追加**，地址序由每次维护调用
-在冷路径上一次性重建（heapsort）。改后 alloc 在两种规模下都是 **~38 ns 稳态**，
-与 live 数无关。
+总成本，且随 live 数线性增长**——同一份基准源码编译到改动前/后两个 core 修订的
+A/B：live=16 时 58.0 → 38.0 ns，live=1024 时 **844.2 → 38.4 ns（22×）**
+（见 `bench/RESULTS.md` §1）。地址序只在维护路径上被需要，于是改为：**alloc 做
+O(1) 追加**，地址序由每次维护调用在冷路径上一次性重建（heapsort）。改后
+alloc 在 live 16→1024 全程 **x1.01（完全平坦）**，`PM_MAX_OBJECTS=256` 下
+36.7 ns 且同样平坦。
+
+> **数字口径提示**：以上数字产自 `bench/bench_timer.h`。早先版本的数字来自
+> 一个未量化的计时仪器（探针主机 `RDTSC` 被拦截，单次时钟读取 ~9,400 ns，
+> 而被测操作只有 ~40 ns）。形状结论不变，绝对值已被重测取代。
 
 代价与取舍（完整记录在 `docs/AUDIT_LEDGER.md`）：
 
@@ -298,18 +317,28 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 | 双核并发（设备） | 借用/暂停/整理的 SMP 锁边界（`tests/concurrency_esp32.cpp`） |
 | 协议/HTTP 冒烟 | `examples/protocol_smoke.py`（95 项）、`examples/http_smoke.py`（15 项） |
 
-### 当前验收状态（提交 `e6bd516`）
+### 当前验收状态（提交 `4b412de`）
 
 | 档位 | 结果 |
 |---|---|
-| Host Debug（10000 op） | 5,409,618 checks, 0 failures |
-| Host Release（10000 op） | 5,409,625 checks, 0 failures |
-| ASan/UBSan（10000 op） | 5,409,618 checks, 0 failures |
+| Host Debug（10000 op） | 5,409,619 checks, 0 failures |
+| Host Release（10000 op） | 5,409,626 checks, 0 failures |
+| ASan/UBSan（10000 op） | 1,508,630 checks, 0 failures |
 | 参考模型对拍 | 466,859 checks, 0 failures |
 | cppcheck（warning/style/performance） | exit 0，三类计数 0/0/0 |
 | 配置矩阵 | PASSED |
 | 协议回归 / HTTP 回归 | 95 / 15 checks, 0 failures |
-| ESP32-S3 实机（2000 op，App version `baf20e8`） | 套件 1,120,456 + 双核并发 28 + 模型 466,859 checks, 全部 0 failures |
+| `src/core.cpp` 覆盖率 | 96.47% 行 / 98.75% 分支执行（下限强制） |
+| libFuzzer（有界运行） | 无崩溃、无 sanitizer 发现 |
+| ESP32-S3 实机（当前提交） | **未执行——板子离线，见下** |
+| ESP32-S3 实机（历史记录，App version `baf20e8`） | 套件 1,120,456 + 双核并发 28 + 模型 466,859 checks，全部 0 failures |
+
+> **当前提交的设备端验收未执行，且不作声称。** 固件可构建，
+> `bench/esp32/`（把基准源码编到设备）已实测配置 / 编译 / 链接通过
+> （elf 3.7 MB，DIRAM 204,361 / 341,760 B = 59.8%），但最后一次尝试时
+> **板子不在线**（内核日志 `usb 1-2.1: USB disconnect`，`lsusb` 无 Espressif
+> 设备），因此未烧录、未抓串口。上表的实机记录属于更早的提交。
+> 详见 `docs/AUDIT_LEDGER.md` §6.10 与 `docs/HANDOVER_v12.md`。
 
 ## 可视化 Demo
 
@@ -374,12 +403,15 @@ advice 即断言诊断）；`PM_DEBUG=0` 时断言编译为空，但 generation�
 
 | 文档 | 内容 |
 |---|---|
+| [README.en.md](README.en.md) | 英文概览（一页；深挖指向本文件与 docs/） |
 | [QUICKSTART.md](QUICKSTART.md) | 快速入门：最小示例 → compact 全流程 → 常见错误 |
 | [docs/USAGE_GUIDE.md](docs/USAGE_GUIDE.md) | 完整使用指南：三区模型、API 契约表、并发、错误码、复杂度 |
 | [docs/COMPACTION_POLICY.md](docs/COMPACTION_POLICY.md) | 整理建议语义、判定矩阵、阈值、标准整理流程 |
 | [docs/DEMO_REQUIREMENTS.md](docs/DEMO_REQUIREMENTS.md) | Demo 组成、快照协议 v1(.1)、JSON 子集、应答分类、验收 |
 | [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) | 审计账本：不变量 → 代码位置 → 证明 → 测试 |
+| [bench/README.md](bench/README.md) | 基准方法、公平性规则、**计时仪器规则**与引用数字的必备条件 |
+| [bench/RESULTS.md](bench/RESULTS.md) | 全部实测数字、仪器限制、负结果、方案 A 的 A/B |
 | docs/架构说明.md | 目标架构契约 |
 | docs/PondMerge_v1_代码指导书.md | 接口与内存布局的原始设计 |
 | docs/PondMerge_v1_repair_task.md / v2 | 第一/二轮修复任务书 |
-| docs/HANDOVER_v2–v11.md | 各轮收口报告（v11 为最新） |
+| docs/HANDOVER_v2–v12.md | 各轮收口报告（v12 为最新，含测量仪器轮） |
