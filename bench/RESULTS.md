@@ -399,13 +399,14 @@ Both PondMerge variants report structure audit OK and zero churn refusals. Cost
 of the compaction on the device:
 
 ```
-compact time : 7.587 ms raw, 7.587 ms corrected (1 x 50 ns bias)
-               => 7,586.8 us per compaction, moving 141 objects / 138,856 B
+compact time : 7.583 ms raw, 7.583 ms corrected (1 x 50 ns bias)
+               => 7,583 us per compaction, moving 141 objects / 138,856 B
 ```
 
-~18 MB/s of relocation on a 240 MHz MCU, and that is the maintenance window a
-caller has to budget for. It is ~143x the host's 53 µs, consistent with the
-per-cycle effect in section 5.3.
+(~18 MB/s of relocation on a 240 MHz MCU, and that is the maintenance window a
+caller has to budget for. Two independent runs gave 7.583 ms and 7.587 ms — a
+0.05% spread, so this figure is reproducible in a way the host's is not.) It is
+~143x the host's 53 µs, consistent with the per-cycle effect in section 5.3.
 
 Three honesty notes on this table:
 

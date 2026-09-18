@@ -23,7 +23,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   large demands in the fragmented state; with compaction triggered on failure,
   PondMerge fails 1 of 50. The library's core claim is now measured against a
   mature third-party implementation of the same segregated-fit family rather than
-  only against itself. Cost on the target: one compaction, **7.587 ms**, moving
+  only against itself. Cost on the target: one compaction, **7.583 ms**, moving
   141 objects / 138,856 B (about 18 MB/s on a 240 MHz MCU).
 
 - **`bench/churn_overhead.cpp`**, which decomposes the measured churn pair into
