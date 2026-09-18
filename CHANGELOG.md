@@ -7,6 +7,41 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **The compaction window now has a distribution, not just a single point.**
+  Every record of what one `compact()` call costs was one event, because
+  `fragmentation.cpp` contains exactly one compaction (the first heals the
+  holes and the same-size churn cannot re-fragment). The new
+  `bench/compaction_window.cpp` rebuilds the fragmented state before every
+  event and records 512 timed `compact()` calls per run on the ESP32-S3
+  (`bench/RESULTS.md` section 5.8). Headline: **p50 = 8,977.7 us, p99 =
+  9,563.0 us, min = 6,541.4 us, max = 9,743.4 us** over 512 events at 240 MHz
+  with a 192 KiB region -- the pool is paused for ~9 ms per compaction in this
+  regime, and the spread is tight (p99 within 7% of p50) because the workload
+  always moves most of the pool. The window rises with the moved bytes
+  (quintile means 8,128 -> 9,366 us), and the means imply **18.5 MB/s** against
+  the single event's recorded 18.3 MB/s.
+
+- **The advice's move estimate matched the actual compaction on 512 of 512
+  hardware events** (max deviation 0 objects / 0 bytes, 0 UNKNOWN). The R35
+  exactness claim had fault-injection tests; this is its first check on real
+  silicon across hundreds of different fragmentation patterns, and CI now
+  asserts the host copy of the line.
+
+- **A documented attribution was measured and retired**: bench documentation
+  attributed the fragmentation workload's sustained fragmentation to its pinned
+  fence posts, but the scatter step releases every 4th slot and the posts sit
+  every 16th -- a subset -- so the measured phases have run on a pin-free pool
+  all along (probe-verified: `has_pinned=0` after scatter, and the
+  consolidation then moves exactly the recorded 189 objects / 184,296 B). The
+  workload is unchanged; the comments and bench/README.md section 4 are
+  corrected with the original text kept. The pins' real effect was measured in
+  a development build of the new benchmark: with a barrier every 16 objects,
+  compact() strands free space below each barrier into ~1 KiB pockets and the
+  10 KiB probe retry failed after EVERY one of 512 compactions -- dense
+  barriers can make "compact to satisfy a demand" structurally fail even with
+  enough total free (COMPACTION_POLICY.md section 7 predicted this
+  qualitatively).
+
 - **A hypothesis in this file's own history was measured and killed: the ~20x
   device/host per-cycle gap is NOT cache misses.** `bench/RESULTS.md` section 5.3
   offered "memory and code access rather than CPU throughput" as the explanation

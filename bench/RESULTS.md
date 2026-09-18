@@ -541,6 +541,92 @@ bubbles) instead of reading everything at once. Each pass is internally exact, b
 the three are three executions. On this device that costs nothing, because the
 runs are byte-identical to one another (section 6.6).
 
+### 5.8 The compaction window as a distribution (512 events, percentiles)
+
+Every compaction-cost figure above this section is ONE event: section 4's 53 us
+on the host, section 5's 7.583/7.587 ms here. `bench/compaction_window.cpp` makes
+the event repeatable: it reproduces this section's fill/scatter state (see the
+pinned correction in bench/README.md section 4 -- the scatter releases the
+pinned posts too, which a probe of the exact sequence confirms), takes the
+recorded consolidation as an untimed settle plus a refill to full, and then
+cycles: free K=14..20 random movable objects, demand 10 KiB (fails), read-only
+advice, ONE timed `compact()`, retry, refill the exact freed sizes in order.
+512 events per run.
+
+Setup: this chip at 240 MHz, 192 KiB region, `PM_MAX_OBJECTS=256`, `PM_DEBUG=0`,
+watchdogs off. App version `v1.0.0-13-g315fce7`, two independent captures.
+
+Probe outcomes per run: pre-compact ok 0, rescued by compact **512**, still
+failed 0; refill refusals 0; structure audit OK. The window (one `compact()`
+call, i.e. the whole pause a caller budgets for), nearest-rank percentiles in
+microseconds:
+
+| run | min | p50 | p75 | p90 | p95 | p99 | max | mean |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 6,541.4 | 8,977.65 | 9,178.98 | 9,350.57 | 9,431.49 | 9,558.16 | 9,743.42 | 8,864.05 |
+| 2 | 6,546.26 | 8,977.78 | 9,179.13 | 9,346.95 | 9,430.75 | 9,562.96 | 9,743.58 | 8,864.15 |
+
+Moved bytes per event: min 118,216 / mean 164,182 / max 181,392, **identical in
+both runs** -- the workload is state-deterministic (fixed seed), and every
+state-level aggregate reproduces byte-for-byte. The timing layer does not:
+p50, p75, p95 and the mean differ between the two runs by <= 0.008%, p90 and
+p99 by 0.04-0.05%, the min (a single event) by 0.07%, with a plausible cause
+(the periodic tick's phase relative to each trial). The earlier
+"three runs byte-identical" claim (section 6.6) is therefore build-scoped, not a
+law: a rebuild moved the single-event figure of section 5.6 from 7,583 us
+(the recorded build) to 7,589.9 us (this round's build, byte-identical in both
+of its runs; an intermediate build gave 7,587.3) -- ~0.1% of build-to-build
+code-layout sensitivity, on top of the tick-phase spread already recorded
+there.
+
+The window rises with the work, as it should -- mean window per moved-bytes
+quintile of the window itself (run 1; run 2 agrees to the fourth digit):
+
+| quintile | mean window (us) | moved bytes |
+|---|---|---|
+| Q1 (shortest) | 8,128.4 | 118,216..157,200 |
+| Q2 | 8,702.5 | 157,152..164,392 |
+| Q3 | 8,976.2 | 164,160..168,512 |
+| Q4 | 9,141.4 | 168,264..171,128 |
+| Q5 (longest) | 9,365.6 | 171,128..181,392 |
+
+At the means this is 8.864 ms / 164,182 B = **54.0 ns/B = 18.5 MB/s**, against
+the single event's 18.3 MB/s in section 5.6 -- the distribution and the
+one-point record agree.
+
+Two cross-checks are printed by the benchmark and were checked on both runs:
+
+- **The advice's move estimate equalled what compact actually moved on 512 of
+  512 events** (max deviation 0 objects / 0 bytes, 0 UNKNOWN). The R35 claim
+  that the estimate simulates the exact packing rules has been fault-injection
+  tested; this is the first time it has been checked on hardware across a few
+  hundred different fragmentation patterns. CI now asserts the host copy of
+  this line.
+- **The library's own esp_timer microseconds vs the mcycle figure**: max
+  deviation 9-10 us over 512 events -- the two independent clocks agree to
+  within the esp_timer tick.
+
+Instrument: the interval bias is 50 ns per event, five orders of magnitude
+below the median window, so these percentiles are quotable in a way no host
+per-event figure can be (section 7).
+
+What this section does NOT establish:
+
+- **One regime, one part.** The distribution is for a full, pin-free pool with
+  14-20 dispersed holes at 100% occupancy. The classic ESP32's percentiles are
+  not taken (the board was offline this round; its bench firmware build records
+  128 events for .bss reasons). And a pinned regime is NOT part of the record:
+  a development build that kept the pins alive during the cycles (barrier every
+  16 objects) saw compact() strand the free space below each barrier into ~1 KiB
+  pockets, and the probe retry failed after EVERY one of 512 compactions
+  (rescued=0). That is a real property of dense barriers --
+  COMPACTION_POLICY.md section 7 predicts it qualitatively -- and it means
+  "compact to satisfy a demand" can structurally fail with pins intact even
+  when total free is sufficient. It is recorded here as an observation because
+  it is a single dev-build run, not a measured distribution.
+- **No soak, still.** The 512 events span ~4.5 s of compaction inside a ~30 s
+  firmware; nothing here is an endurance result.
+
 ---
 
 ## 6. A second device: classic ESP32 (ESP32-D0WDQ6, LX6)
@@ -698,16 +784,18 @@ transfers unchanged.
   192 KiB region; section 6 is a classic ESP32 at the same clock with a 112 KiB
   region. Both are Release-semantics builds (`PM_DEBUG=0`). The shapes transfer;
   the absolutes are those two parts'.
-- **No compaction-window percentiles.** The device clock is free, so the raw
-  material exists, but each run contains *one* compaction. A percentile needs many
-  events, which needs a workload with many failed probes over a long run. Not
-  measured.
+- **Compaction-window percentiles exist for ONE regime and ONE part** (section
+  5.8: S3, full pin-free pool, 14-20 dispersed holes). The classic part's
+  percentiles are not taken, a pinned-barrier distribution was never recorded
+  (only the dev-build observation in 5.8), and no other regime has been swept.
 - **No soak.** The device benchmark firmware is ~28 s end to end, and the
   acceptance suite was run twice from reset on each of two parts. Nothing here is
   a multi-hour endurance result, and nothing here is a substitute for one.
-- **Section 5.3's explanation is a hypothesis**, and section 6.3 neither confirms
-  nor refutes it. The ~20x per-cycle gap is measured; the reason offered for it is
-  not.
+- **Section 5.3's explanation is no longer open** -- section 5.7 measured it and
+  it is dead (both miss counters exactly zero; 1,528 instructions at CPI 1.41).
+  What remains un-measured is the second chip's own decomposition: section 6.3's
+  per-cycle difference is a fact whose per-chip cause nobody has taken apart
+  (section 6.6's "two points is not a trend").
 - **Run-to-run spread is ±4% on the host** on the pair metric, and larger on
   anything per-event. That is a property of the measurement host (a VM with a
   trapped `RDTSC`), not of the library, and it is the reason the host tables quote
@@ -715,8 +803,12 @@ transfers unchanged.
   runs are byte-identical including the medians, so its figures carry no spread
   term. Differences smaller than the host's ±4% are therefore not meaningful *in
   the host tables* — but they would be in section 6's.
-- **The host's virtualisation changed during this work** (the TSC trap appeared
-  after a guest reboot/resume). Absolute per-event host figures taken before and
-  after that change are not comparable, which is a further reason the headline
-  claims rest on counts and on the pair metric rather than on per-event host
-  times.
+- **The host's virtualisation has changed more than once during this work** (the
+  TSC trap appeared after a guest reboot/resume, and has since disappeared again:
+  2026-09-18 the instrument self-reports a 19-26 ns clock cost where section 0
+  records ~9,400 ns). There are therefore three instrument regimes across this
+  file's host history, and absolute per-event host figures taken under different
+  regimes are not comparable -- which is a further reason the headline claims
+  rest on counts and on the pair metric rather than on per-event host times.
+  Check the timer's self-report line at the top of a host run before quoting
+  anything per-event from it.

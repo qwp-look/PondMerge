@@ -57,6 +57,7 @@ bench/              可复现基准 + 实测结果（见 README.md 与 RESULTS.m
     alloc_latency.cpp   alloc/free 与 live 数的标度（含对历史 core 的 A/B）
     validate_scaling.cpp  validate / get_stats 标度
     fragmentation.cpp   碎片治理 A/B（同一分配器，compact 开/关）
+    compaction_window.cpp  整理窗口分布：512 次 compact() 的逐次计时与百分位（设备端）
     esp32/              同一份基准源码的设备端 IDF 工程（独立于验收固件）
 esp32/              IDF 验收工程，多目标（默认 ESP32-S3；经典 ESP32 见 sdkconfig.defaults.esp32）
 docs/               架构说明、代码指导书、各轮任务书与交接文档（见文末索引）
@@ -488,4 +489,4 @@ advice 即断言诊断）；`PM_DEBUG=0` 时断言编译为空，但 generation�
 | docs/架构说明.md | 目标架构契约 |
 | docs/PondMerge_v1_代码指导书.md | 接口与内存布局的原始设计 |
 | docs/PondMerge_v1_repair_task.md / v2 | 第一/二轮修复任务书 |
-| docs/HANDOVER_v2–v13.md | 各轮收口报告（v13 为最新：第二颗芯片 + 指令数轮） |
+| docs/HANDOVER_v2–v14.md | 各轮收口报告（v14 为最新：整理窗口百分位轮） |

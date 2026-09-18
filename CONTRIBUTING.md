@@ -39,6 +39,16 @@ compact/merge/split。核心约束：**C++17 子集，无异常、无 RTTI、无
 
 ## 3. 怎么跑验证（host，改任何东西之后）
 
+一把全跑（十项，等价于下面逐条命令；CI 的 `benchmarks` job 是其中第 10 项
+的来源）：
+
+```sh
+scripts/gates.sh                # 全部十项；输出折叠，失败时保留末 30 行
+scripts/gates.sh -v             # 不折叠输出
+```
+
+逐条命令（`scripts/gates.sh` 就是按这个清单调的，改了门禁要两边同步）：
+
 ```sh
 tests/run_host.sh            # Debug，10000 ops（默认档）
 tests/run_host.sh --release  # Release
@@ -47,8 +57,14 @@ tests/run_host.sh --cppcheck # 静态检查（用 2.19.0 校准过；换版本�
 tests/run_host.sh --configs  # TLSF 配置矩阵
 tests/run_host.sh --coverage # 覆盖率（下限 85%，低于即失败）
 tests/run_host.sh --fuzz     # libFuzzer 有界运行
+g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc \
+    examples/host_demo.cpp src/core.cpp -o build/host_demo
 python3 examples/protocol_smoke.py build/host_demo   # 95 checks
 python3 examples/http_smoke.py build/host_demo       # 15 checks
+g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra \
+    -Wno-unused-parameter -Werror -Iinclude -Isrc \
+    bench/$b.cpp src/core.cpp -o build/bench_$b     # b ∈ {alloc_latency,
+    validate_scaling, fragmentation, compaction_window}（CI 的 benchmarks job）
 ```
 
 全部通过应看到 **5,409,619 (Debug) / 5,409,626 (Release) / 1,508,630 (San)

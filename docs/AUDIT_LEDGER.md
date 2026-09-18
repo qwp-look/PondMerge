@@ -221,3 +221,15 @@
   拒绝、结构审计 OK）；整理成本 0.061 ms 原始 / 0.053 ms 修正后。
   接受边界新增 §6.10（设备端未实测，板子离线）。
 
+- 2026-09-18（第十三轮，整理窗口百分位轮，HANDOVER_v14）：**建议估算的精确性
+  第一次在真实硬件上跨碎片形态检验**。`bench/compaction_window.cpp`（新增）在
+  S3 上重建碎片状态 512 次、每次先只读建议后计时整理：`estimated_moved_objects/
+  estimated_moved_bytes` 与 `compact` 实际搬迁在 **512/512 事件上偏差为 0**
+  （0 UNKNOWN；CI 已断言 host 侧同项）。同时证伪并修正了一处文档归因：碎片
+  基准的 scatter 按 `(i+1)%4` 释放、pinned 在 `(i+1)%16`（子集）⇒ **测量阶段
+  实际无 pin**（探针实测 `has_pinned=0`，整合搬迁 189 对象/184,296 B 与原
+  host 记录一致）；`fragmentation.cpp` 注释与 `bench/README.md` §4 已更正
+  （原文保留）。pinned 屏障密集的真实效应由开发版实测记录（512 次整理后
+  probe 重试全部失败——屏障把整合空间切成 ~1 KiB 口袋），印证 COMPACTION_POLICY
+  §7 的定性预告。不变式本体无增改：本条登记的是**证据升级**（R31/R35 行的
+  设备端佐证）与一处叙述修正。
