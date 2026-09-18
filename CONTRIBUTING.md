@@ -34,6 +34,8 @@ compact/merge/split。核心约束：**C++17 子集，无异常、无 RTTI、无
    过程（`docs/HANDOVER_vN.md`）。修 bug 要同步更新台账与一份新的 HANDOVER。
 7. **对外可见的动作（push、发 release、上传 Registry）先问维护者。**
    仓库是公开的，push 即对外可见。
+   **更新（2026-09-19，维护者授权）**：push 到 main 已获常授权——host 门禁
+   全绿即可直接推，无需再问；**发 release 与上传 Registry 仍先问**。
 8. **假设要用测量检验**。本项目历史上至少两个"合理"的解释后来被计数器/差分
    直接证伪（见 `bench/RESULTS.md` §5.3 保留的错误原文与 §5.7 的测量）。
 
