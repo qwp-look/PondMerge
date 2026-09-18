@@ -582,25 +582,40 @@ transfers unchanged.
 
 ### 6.6 What this section does not establish
 
-- **One run.** The re-run was blocked by the board's USB-UART bridge hanging (see
-  the note below), so unlike the acceptance suite this bench record is
-  single-run. The run's own self-checks all passed: structure audit OK on both
-  fragmentation variants, the IDF-heap accounting consistent, `validate` OK, and
-  the pair/free+alloc cross-check in section 6.2 agreeing to 0.6%.
+- **Three runs, and all three are byte-identical.** Every figure in this section —
+  including the *median* columns, not just the minima — is identical across three
+  separate power-on runs of the same firmware, so this is not a single-run record
+  after all and there is no run-to-run spread to quote for this part. That is a
+  stronger statement than the host can make (see section 7) and it has a mundane
+  explanation: the workload is fully determined by fixed seeds, the code is `-O2`,
+  the flash cache is deterministic, and the periodic tick lands at the same phase
+  in each trial, so the per-interval cycle count is a reproducible function of the
+  code path. Two runs were captured with `tests/serial_cap.py`; the third, after a
+  re-plug, with the same tool plus a retry on the open. The run's own self-checks
+  all passed: structure audit OK on both fragmentation variants, the IDF-heap
+  accounting consistent, `validate` OK, and the pair/free+alloc cross-check in
+  section 6.2 agreeing to 0.6%.
+
+  What identical runs do *not* establish is that the figures are right — only that
+  they are reproducible. A systematic error would reproduce just as exactly.
 - **A different region size**, so `filled`, `live` and the compaction's byte count
   are not comparable across the two chips. The live counts (16–256), the block
   counts (96–384) and the probe size (10 KiB) are, and those are what the tables
   above compare.
 - **Two points is not a trend.** Section 6.3's per-cycle difference is measured;
   its cause is not.
-- **Device-side operational note, recorded because it cost a run:** the CH340
-  bridge on this board became unresponsive after the first benchmark run —
-  `/dev/ttyUSB0` stayed enumerated but every read failed with EIO while the kernel
-  logged `ch341-uart: failed to send control message: -110` (ETIMEDOUT) — and it
-  could not be recovered from software without root (a USB rebind, or simply
-  re-plugging the board). The ESP32 itself was fine. If a device run stops
-  answering on a bridge chip like this, check the kernel log before suspecting the
-  firmware.
+- **Device-side operational note, recorded because it cost two attempts.** The
+  CH340 bridge on this board can go unresponsive: `/dev/ttyUSB0` stays enumerated
+  and `lsusb` still lists the chip, but every read fails with EIO while the kernel
+  logs `ch341-uart: failed to send control message: -110` (ETIMEDOUT on a control
+  transfer — retried by the driver, and not fatal to the device). A re-plug clears
+  it; there is no software fix over SSH without root. **The ESP32 itself is
+  unaffected, so check the kernel log before suspecting the firmware.**
+
+  The same chip also fails the *port open* intermittently — measured directly: the
+  first open raised `OSError [Errno 5]` and the immediate next one succeeded and
+  captured the whole run. `tests/serial_cap.py` now retries the open up to 20
+  times, which is what turned a confusing traceback into this section's third run.
 
 ---
 
@@ -620,8 +635,13 @@ transfers unchanged.
 - **Section 5.3's explanation is a hypothesis**, and section 6.3 neither confirms
   nor refutes it. The ~20x per-cycle gap is measured; the reason offered for it is
   not.
-- **Run-to-run spread is ±4%** on the pair metric and larger on anything
-  per-event. Differences smaller than that are not meaningful in these tables.
+- **Run-to-run spread is ±4% on the host** on the pair metric, and larger on
+  anything per-event. That is a property of the measurement host (a VM with a
+  trapped `RDTSC`), not of the library, and it is the reason the host tables quote
+  one representative run. **The device record is not like this**: section 6's three
+  runs are byte-identical including the medians, so its figures carry no spread
+  term. Differences smaller than the host's ±4% are therefore not meaningful *in
+  the host tables* — but they would be in section 6's.
 - **The host's virtualisation changed during this work** (the TSC trap appeared
   after a guest reboot/resume). Absolute per-event host figures taken before and
   after that change are not comparable, which is a further reason the headline

@@ -49,16 +49,34 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
-- **A serial bridge can die in a way that looks exactly like a firmware hang.**
-  After the first classic-ESP32 benchmark run the CH340 stayed enumerated and
-  `/dev/ttyUSB0` stayed present, but every open failed with `EIO` while the kernel
-  logged `ch341-uart: failed to send control message: -110` (ETIMEDOUT);
-  recovering it needed a USB rebind or a re-plug, neither available over SSH
-  without root. The ESP32 itself was fine. Recorded in `bench/RESULTS.md`
-  section 6.6 because the first thing this looks like is broken firmware, and one
-  `journalctl -k | grep usb` says otherwise. The consequence for the record is
-  stated plainly rather than glossed: **the section 6 bench record is single-run**,
-  unlike the acceptance suite, which has two runs per part.
+- **A USB-UART bridge can fail in two ways that both look like broken firmware,
+  and both are now handled.** Measured on the classic-ESP32 board's CH340:
+
+    * the bridge can go unresponsive — `/dev/ttyUSB0` stays enumerated and `lsusb`
+      still lists the chip, but every read fails with `EIO` while the kernel logs
+      `ch341-uart: failed to send control message: -110`. A re-plug clears it;
+      there is no software fix over SSH without root. The ESP32 itself is
+      unaffected.
+    * the **port open** fails intermittently with the same `EIO` — measured
+      directly: `serial_cap.py`'s first open raised `OSError [Errno 5]`, and the
+      immediate next attempt opened and captured the whole run.
+
+  The second was fixed rather than documented: `tests/serial_cap.py` now retries
+  the open (20 attempts, with the evidence in a comment), because one transient
+  failure used to abort a capture that would have worked while the traceback
+  pointed at the port rather than at the real story. The first is recorded in
+  `bench/RESULTS.md` section 6.6 as an operational note, since
+  `journalctl -k | grep usb` answers it in one command.
+
+- **The classic-ESP32 benchmark record is three runs, and all three are
+  byte-identical** — medians included, not just the minima — so what was written
+  up as a single-run limitation is not one, and this part carries **no run-to-run
+  spread term at all**. The explanation is mundane: fixed seeds, `-O2`, a
+  deterministic flash cache, and a periodic tick at the same phase in every trial
+  make the per-interval cycle count a reproducible function of the code path. The
+  host cannot do this, which is why its tables quote one run and a ±4% spread.
+  Identical runs prove reproducibility and not correctness — a systematic error
+  would reproduce just as exactly, and the section says so.
 
 - **A second hardware target, and the reason it is worth having: the dual-core
   lock claim now has evidence from two different cores.** The acceptance firmware

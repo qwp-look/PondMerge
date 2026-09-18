@@ -41,7 +41,30 @@ baud = int(sys.argv[3]) if len(sys.argv) > 3 else 115200
 stop_marker = sys.argv[4].encode() if len(sys.argv) > 4 else b"=== model PASSED"
 stop_also = None if len(sys.argv) > 4 else b"=== model FAILED"
 
-s = serial.Serial(port, baud, timeout=0.2)
+def open_port():
+    """Open the port, retrying transient failures.
+
+    A USB-UART bridge can refuse the open while the device itself is fine.
+    Measured on a CH340 board: the first attempt raised
+    `OSError: [Errno 5] Input/output error` while the kernel was logging
+    `ch341-uart: failed to send control message: -110` -- ETIMEDOUT on a control
+    transfer, retried by the driver and non-fatal -- and the very next attempt
+    opened normally and captured the whole run. Without this, one failed open
+    aborts a capture that would otherwise have worked, and the traceback points
+    at the port rather than at the real story.
+    """
+    last = None
+    for _ in range(20):
+        try:
+            return serial.Serial(port, baud, timeout=0.2)
+        except Exception as e:  # any failure here is worth one more try
+            last = e
+            time.sleep(0.5)
+    raise SystemExit("[serial_cap] could not open %s after 20 attempts: %s"
+                     % (port, last))
+
+
+s = open_port()
 
 
 def dtr(v):
