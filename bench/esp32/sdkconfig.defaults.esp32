@@ -1,0 +1,30 @@
+# PondMerge on-target benchmarks -- classic ESP32 (ESP32-D0WDQ6, LX6).
+#
+# Applied on top of the shared sdkconfig.defaults. See
+# esp32/sdkconfig.defaults.esp32 for why the two-file + set-target dance is
+# necessary at all (IDF does not read sdkconfig.defaults.<target> on its own, and
+# a second file in SDKCONFIG_DEFAULTS cannot override the target itself):
+#
+#   rm -f sdkconfig && \
+#   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32" \
+#       idf.py set-target esp32 build
+#
+# The shared file already carries the two settings that must NOT differ between
+# targets if the numbers are to be comparable -- -O2 and the watchdogs off -- and
+# this file deliberately does not touch them.
+
+CONFIG_IDF_TARGET="esp32"
+
+# 4 MB on this board against 16 MB on the ESP32-S3 one.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# No USB-Serial-JTAG peripheral exists on this part, so the console has to be
+# UART0 behind the board's USB-UART bridge (a CH340, i.e. /dev/ttyUSB0, which
+# needs the user in the dialout group).
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# 240 MHz, the same as the ESP32-S3 run. This one matters more than the others:
+# the whole point of a second chip is comparing per-cycle cost, and a different
+# clock would turn that comparison into a division problem. IDF's default for this
+# target is 160 MHz, which is exactly why it is stated here rather than inherited.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y

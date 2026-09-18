@@ -335,8 +335,26 @@ USB-UART bridge (`/dev/ttyUSB0`, needs the user in `dialout`).
 pulsed) that works for both, and takes an optional stop marker because the
 benchmark firmware ends on a different line than the acceptance firmware.
 
-`bench/esp32/` (the benchmark sources compiled for the device) is still
-ESP32-S3-only.
+And `bench/esp32/` — the benchmark sources compiled for the device — now runs on
+**both** parts too, from one set of sources with one set of parameters: the only
+difference is the shared region, 192 KiB on the S3 against 112 KiB here, because
+this part has ~200 KiB of static DRAM in total and the link failed at 128 KiB with
+`dram0_0_seg overflowed by 4208 bytes`. `bench/RESULTS.md` section 6 is the second
+device's record. What it adds:
+
+- the `alloc`/`free` pair is flat in the live count on both cores (**x0.99** on
+  each), and the churn decomposition reproduces (two independent estimates of the
+  allocator's own cost agree to 0.6%);
+- fragmentation repeats exactly: **50 of 50** large demands fail with compaction
+  disabled, **1 of 50** with it enabled, on both parts;
+- the independent TLSF baseline's sustained-churn failure count becomes
+  **quotable** here: the S3's 0 of 199 was marked `CONFOUNDED` by a single
+  re-allocation refusal, but the classic part had no refusals, so its **21 of 200**
+  (10%) stands against PondMerge's 0;
+- and one new result: a trivial loop is **faster** on the LX6 (25.0 ns against
+  29.2 ns) while every allocator operation is slower. That argues against reading
+  the ~20x device/host gap as "the target's CPU is simply slow" — but it does not
+  yet explain it.
 
 
 ## Debug vs Release

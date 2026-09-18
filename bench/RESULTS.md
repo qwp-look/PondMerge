@@ -9,14 +9,23 @@ a design document.
 -DPM_DEBUG=0`. The host is a VMware guest; see the instrument section — that
 matters more than the CPU does.
 
-**Device:** ESP32-S3 (n16r8), 240 MHz, `-O2`, `PM_DEBUG=0` (Release semantics),
-192 KiB region as 48 x 4 KiB segments, `PM_MAX_OBJECTS=256`, `PM_MAX_POOLS=16`,
-`PM_SL_COUNT=4`. Firmware is `bench/esp32/`, a separate IDF project that compiles
-the **same** benchmark sources as the host build; only the sizing macros differ.
-Section 5 is the device run. The instrument is a different one there, and it says
-so itself: `esp_cpu_get_cycle_count()` costs 59 ns per read against the host's
-9,592 ns, so per-operation timings are usable on the target and are not on the
-host.
+**Devices:** two, and they are not interchangeable.
+
+| | ESP32-S3 (n16r8) | classic ESP32 (D0WDQ6 v1.1) |
+|---|---|---|
+| core | Xtensa **LX7**, 2 cores | Xtensa **LX6**, 2 cores |
+| clock | 240 MHz | 240 MHz (set explicitly; IDF's default here is 160) |
+| static DRAM | 512 KiB class | ~200 KiB total (`dram0_0_seg`) |
+| shared region | 192 KiB, 48 segments | **112 KiB**, 28 segments (forced by DRAM) |
+| console | USB-Serial-JTAG | UART0 behind a CH340 |
+| section | 5 | **6** |
+
+Firmware for both is `bench/esp32/`, one IDF project that compiles the **same**
+benchmark sources as the host build; only the sizing macros and the target
+defaults differ, and the one parameter that changes between the two chips is the
+region size. The instrument is free enough on both for per-operation timing and
+says so itself: 59 ns per clock read on the S3, 72 ns on the classic part, against
+9,592 ns on the host — which is why the host numbers are batched and these are not.
 
 **Superseded:** an earlier revision of this file reported numbers produced before
 the instrument problem below was found. Those figures were not wrong in
@@ -466,20 +475,151 @@ budget should use; the closed form is an illustration, not a contract.
 
 ---
 
-## 6. What these numbers do not say
+## 6. A second device: classic ESP32 (ESP32-D0WDQ6, LX6)
 
-- **One device, one configuration.** Section 5 is a single ESP32-S3 at 240 MHz
-  with a 192 KiB region and 256 objects, on a Release-semantics build
-  (`PM_DEBUG=0`). The shapes should transfer; the absolutes are one part's.
+Section 5 is one part, which makes "the device" and "this ESP32-S3" the same
+thing. This section separates them: a different Xtensa core, a different cache,
+and a different amount of DRAM.
+
+**Platform.** ESP32-D0WDQ6 revision v1.1, dual-core **LX6**, 240 MHz — the *same*
+clock as the S3 run, set explicitly because IDF's default for this target is
+160 MHz and a different clock would have turned every per-cycle comparison into a
+division problem. `-O2`, `PM_DEBUG=0`, 4 MB flash, UART0 console behind a CH340
+bridge, **112 KiB shared region** as 28 x 4 KiB segments, `PM_MAX_OBJECTS=256`,
+`PM_MAX_POOLS=16`, `PM_SL_COUNT=4`.
+
+**The region is the only thing that had to change, and it changed because of DRAM.**
+This part has ~200 KiB of static DRAM in total (`dram0_0_seg` = 204,800 B). The
+S3's 192 KiB region does not fit — and neither does 128 KiB, which the linker
+rejected with `region 'dram0_0_seg' overflowed by 4208 bytes`. 112 KiB leaves
+~12 KiB of margin. **Every other benchmark parameter is identical on both targets**
+(live counts, churn intervals, probe size, pin cadence, scatter cadence), because
+a second chip running a differently-shaped experiment would not be a second data
+point. The instrument reports itself here too: 72 ns per clock read against the
+S3's 59 ns, both far below the operations being timed.
+
+### 6.1 The flatness reproduces, on a different core
+
+| live | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|
+| ESP32-S3 (LX7) | 9,253.1 | 9,215.0 | 9,193.0 | 9,184.0 | 9,180.5 ns |
+| classic ESP32 (LX6) | 10,092.4 | 10,044.6 | 10,018.2 | 10,007.6 | 10,003.4 ns |
+
+Both **x0.99** over a 16x range of live counts. Plan A's result — the address-ordered
+insertion walk was the whole cost of `alloc` — holds on two different cores.
+
+### 6.2 The harness decomposition reproduces
+
+| component | S3 ns/op | LX6 ns/op |
+|---|---|---|
+| D loop + one array load (floor) | 29.2 | 25.0 |
+| C address generation only | 62.5 | 62.8 |
+| A free+alloc, generation excluded | 9,007.8 | 9,804.2 |
+| B free+alloc, generation included | 9,079.6 | 9,897.8 |
+| E alloc only, fill pattern | 3,949.4 | 4,216.9 |
+| F free only, random order | 7,976.5 | 9,071.4 |
+
+On the LX6: allocator cost `A - D` = 9,779.1 ns against the differenced estimate
+`B - C` = 9,835.0 ns — two independent estimates agreeing to 0.6%, with index
+generation at 0.9% of the pair. The "the harness is measuring itself" worry was
+answered the same way on both parts.
+
+### 6.3 The two devices agree on the shape and disagree on the constant
+
+| | ESP32-S3 (LX7) | classic (LX6) | LX6 / S3 |
+|---|---|---|---|
+| loop + one array load | 29.2 ns | **25.0 ns** | **0.86** |
+| allocator cost (A - D) | 8,978.6 ns | 9,779.1 ns | 1.09 |
+| `alloc` only (E) | 3,949.4 ns | 4,216.9 ns | 1.07 |
+| `free` only (F) | 7,976.5 ns | 9,071.4 ns | 1.14 |
+| compaction, per byte | 18.3 MB/s | **22.3 MB/s** | 1.22 |
+| `validate`, 384 blocks | 20.10 ms | 24.47 ms | 1.22 |
+| `get_stats`, per block | 112.6 ns | 127.0 ns | 1.13 |
+
+**The trivial loop is FASTER on the LX6 while every allocator operation is
+SLOWER.** That is evidence against the simplest reading of section 5.3 — "the
+target's CPU is just slow" — because the loop costs *fewer* cycles on the part
+that loses on everything else. It does not prove the memory/code-access
+hypothesis either: the two cores differ in cache, in pipeline, and in how the
+flash cache is wired, so this is a second instance of the pattern rather than an
+explanation of it. What it does establish is that the ~20x device/host gap is not
+a uniform clock effect.
+
+### 6.4 Fragmentation: same conclusion, larger magnitude, and now quotable
+
+| | filled | live | Phase 1 | Phase 2 | largest free (min) |
+|---|---|---|---|---|---|
+| PondMerge, compaction disabled | 112 | 84 | **50 of 50 FAILED** | 1 of 200 | 2,056 B |
+| PondMerge, compaction on failure | 112 | 84 | **1 of 50 failed** | 0 of 200 | 2,056 B |
+| IDF heap (TLSF) | 107 | 81 | **50 of 50 FAILED** | **21 of 200 FAILED** | 2,048 B |
+
+Two things are better here than on the S3:
+
+- **The baseline's phase-2 count is quotable this time.** The S3 run had 1 churn
+  refusal in 199 probes and was marked `CONFOUNDED`; this one had **zero**, so the
+  number stands. An uncompacted pool loses **~10% of its large demands under
+  sustained churn**, and PondMerge with compaction loses none. On the S3 the same
+  comparison was 0 of 199, which was true but weak; here it is a magnitude.
+- `filled` and `live` are smaller because the region is: 112 objects against 191.
+  That is a consequence of the DRAM budget, not of the allocator, which is why the
+  counts are reported beside each other rather than normalised.
+
+Compaction cost: **3.5388 ms moving 81 objects / 78,984 B** — 22.3 MB/s against the
+S3's 18.3 MB/s, so on this part the maintenance window is both smaller and faster
+per byte moved.
+
+### 6.5 `validate` and `get_stats`
+
+| live | blocks | `validate` | per block | `get_stats` |
+|---|---|---|---|---|
+| 64 | 96 | 2,325.0 µs | 24,218.4 ns | 17,154 ns |
+| 128 | 192 | 7,165.4 µs | 37,320.0 ns | 27,687.5 ns |
+| 256 | 384 | **24,474.4 µs** | 63,735.4 ns | 48,754 ns |
+
+Fitted exponent **1.70** — the same figure the S3 gave, from a different core.
+`get_stats` is 0.75 on both and 127.0 ns/block here, so the negative result
+transfers unchanged.
+
+### 6.6 What this section does not establish
+
+- **One run.** The re-run was blocked by the board's USB-UART bridge hanging (see
+  the note below), so unlike the acceptance suite this bench record is
+  single-run. The run's own self-checks all passed: structure audit OK on both
+  fragmentation variants, the IDF-heap accounting consistent, `validate` OK, and
+  the pair/free+alloc cross-check in section 6.2 agreeing to 0.6%.
+- **A different region size**, so `filled`, `live` and the compaction's byte count
+  are not comparable across the two chips. The live counts (16–256), the block
+  counts (96–384) and the probe size (10 KiB) are, and those are what the tables
+  above compare.
+- **Two points is not a trend.** Section 6.3's per-cycle difference is measured;
+  its cause is not.
+- **Device-side operational note, recorded because it cost a run:** the CH340
+  bridge on this board became unresponsive after the first benchmark run —
+  `/dev/ttyUSB0` stayed enumerated but every read failed with EIO while the kernel
+  logged `ch341-uart: failed to send control message: -110` (ETIMEDOUT) — and it
+  could not be recovered from software without root (a USB rebind, or simply
+  re-plugging the board). The ESP32 itself was fine. If a device run stops
+  answering on a bridge chip like this, check the kernel log before suspecting the
+  firmware.
+
+---
+
+## 7. What these numbers do not say
+
+- **Two devices, two configurations.** Section 5 is an ESP32-S3 at 240 MHz with a
+  192 KiB region; section 6 is a classic ESP32 at the same clock with a 112 KiB
+  region. Both are Release-semantics builds (`PM_DEBUG=0`). The shapes transfer;
+  the absolutes are those two parts'.
 - **No compaction-window percentiles.** The device clock is free, so the raw
-  material exists, but the run above contains *one* compaction. A percentile
-  needs many events, which needs a workload with many failed probes over a long
-  run. Not measured.
-- **No soak.** The device benchmark firmware is ~25 s end to end, and the
-  acceptance suite was run twice from reset. Nothing here is a multi-hour
-  endurance result, and nothing here is a substitute for one.
-- **Section 5.3's explanation is a hypothesis.** The 20x per-cycle gap is
-  measured; the reason offered for it is not.
+  material exists, but each run contains *one* compaction. A percentile needs many
+  events, which needs a workload with many failed probes over a long run. Not
+  measured.
+- **No soak.** The device benchmark firmware is ~28 s end to end, and the
+  acceptance suite was run twice from reset on each of two parts. Nothing here is
+  a multi-hour endurance result, and nothing here is a substitute for one.
+- **Section 5.3's explanation is a hypothesis**, and section 6.3 neither confirms
+  nor refutes it. The ~20x per-cycle gap is measured; the reason offered for it is
+  not.
 - **Run-to-run spread is ±4%** on the pair metric and larger on anything
   per-event. Differences smaller than that are not meaningful in these tables.
 - **The host's virtualisation changed during this work** (the TSC trap appeared

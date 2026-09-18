@@ -7,6 +7,59 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **The benchmarks now run on a second chip, and one conclusion went from "true"
+  to "true and quantified".** `bench/esp32/` builds and runs on a classic ESP32
+  (ESP32-D0WDQ6, dual-core **LX6**) as well as on the ESP32-S3 (LX7), at the SAME
+  clock — 240 MHz, set explicitly because IDF defaults this part to 160, and a
+  different clock would have turned every per-cycle comparison into a division
+  problem. Every benchmark parameter except the region size is identical on the
+  two targets. Full numbers in `bench/RESULTS.md` section 6; the short version:
+
+    * the alloc/free pair is flat in the live count on both cores (**x0.99**);
+    * the churn decomposition reproduces: two independent estimates of the
+      allocator's own cost agree to 0.6%, and index generation is 0.9% of the pair;
+    * `validate` fits exponent **1.70** on both, `get_stats` **0.75** on both;
+    * fragmentation: **50 of 50** large demands fail with compaction disabled and
+      **1 of 50** with it enabled, on **both** parts — and the independent TLSF
+      baseline fails **50 of 50** on both;
+    * **the TLSF baseline's sustained-churn count is quotable now.** On the S3 it
+      was 0 of 199 but marked `CONFOUNDED` by a single same-size re-allocation
+      refusal; on the classic part there were **no** refusals, so the number
+      stands: the uncompacted baseline loses **21 of 200** (10%) of its large
+      demands while PondMerge with compaction loses none. On the S3 that
+      comparison was true but weak; here it is a magnitude.
+
+  One result is new rather than repeated: **a trivial loop is FASTER on the LX6
+  (25.0 ns against 29.2 ns) while every allocator operation is SLOWER (1.07x to
+  1.14x)**. That argues against the simplest reading of the ~20x device/host gap —
+  "the target's CPU is just slow" — because the loop costs *fewer* cycles on the
+  part that loses on everything else. It does not prove the memory/code-access
+  hypothesis either; it is a second instance of the pattern, not an explanation.
+
+- **`bench/esp32/` is a two-target project**, using the same two-file
+  `SDKCONFIG_DEFAULTS` + `set-target` mechanism as `esp32/`, with its own
+  `bench/esp32/sdkconfig.defaults.esp32` (4 MB flash, UART0 console, explicit
+  240 MHz). The region size and the population it determines are the only things
+  the fork changes: this part has ~200 KiB of static DRAM in total, the S3's
+  192 KiB region does not fit, and neither does 128 KiB — the linker rejected that
+  with `region 'dram0_0_seg' overflowed by 4208 bytes` — so it is 112 KiB, with
+  ~12 KiB of margin. `PM_BENCH_SEGMENTS` is now **derived** from the region size
+  rather than being a hand-maintained 48, so a pool whose segment count disagrees
+  with its region is no longer expressible.
+
+### Fixed
+
+- **A serial bridge can die in a way that looks exactly like a firmware hang.**
+  After the first classic-ESP32 benchmark run the CH340 stayed enumerated and
+  `/dev/ttyUSB0` stayed present, but every open failed with `EIO` while the kernel
+  logged `ch341-uart: failed to send control message: -110` (ETIMEDOUT);
+  recovering it needed a USB rebind or a re-plug, neither available over SSH
+  without root. The ESP32 itself was fine. Recorded in `bench/RESULTS.md`
+  section 6.6 because the first thing this looks like is broken firmware, and one
+  `journalctl -k | grep usb` says otherwise. The consequence for the record is
+  stated plainly rather than glossed: **the section 6 bench record is single-run**,
+  unlike the acceptance suite, which has two runs per part.
+
 - **A second hardware target, and the reason it is worth having: the dual-core
   lock claim now has evidence from two different cores.** The acceptance firmware
   builds and runs on a classic ESP32 (ESP32-D0WDQ6 v1.1, dual-core **LX6**) as well

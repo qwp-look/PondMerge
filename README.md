@@ -371,10 +371,16 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 > `esp32/main/CMakeLists.txt` 里由 `CONFIG_IDF_TARGET` 驱动。
 >
 > 这条分叉的**直接动因**是项目的锁语义声明：Host 的 `PM_LOCK` 是空操作，SMP 证据
-> 只能来自双核设备测试，而在此之前它只在一颗芯片上成立过。经典 ESP32 是**双核
+> 只能来自双核设备测试，而在此之前它只在**一颗**芯片上成立过。经典 ESP32 是**双核
 > LX6**（S3 是 LX7），`portMUX` 实现与 cache 都不同；同一份
 > `tests/concurrency_esp32.cpp` 在第二套架构上通过，才是这条声明更强的证据。
-> `bench/esp32/`（把基准源码编到设备）目前仍只面向 S3。
+>
+> `bench/esp32/`（把基准源码编到设备）**同样已支持两个目标**：同一份基准源码、
+> 同一组参数（只有 region 因 DRAM 从 192 KiB 降到 112 KiB），所以两片芯片的数字
+> 可比。结论见 `bench/RESULTS.md` §6——`alloc`/`free` 的平坦性（两片都是 x0.99）、
+> 碎片 A/B（两片都是 50/50 → 1/50）都在第二片复现，而且**独立 TLSF 基线在经典
+> ESP32 上持续 churn 掉了 21/200（10%）而 PondMerge 开整理掉了 0**（S3 那次该计数
+> 因一次同尺寸拒绝被标 CONFOUNDED，不可引用；这次可引用）。
 
 ## 可视化 Demo
 
