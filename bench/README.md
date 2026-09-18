@@ -132,6 +132,41 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
 # 调参：-DPM_BENCH_CHURN_LIVE / -DPM_BENCH_CHURN_OPS / -DPM_BENCH_IDX_RING
 ```
 
+### §2 的两个配套仪器：`perfcount.cpp`（设备）与 `host_insn.cpp`（host）
+
+分解基准回答"这一对操作里有多少是分配器"；这两个回答**"分配器的那些周期去了哪"**。
+`RESULTS.md` §5.3 曾把设备侧 ~20×/周期猜成"内存与代码访问"，§5.7 用它们测了，
+**结论是猜错了：两个 cache 未命中计数器读数都是 0**。
+
+**`bench/esp32/main/perfcount.cpp`（仅设备端）**：跑与 `churn_overhead` 完全相同的
+三个工作负载，读 Xtensa 性能计数器——`XTPERF_CNT_ICACHE_MISSES` /
+`DCACHE_MISSES`（**以周期计的未命中代价**）、指令数（⇒ CPI）、I/D stall 与
+bubble 分解。**两个计数器与 `mcycle` 取自同一次试验**，所以占比是精确值而不是
+两次运行的商。仪器只有两个计数器，故分三轮读。
+
+**`bench/host_insn.cpp`（host 侧）**：同一负载的**指令数**——callgrind 确定性计数，
+用**两个运行长度做差分**抵消进程启动（与库自己的 `free`/`alloc` 归因同一个技巧）。
+
+```sh
+# host 指令数（差分：两个长度，读 summary 首字段 = 指令数）
+g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -DPM_MAX_OBJECTS=256 \
+    -Iinclude -Isrc bench/host_insn.cpp src/core.cpp -o /tmp/host_insn
+for n in 4096 8192; do
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg_$n.out \
+    /tmp/host_insn $n >/dev/null 2>&1
+  grep -m1 '^summary:' /tmp/cg_$n.out
+done
+```
+
+**读法与陷阱**：
+- 设备侧 1,528 指令/pair vs host 侧 757 ⇒ **目标执行 2.0× 的指令**——这是"指令集与
+  32 位 ABI"的部分，两边都实测；
+- **host 的 CPI 不可引用**：VM 里 `perf` 被 `perf_event_paranoid` 禁掉，而拿实测时间
+  除以标称频率，正是 §0 存在要防的那个错误（虚拟机里的真实频率不是 `lscpu` 印的那个）。
+  所以 §5.7 只报设备侧的 CPI 1.41，并明说不对称；
+- **不要**再拿"内存/代码访问"解释这 20×——它已被直接证伪，`RESULTS.md` §5.3 特意
+  保留了错误的原文以示教训。
+
 ## 3. `validate_scaling.cpp` — 结构审计的成本标度
 
 **问题**：`validate` 声明的边界是 O((live + free)²)。真二次吗？`get_stats` 值不值得优化？

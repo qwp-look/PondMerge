@@ -23,7 +23,7 @@ OS 线程）的**用户态托管内存系统**。在一段固定 Auto Zone 上�
 | 跑可视化 Demo（浏览器 + 设备） | [examples/](examples/) 与 [docs/DEMO_REQUIREMENTS.md](docs/DEMO_REQUIREMENTS.md) |
 | 审计与不变量证据 | [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) |
 | **实测性能数字与仪器限制** | [bench/RESULTS.md](bench/RESULTS.md) |
-| 历史轮次报告 | [docs/HANDOVER_v12.md](docs/HANDOVER_v12.md)（含 v2–v11 索引） |
+| 历史轮次报告 | [docs/HANDOVER_v13.md](docs/HANDOVER_v13.md)（含 v2–v12 索引） |
 
 ## 目录结构
 
@@ -381,6 +381,11 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 > 碎片 A/B（两片都是 50/50 → 1/50）都在第二片复现，而且**独立 TLSF 基线在经典
 > ESP32 上持续 churn 掉了 21/200（10%）而 PondMerge 开整理掉了 0**（S3 那次该计数
 > 因一次同尺寸拒绝被标 CONFOUNDED，不可引用；这次可引用）。
+>
+> 设备侧那个 ~20×/周期的差距也已**实测定性**（`bench/RESULTS.md` §5.7）：S3 的
+> cache 未命中计数器读数**恰好为 0**——"内存与代码访问"的旧解释被直接证伪。真实
+> 原因是**指令数与流水线依赖**：目标上一次 free+alloc 要执行 **1,528 条指令**
+> （x86-64 上同一负载 757 条，callgrind 实测），CPI 1.41、其中 24% 是依赖气泡。
 
 ## 可视化 Demo
 
@@ -482,4 +487,4 @@ advice 即断言诊断）；`PM_DEBUG=0` 时断言编译为空，但 generation�
 | docs/架构说明.md | 目标架构契约 |
 | docs/PondMerge_v1_代码指导书.md | 接口与内存布局的原始设计 |
 | docs/PondMerge_v1_repair_task.md / v2 | 第一/二轮修复任务书 |
-| docs/HANDOVER_v2–v12.md | 各轮收口报告（v12 为最新，含测量仪器轮） |
+| docs/HANDOVER_v2–v13.md | 各轮收口报告（v13 为最新：第二颗芯片 + 指令数轮） |

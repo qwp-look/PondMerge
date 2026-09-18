@@ -353,8 +353,13 @@ device's record. What it adds:
   (10%) stands against PondMerge's 0;
 - and one new result: a trivial loop is **faster** on the LX6 (25.0 ns against
   29.2 ns) while every allocator operation is slower. That argues against reading
-  the ~20x device/host gap as "the target's CPU is simply slow" — but it does not
-  yet explain it.
+  the ~20x device/host gap as "the target's CPU is simply slow" — and
+  `bench/RESULTS.md` section 5.7 has since measured where the gap does go: the
+  S3's cache-miss counters read **exactly zero** for the same churn, so the
+  memory story is refuted. The target executes **1,528 instructions per
+  free+alloc pair against 757 on x86-64** (callgrind) and runs them at CPI 1.41
+  with 24% dependency bubbles: an instruction-count explanation, not a
+  memory-latency one.
 
 
 ## Debug vs Release

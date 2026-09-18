@@ -42,6 +42,7 @@ math(EXPR PM_BENCH_SEGMENTS "${PM_BENCH_SHARED_ZONE_BYTES} / ${PM_BENCH_SEGMENT}
 idf_component_register(
     SRCS "bench_main.cpp"
          "idf_heap_baseline.cpp"
+         "perfcount.cpp"
          "../../../src/core.cpp"
          "../../alloc_latency.cpp"
          "../../churn_overhead.cpp"
@@ -50,10 +51,11 @@ idf_component_register(
     INCLUDE_DIRS "../../../include"
     PRIV_INCLUDE_DIRS "../../../src"
     # esp_timer for pm_port.h's tick source, freertos for the portMUX spinlock,
-    # heap for the heap_caps_* baseline. bench_main.cpp reaches the last one
-    # directly; core.cpp does not, so heap is a private requirement of the whole
+    # heap for the heap_caps_* baseline, perfmon for the Xtensa performance
+    # counters that perfcount.cpp reads. bench_main.cpp reaches two of them
+    # directly; core.cpp reaches none, so they are requirements of the whole
     # component.
-    PRIV_REQUIRES esp_timer freertos heap)
+    PRIV_REQUIRES esp_timer freertos heap perfmon)
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wall -Wextra -Wno-unused-parameter

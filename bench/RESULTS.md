@@ -363,17 +363,18 @@ in a fill, `free` ≈ 8.0 µs in a random-order drain.**
 | | host | device | per-cycle ratio |
 |---|---|---|---|
 | loop + one array load | 2.1 ns (~6 cycles at 3.7 GHz) | 29.2 ns (~7 cycles at 240 MHz) | ~1.2x |
-| free + alloc | ~34 ns (~100 cycles) | 9,008 ns (~2,160 cycles) | **~21x** |
+| free + alloc | ~34 ns (~100 cycles) | 9,008 ns (~2,160 cycles) | **~20x** |
 
 A trivial loop costs about the same number of *cycles* on both platforms, so the
-CPU's basic throughput is not the difference. The allocator's operations cost
-~20x more cycles on the target, which points at memory and code access rather
-than at the core: the host keeps the whole working set resident, while the target
-fetches the core's code through the flash cache and walks descriptor and bin
-structures that are wide relative to its cache line.
+CPU's basic throughput is not the difference: something about the allocator's own
+operations costs ~20x more cycles on the target.
 
-**This explanation is a hypothesis and is labelled as one.** It is recorded as
-the next thing to investigate, and none of the numbers above depend on it.
+**The explanation first offered here was "memory and code access rather than CPU
+throughput" — and section 5.7 measured it directly and found it wrong.** Both
+cache-miss counters read **exactly zero**. The cost is instruction count and a
+dependency-limited pipeline, not a stalled memory hierarchy. The guess is left in
+place rather than deleted because the shape of the error is instructive: it was
+plausible, it was repeated in an earlier README, and it took a counter to kill it.
 
 ### 5.4 Fragmentation, and an independent baseline
 
@@ -473,6 +474,73 @@ per-object term is smaller — 52 B of descriptor plus 30 B of plan scratch, i.e
 available on the target as `global_stats().metadata_bytes`, which is what a RAM
 budget should use; the closed form is an illustration, not a contract.
 
+### 5.7 Where the cycles actually go: not the cache
+
+Section 5.3's guess was testable, so it was tested. The ESP32-S3's Xtensa
+performance monitor counts **ICache-miss and DCache-miss penalty in cycles**, so
+the share of an interval that is memory stall can be read off rather than
+inferred, and the instruction counter gives CPI. `bench/esp32/main/perfcount.cpp`
+runs the same three workloads as `churn_overhead.cpp`, with counter 0, counter 1
+and `mcycle` sampled from the **same trial**, so every share below is exact rather
+than an average of two runs.
+
+| workload | icache miss penalty | dcache miss penalty | instructions | cycles | CPI |
+|---|---|---|---|---|---|
+| loop + one array load | **0** | **0** | 5.01/op | 5.02/op | 1.00 |
+| address generation only | **0** | **0** | 12.01/op | 12.02/op | 1.00 |
+| **free + alloc (index ring)** | **0** | **0** | **1,528.4/op** | **2,160.6/op** | **1.41** |
+
+**Both cache-miss counters read exactly zero on all three workloads.** The
+hypothesis in section 5.3 is dead: on this target the allocator does not stall on
+cache misses at all. With hindsight it should not be surprising — the descriptor
+table is 256 x 52 B, the bins are 364 B, and the churn keeps its blocks packed
+into the low part of the region, so the working set fits.
+
+Where the 2,160 cycles do go, from the same counters:
+
+| | per op | share of the interval |
+|---|---|---|
+| instructions retired | 1,528.4 | (CPI 1.41) |
+| **hold / bubble cycles** | **524.0** | **24.3%** |
+| instruction-related stalls | 66.7 | 3.1% |
+| data-related stalls | 0.8 | 0.04% |
+| cache-miss penalty | 0 | 0% |
+
+So the cost is **instruction count plus pipeline bubbles**: the target executes
+1,528 instructions for one free+alloc and spends a quarter of its time waiting on
+dependencies inside them. Nothing in the profile points at memory.
+
+**The same code on x86-64 executes 757 instructions for the same pair**, measured
+with callgrind (`bench/host_insn.cpp`; the counts are taken as a differential
+between two run lengths so process startup cancels — the same trick the library's
+own `free`/`alloc` attribution uses, for the same reason). So:
+
+- **the target executes 2.0x the instructions per pair** — 1,528 against 757. That
+  is the part of the gap which is about the instruction set and the 32-bit ABI
+  rather than about the two chips;
+- the remainder is cycles-per-instruction. On the target that is 1.41, with the
+  bubbles above as the mechanism. The host's equivalent is **not** quoted here:
+  `perf` events are blocked in this VM (`perf_event_paranoid`), and dividing the
+  host's measured time by its nominal clock would repeat exactly the mistake
+  section 0 exists to prevent — the host's real clock under a hypervisor is not
+  the number `lscpu` prints. The honest position is therefore asymmetric and is
+  stated as such: **the instruction-count half of the gap is measured on both
+  sides, the CPI half only on the target.**
+
+What this changes: the "memory and code access" story should not be repeated, here
+or anywhere else. The target's disadvantage is that this code compiles to ~2x the
+instructions *and* that the core retires them far less efficiently — both
+properties of the core and the code, not of where the bytes live. It also
+retro-explains section 6.3: a second chip with a *faster* trivial loop but *slower*
+allocator operations is what an instruction-count-and-dependency story predicts,
+and not what a memory-latency one does.
+
+Caveat on the method: the perfmon has two counters, so `perfcount.cpp` runs three
+passes (cache misses; instructions and data stalls; instruction stalls and
+bubbles) instead of reading everything at once. Each pass is internally exact, but
+the three are three executions. On this device that costs nothing, because the
+runs are byte-identical to one another (section 6.6).
+
 ---
 
 ## 6. A second device: classic ESP32 (ESP32-D0WDQ6, LX6)
@@ -544,6 +612,11 @@ hypothesis either: the two cores differ in cache, in pipeline, and in how the
 flash cache is wired, so this is a second instance of the pattern rather than an
 explanation of it. What it does establish is that the ~20x device/host gap is not
 a uniform clock effect.
+
+Section 5.7 was written after this and settles it: the cache-miss counters on
+the S3 read zero, so the memory story is refuted and this table's pattern is what
+an instruction-count-and-dependency explanation predicts — a core that runs a
+simple loop faster can still run a long dependency-chained path slower.
 
 ### 6.4 Fragmentation: same conclusion, larger magnitude, and now quotable
 

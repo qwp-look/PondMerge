@@ -7,6 +7,42 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **A hypothesis in this file's own history was measured and killed: the ~20x
+  device/host per-cycle gap is NOT cache misses.** `bench/RESULTS.md` section 5.3
+  offered "memory and code access rather than CPU throughput" as the explanation
+  and labelled it a guess. The ESP32-S3's Xtensa performance monitor counts
+  ICache-miss and DCache-miss penalty *in cycles*, so the guess was testable, and
+  `bench/esp32/main/perfcount.cpp` tested it on the same three workloads as
+  `churn_overhead.cpp`, with both counters and `mcycle` sampled from the same
+  trial so every share is exact:
+
+  | workload | icache miss penalty | dcache miss penalty | instructions | cycles | CPI |
+  |---|---|---|---|---|---|
+  | loop + one array load | **0** | **0** | 5.01/op | 5.02/op | 1.00 |
+  | **free + alloc** | **0** | **0** | **1,528.4/op** | **2,160.6/op** | **1.41** |
+
+  Both counters read exactly zero, on all three workloads. The cost is
+  **instruction count plus pipeline bubbles**: 1,528 instructions per free+alloc
+  pair, 24.3% of the interval in hold/bubble cycles, 3.1% in instruction-side
+  stalls, 0.04% in data-side stalls, and nothing at all in cache.
+
+  `bench/host_insn.cpp` then measured the same pair on x86-64 with callgrind, as a
+  differential between two run lengths so process startup cancels: **757
+  instructions per pair**. So the target executes **2.0x the instructions** for
+  the same work — that half of the gap is about the instruction set and the 32-bit
+  ABI, and it is measured on both sides. The other half is
+  cycles-per-instruction, and only the target's is quotable: `perf` events are
+  blocked in this VM, and dividing the host's measured time by its nominal clock
+  would repeat the exact mistake the instrument section exists to prevent. The
+  asymmetry is stated rather than papered over.
+
+  Section 5.3 keeps the refuted text in place, with the refutation next to it,
+  because the shape of the error is instructive: the guess was plausible, it was
+  repeated in an earlier README, and it took a counter to kill it. Section 6.3's
+  cross-chip puzzle is also settled by this — a core that runs a simple loop
+  faster while running a long dependency-chained path slower is what an
+  instruction-count explanation predicts, not what a memory-latency one does.
+
 - **The benchmarks now run on a second chip, and one conclusion went from "true"
   to "true and quantified".** `bench/esp32/` builds and runs on a classic ESP32
   (ESP32-D0WDQ6, dual-core **LX6**) as well as on the ESP32-S3 (LX7), at the SAME

@@ -38,7 +38,9 @@ int pm_bench_alloc_latency();
 int pm_bench_churn_overhead();
 int pm_bench_fragmentation();
 int pm_bench_validate_scaling();
-// Device-only: the FreeRTOS heap_4 baseline. It has no host counterpart, and it
+// Device-only: where the cycles go, read off the Xtensa performance counters.
+int pm_bench_perfcount();
+// Device-only: the ESP-IDF heap baseline. It has no host counterpart, and it
 // runs last because it re-uses g_zone as a heap region.
 int pm_bench_idf_heap_baseline();
 
@@ -117,13 +119,17 @@ extern "C" void app_main(void) {
         int (*fn)();
     };
     Step const steps[] = {
-        {"1/5 alloc latency", pm_bench_alloc_latency},
-        {"2/5 churn harness decomposition", pm_bench_churn_overhead},
-        {"3/5 fragmentation A/B", pm_bench_fragmentation},
-        {"4/5 validate / get_stats scaling", pm_bench_validate_scaling},
+        {"1/6 alloc latency", pm_bench_alloc_latency},
+        {"2/6 churn harness decomposition", pm_bench_churn_overhead},
+        // Right after the decomposition, because it explains that file's rows:
+        // the same three workloads, with the Xtensa counters saying where the
+        // cycles went instead of one guess about it.
+        {"3/6 where the cycles go (perf counters)", pm_bench_perfcount},
+        {"4/6 fragmentation A/B", pm_bench_fragmentation},
+        {"5/6 validate / get_stats scaling", pm_bench_validate_scaling},
         // Last, because it takes g_zone over as a heap region once PondMerge is
         // done with it. See idf_heap_baseline.cpp.
-        {"5/5 baseline: ESP-IDF own heap (TLSF)", pm_bench_idf_heap_baseline},
+        {"6/6 baseline: ESP-IDF own heap (TLSF)", pm_bench_idf_heap_baseline},
     };
     for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]); ++i) {
         std::printf("\n########## %s ##########\n", steps[i].title);
