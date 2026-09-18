@@ -5,7 +5,66 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **On-target benchmark results, and an independent allocator baseline.**
+  `bench/esp32/` runs four benchmarks — alloc latency, a churn-harness
+  decomposition, the fragmentation A/B, and validate/`get_stats` scaling — plus a
+  fifth section that measures ESP-IDF's own allocator over the same region, on
+  the same workload, with the same constants (passed to both from one CMake
+  variable so they cannot drift). The baseline is **TLSF**: IDF v6.0.2 has no
+  heap_4, `components/heap/tlsf/tlsf.c` is the allocator. The first on-target run
+  identified it unprompted by tripping a `tlsf_free` assertion — which was a real
+  bug in the baseline harness (a refused same-size re-allocation left a dangling
+  pointer, and the next visit to that slot double-freed); fixed, and the refusal
+  is now counted and the run flagged.
+
+  Headline: with compaction disabled, PondMerge and TLSF **both fail 50 of 50**
+  large demands in the fragmented state; with compaction triggered on failure,
+  PondMerge fails 1 of 50. The library's core claim is now measured against a
+  mature third-party implementation of the same segregated-fit family rather than
+  only against itself. Cost on the target: one compaction, **7.587 ms**, moving
+  141 objects / 138,856 B (about 18 MB/s on a 240 MHz MCU).
+
+- **`bench/churn_overhead.cpp`**, which decomposes the measured churn pair into
+  allocator cost and harness cost. The churn loop chooses its victim slot with a
+  64-bit LCG and a 64-bit modulo *inside the timed interval*, and on a 32-bit
+  target both are software routines — so before the ~9 us free+alloc measured on
+  the device could be blamed on the allocator, the harness had to be ruled out.
+  Two independent estimates of the allocator's cost agree to 0.4% and index
+  generation accounts for 0.8% of the pair. The benchmark also refuses to quote
+  its own direct `alloc`/`free` rows when the platform's clock is too expensive
+  for them, which is the case on the measurement host and is printed as such.
+
+- **Device acceptance re-verified after the allocator change.** The ESP32-S3
+  build of the acceptance suite runs **1,120,457 checks, 0 failures**, plus 28
+  concurrency checks and 466,859 reference-model checks, and two runs from reset
+  produce identical counts. The suite count moved by exactly **+1** from
+  1,120,456, matching the host suite's +1 for the same reason — R29(5) is a
+  rewritten test carrying one extra assertion — which is an independent check
+  that the two builds are measuring the same code.
+
 ### Fixed
+
+- **The `metadata_bytes` sizing claim was wrong about being platform-independent.**
+  `README.md` published `72 + 476 x POOLS + 98 x OBJ` and stated that it held for
+  host and ESP32 alike. It is an **x86-64** closed form: `ObjectDesc` contains a
+  pointer, so on a 32-bit target it is 52 B rather than 64 B and the per-object
+  term is ~82 B rather than 98 B. Measured on the ESP32-S3 at 256 objects and 16
+  pools: **28,672 B**, against the closed form's 32,776 B. `metadata_bytes`
+  itself is exact on every ABI, and both `README.md` and `docs/USAGE_GUIDE.md` now
+  say to read it at runtime for a RAM budget instead of extrapolating. The device
+  benchmark prints the target ABI's `sizeof` values on every run, which is how
+  this was found.
+
+- **Two host-only statements were being printed unchanged on the device.** The
+  "per-event WORST is not reported, percentiles belong on the device" note is
+  false where the cycle counter is a register read and a per-event figure is
+  legitimate; it is now emitted only where the clock is expensive enough for it to
+  be true, and the opposite case says so instead. Separately, the baseline
+  harness's accounting cross-check compared two readings taken at different
+  moments and so reported a mismatch that meant nothing; both readings are now
+  taken at one instant.
 
 - **The host port was instrumenting itself, at ~15x the cost of the work it was
   measuring.** `pm_port_ticks_us()`, which fills in `compact_time_us` — the
@@ -26,6 +85,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   No test asserted on the value, so only the reported magnitude changes.
 
 ### Changed
+
+- **`bench/esp32/` is reproducible from the repository.** Its generated
+  `sdkconfig` is no longer committed; `sdkconfig.defaults` replaces it and pins
+  the measurement configuration: `-O2` at 240 MHz (a benchmark should not be
+  measured through a debug build), the USB-Serial-JTAG console, a 16 KiB main-task
+  stack, and **the task and interrupt watchdogs off**. A churn interval is a
+  long CPU-bound loop with no blocking call in it, which is exactly what the task
+  watchdog exists to catch, and its output over USB-Serial-JTAG was injecting
+  hundreds of microseconds into the intervals being measured — the first run
+  tripped it three times and every `free`/`alloc` attribution was rejected.
 
 - **Every absolute figure in `bench/RESULTS.md` has been re-measured**, after
   discovering that the timing instrument on the measurement host was broken. A

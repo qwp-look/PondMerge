@@ -30,6 +30,15 @@
 #include <cstdint>
 #include <cstdio>
 
+// The on-target driver supplies ONE scratch region shared by every benchmark
+// (they run one after another on the device, never concurrently), so the three
+// zone arrays do not all have to be resident in a 512 KiB-SRAM part. Naming the
+// driver's object requires external linkage, hence this declaration sits outside
+// the anonymous namespace; host builds keep their own private array.
+#if defined(PM_BENCH_SHARED_ZONE)
+extern uint8_t g_zone[];
+#endif
+
 namespace {
 
 #ifndef PM_BENCH_ZONE_BYTES
@@ -37,6 +46,17 @@ namespace {
 #endif
 #ifndef PM_BENCH_SEGMENT
 #define PM_BENCH_SEGMENT 4096u
+#endif
+#ifndef PM_BENCH_SEGMENTS
+// Segments the benchmark's pool claims; see the note in alloc_latency.cpp.
+#define PM_BENCH_SEGMENTS 64u
+#endif
+#ifndef PM_BENCH_LIVE_MAX
+// Highest live count sampled. It is a parameter and not a constant because the
+// array below lives on the caller's stack: at a 1024-object ceiling it is 8 KiB,
+// which does not fit an ESP-IDF task stack, so the device build lowers it (and
+// must, since PM_MAX_OBJECTS caps it anyway).
+#define PM_BENCH_LIVE_MAX 1024u
 #endif
 // Wall time to aim at per sample point. The probe call tells us the per-call
 // cost, and K is set so that K calls take about this long.
@@ -46,15 +66,20 @@ namespace {
 
 constexpr uint32_t ZONE_BYTES = PM_BENCH_ZONE_BYTES;
 constexpr uint32_t SEGMENT    = PM_BENCH_SEGMENT;
+constexpr uint32_t SEGMENTS   = PM_BENCH_SEGMENTS;
 constexpr uint32_t OBJ_SIZE   = 64u;
-constexpr uint32_t LIVE_MAX   = 1024u;
+constexpr uint32_t LIVE_MAX   = PM_BENCH_LIVE_MAX;
 
 static_assert(ZONE_BYTES / SEGMENT <= PM_MAX_SEGMENTS,
               "the zone needs more segments than PM_MAX_SEGMENTS allows");
+static_assert(SEGMENTS <= ZONE_BYTES / SEGMENT,
+              "the pool cannot claim more segments than the zone contains");
 static_assert(LIVE_MAX <= PM_MAX_OBJECTS,
               "the live count must fit the descriptor table");
 
+#if !defined(PM_BENCH_SHARED_ZONE)
 alignas(16) uint8_t g_zone[ZONE_BYTES];
+#endif
 
 struct Row {
     uint32_t live, blocks;
@@ -66,13 +91,13 @@ struct Row {
 int pm_bench_validate_scaling() {
     pm_bench::report("validate / get_stats scaling against block count");
 
-    pm::Config cfg{g_zone, sizeof(g_zone), SEGMENT};
+    pm::Config cfg{g_zone, ZONE_BYTES, SEGMENT};
     if (pm::init(cfg) != pm::Status::Ok) {
         std::printf("init failed\n");
         return 1;
     }
     pm::PoolId pool{};
-    if (pm::create_pool(pool, 64) != pm::Status::Ok) {
+    if (pm::create_pool(pool, SEGMENTS) != pm::Status::Ok) {
         std::printf("create_pool failed\n");
         return 1;
     }

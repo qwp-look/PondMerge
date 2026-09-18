@@ -1,0 +1,32 @@
+# PondMerge on-target benchmarks (ESP32-S3 N16R8)
+#
+# This project measures rather than verifies, so it is configured differently
+# from esp32/ (the acceptance firmware) on purpose:
+#
+#   * -O2 at 240 MHz, not -Og at 160 MHz. The host figures these runs are
+#     compared against come from a -O2 -DNDEBUG build; a debug measurement would
+#     be dominated by the compiler's choices rather than by the allocator.
+#   * USB-Serial-JTAG console, like the acceptance firmware: the board is reached
+#     through its native USB port, and tests/serial_cap.py drives that port.
+#   * PM_DEBUG=0 is set in main/CMakeLists.txt, not here -- it is a PondMerge
+#     knob, and the acceptance firmware is the build that exercises it =1.
+#   * A 16 KiB main task stack, because validate_scaling.cpp keeps its sample
+#     array (PM_BENCH_LIVE_MAX entries) on the stack and the IDF default of
+#     3584 bytes does not hold it.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_MAIN_TASK_STACK_SIZE=16384
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+# A dedicated benchmark firmware must not be interrupted by the watchdog. A
+# single churn interval is a CPU-bound loop of tens of milliseconds with no
+# blocking call in it, which is precisely what the task WDT is built to notice;
+# its prints leave over USB-Serial-JTAG and inject hundreds of microseconds of
+# jitter into the intervals being measured. The first run of this firmware
+# tripped it three times and the free/alloc attribution was REJECTED for it.
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_ESP_INT_WDT=n

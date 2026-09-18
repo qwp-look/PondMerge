@@ -61,6 +61,15 @@
 #include <cstdint>
 #include <cstdio>
 
+// The on-target driver supplies ONE scratch region shared by every benchmark
+// (they run one after another on the device, never concurrently), so the three
+// zone arrays do not all have to be resident in a 512 KiB-SRAM part. Naming the
+// driver's object requires external linkage, hence this declaration sits outside
+// the anonymous namespace; host builds keep their own private array.
+#if defined(PM_BENCH_SHARED_ZONE)
+extern uint8_t g_zone[];
+#endif
+
 namespace {
 
 #ifndef PM_BENCH_POPULATION
@@ -108,7 +117,9 @@ static_assert(PINNED_EVERY >= 2, "PINNED_EVERY=1 would pin everything");
 const uint32_t kSizes[] = {256, 512, 768, 1024, 1536, 2048};
 constexpr uint32_t kSizeCount = sizeof(kSizes) / sizeof(kSizes[0]);
 
+#if !defined(PM_BENCH_SHARED_ZONE)
 alignas(16) uint8_t g_zone[REGION_BYTES];
+#endif
 
 uint32_t g_rng;
 inline uint32_t rng() {
@@ -324,11 +335,23 @@ void print_report(const Report& r) {
         printf("                               instrument bias) => %.1f us per"
                " compaction\n",
                (double)corrected / (double)r.compactions / 1e3);
-        printf("    (per-event WORST is not reported: one clock read on this"
-               " host has been\n");
-        printf("     measured at 2.7 ms, so a maximum here would be an artefact"
-               " of the clock,\n");
-        printf("     not of the allocator. Percentiles belong on the device.)\n");
+        if (bias > 1000) {
+            printf("    (per-event WORST is not reported: one clock read on this"
+                   " platform has been\n");
+            printf("     measured at %llu ns, so a maximum here would be an"
+                   " artefact of the clock,\n",
+                   (unsigned long long)bias);
+            printf("     not of the allocator. Percentiles belong where the clock"
+                   " is cheap.)\n");
+        } else {
+            // The warning above is platform-specific, so it is emitted only where
+            // it is true. On the device the cycle counter is a register read, and
+            // the corrected figure IS a per-event figure rather than a bound.
+            printf("    (the corrected figure above is per-event, not a bound: the"
+                   " clock costs %llu ns\n", (unsigned long long)bias);
+            printf("     per read here, so a single compaction's own interval is"
+                   " dominated by the\n     compaction.)\n");
+        }
         printf("    last compact moved       : %u objects / %u bytes\n",
                (unsigned)r.moved_objects, (unsigned)r.moved_bytes);
     }

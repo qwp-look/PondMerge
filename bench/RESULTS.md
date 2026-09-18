@@ -9,6 +9,15 @@ a design document.
 -DPM_DEBUG=0`. The host is a VMware guest; see the instrument section — that
 matters more than the CPU does.
 
+**Device:** ESP32-S3 (n16r8), 240 MHz, `-O2`, `PM_DEBUG=0` (Release semantics),
+192 KiB region as 48 x 4 KiB segments, `PM_MAX_OBJECTS=256`, `PM_MAX_POOLS=16`,
+`PM_SL_COUNT=4`. Firmware is `bench/esp32/`, a separate IDF project that compiles
+the **same** benchmark sources as the host build; only the sizing macros differ.
+Section 5 is the device run. The instrument is a different one there, and it says
+so itself: `esp_cpu_get_cycle_count()` costs 59 ns per read against the host's
+9,592 ns, so per-operation timings are usable on the target and are not on the
+host.
+
 **Superseded:** an earlier revision of this file reported numbers produced before
 the instrument problem below was found. Those figures were not wrong in
 direction but their error budget was unknown and in some cases the instrument
@@ -264,28 +273,216 @@ benchmark; pinned is what DMA buffers are.
 
 ---
 
-## 5. What these numbers do not say
+## 5. On the device: ESP32-S3 (n16r8)
 
-- **No device numbers.** Everything here is x86-64; the *shapes* are
-  architecture-independent, the absolute values are not. `bench/esp32/` builds
-  the same sources for the ESP32-S3 (verified: the project configures, compiles
-  and links, `pondmerge_bench.elf` 3.7 MB, DIRAM 204,361 / 341,760 B = 59.8%),
-  but **the board was not attached when the run was attempted**, so nothing was
-  flashed and no console output was captured. This is an outstanding step, not a
-  negative result: the kernel log records
-  `usb 1-2.1: USB disconnect` immediately before the attempt and `lsusb` shows no
-  Espressif device. Three things become possible there that are *not* possible
-  here, which is why it matters: absolute per-operation costs, compaction-window
-  percentiles (`esp_cpu_get_cycle_count()` is a free register read, whereas one
-  clock read here has been seen to take 2.7 ms), and an independent baseline.
-- **No independent allocator baseline yet, on purpose.** The comparison shipped
-  here is compaction on vs off within one allocator — the question that can be
-  answered without a straw man. Comparing against FreeRTOS `heap_4` belongs on
-  the device, using `heap_caps_add_region` to put it in its own pool, not against
-  something written for the occasion.
+The instrument here is not the host's, and `bench_timer.h` switches it at compile
+time:
+
+| | host (x86-64, VMware guest) | device (ESP32-S3) |
+|---|---|---|
+| backend | `std::chrono::steady_clock` | `esp_cpu_get_cycle_count` (`mcycle`) |
+| clock call cost | 9,592 ns | **59 ns** |
+| interval cost | 7,553 ns | **50 ns** |
+| verdict printed | DO NOT QUOTE PER-OPERATION TIMINGS | per-operation timings are usable |
+
+Everything below is therefore a real per-operation measurement, except where a
+row is marked otherwise.
+
+### 5.1 `alloc` + `free` is flat in the live count on the device too
+
+| live | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|
+| pair, ns | 9,252.9 | 9,215.2 | 9,193.0 | 9,183.9 | 9,180.7 |
+
+Over a 16x range of live counts the pair moves by **x0.99**. Plan A's claim — the
+address-ordered insertion walk was the whole cost of `alloc` — transfers to the
+target.
+
+The `free`/`alloc` split rows in this benchmark are all **REJECTED by the
+cross-check**, at every size. That is the host-designed construction failing
+rather than the allocator misbehaving: it divides the difference of two long
+intervals by L, and it correctly refuses to print a figure it cannot support.
+Section 5.2 measures the split directly instead, because on this platform that is
+legitimate.
+
+### 5.2 What the pair actually contains
+
+Why this had to be checked before anything was concluded: ~9 µs for one
+free+alloc is ~2,160 cycles at 240 MHz, which is ~20x more per cycle than the
+host's ~34 ns (~100 cycles at 3.7 GHz). The churn harness picks its victim slot
+with `rng() % g_live` — a 64-bit LCG and a 64-bit modulo, both of which are
+software routines on a 32-bit target and both of which sit *inside the timed
+interval*. Before blaming the allocator, the instrument had to be ruled out.
+
+`bench/churn_overhead.cpp` separates them: row A takes its indices from a
+pre-generated ring (so the address sequence is still random, but its generation
+is outside the interval), row C times the generation alone, and row B is the
+shape `alloc_latency.cpp` uses.
+
+| component | ns/interval | ns/op |
+|---|---|---|
+| D loop + one array load (measurement floor) | 119,562 | 29.2 |
+| C address generation only | 256,129 | 62.5 |
+| A free+alloc, generation EXCLUDED | 36,896,567 | **9,008.0** |
+| B free+alloc, generation INCLUDED | 37,189,637 | 9,079.5 |
+| E alloc only, fill pattern | 1,011,046 | **3,949.4** |
+| F free only, random order | 2,042,016 | **7,976.6** |
+
+```
+allocator cost, generation excluded (A - D) : 8,978.8 ns
+allocator cost, differenced     (B - C)     : 9,017.0 ns
+address generation cost         (C - D)     :    33.3 ns
+generation share of B                       :     0.8 %
+cross-check: the two allocator estimates differ by 38 ns (0%)
+```
+
+**The harness is not the explanation.** Two independent estimates of the
+allocator's cost agree to 0.4%, and index generation accounts for 0.8% of the
+pair. 9.0 µs per free+alloc is the allocator, measured.
+
+Rows E and F are measured directly because on this platform per-operation numbers
+are legitimate (bias 0.195 ns per op). **They are not the additive decomposition
+of the pair:** E runs a fill — an allocation's address is chosen by first fit, so
+a run of allocations necessarily walks up the arena and there is no way to
+allocate "at a random address" — and F runs a full random-order drain. So
+E + F = 11.9 µs against A = 9.0 µs is expected rather than a contradiction. What
+they establish is the scale of each operation on this target: **`alloc` ≈ 3.9 µs
+in a fill, `free` ≈ 8.0 µs in a random-order drain.**
+
+### 5.3 Why ~20x per cycle, when a trivial loop is not
+
+| | host | device | per-cycle ratio |
+|---|---|---|---|
+| loop + one array load | 2.1 ns (~6 cycles at 3.7 GHz) | 29.2 ns (~7 cycles at 240 MHz) | ~1.2x |
+| free + alloc | ~34 ns (~100 cycles) | 9,008 ns (~2,160 cycles) | **~21x** |
+
+A trivial loop costs about the same number of *cycles* on both platforms, so the
+CPU's basic throughput is not the difference. The allocator's operations cost
+~20x more cycles on the target, which points at memory and code access rather
+than at the core: the host keeps the whole working set resident, while the target
+fetches the core's code through the flash cache and walks descriptor and bin
+structures that are wide relative to its cache line.
+
+**This explanation is a hypothesis and is labelled as one.** It is recorded as
+the next thing to investigate, and none of the numbers above depend on it.
+
+### 5.4 Fragmentation, and an independent baseline
+
+Same workload shape and the same constants as section 4, scaled to the region
+(192 KiB, 10 KiB probe). Fairness rules are the section-4 ones, and they come
+from the same CMake variables so the two builds cannot drift.
+
+The baseline is **ESP-IDF's own heap — and it is not heap_4.** IDF v6.0.2 has no
+heap_4 at all; `components/heap/tlsf/tlsf.c` is the allocator, i.e. TLSF. The
+first on-target run of the baseline identified it without being asked, by
+tripping `assert failed: tlsf_free tlsf.c:630 (!block_is_free(block) && "block
+already marked as free")`. That assertion was a real bug in the baseline harness
+(a failed same-size re-allocation used to leave a dangling pointer behind, which
+the next visit to that slot double-freed); it is fixed, and it is also the
+identification. TLSF being the baseline makes the comparison harder rather than
+easier: it is a mature, widely deployed implementation of the same
+segregated-fit family PondMerge belongs to, not something written to lose.
+
+| | filled | live after scatter | Phase 1 | Phase 2 | largest free block (min) |
+|---|---|---|---|---|---|
+| PondMerge, compaction disabled | 191 | 144 | **50 of 50 FAILED** | 2 of 200 | 2,056 B |
+| PondMerge, compaction on failure | 191 | 144 | **1 of 50 failed** | 0 of 200 | 2,056 B |
+| IDF heap (TLSF); no compaction exists | 185 | 139 | **50 of 50 FAILED** | 0 of 199 | 2,048 B |
+
+**This is the headline of section 5.** An independent, mature implementation
+behaves exactly like PondMerge with compaction disabled — 50 of 50 large demands
+fail — and PondMerge's compaction converts that completely unserviceable state
+into a serviceable one. The core value claim of the library is now measured
+against a third-party allocator rather than only against itself.
+
+Both PondMerge variants report structure audit OK and zero churn refusals. Cost
+of the compaction on the device:
+
+```
+compact time : 7.587 ms raw, 7.587 ms corrected (1 x 50 ns bias)
+               => 7,586.8 us per compaction, moving 141 objects / 138,856 B
+```
+
+~18 MB/s of relocation on a 240 MHz MCU, and that is the maintenance window a
+caller has to budget for. It is ~143x the host's 53 µs, consistent with the
+per-cycle effect in section 5.3.
+
+Three honesty notes on this table:
+
+- **The baseline filled 185 objects where PondMerge filled 191** in the same
+  region, because per-allocation overhead differs. The two are not
+  byte-comparable, so the counts are reported rather than normalised away.
+- **The baseline's churn refused one same-size re-allocation** (1 refusal, 199
+  probes), so it carries the `CONFOUNDED` marker and its phase-2 count is not
+  quotable. That is worth more than the count it perturbs: "a same-size
+  re-allocation cannot be refused" is a fairness rule `fragmentation.cpp` relies
+  on, and it held there (0 refusals in both variants) — but it is a property of
+  a particular allocator, not a law. The baseline harness drops the slot on
+  refusal and counts it, which is what turned a double-free abort into a number.
+- **The baseline gets an accounting cross-check in place of `validate()`:**
+  free 61,996 + allocated 131,584 = 193,580 of a 195,072 B region (1,492 B of
+  heap metadata), and the allocator's own largest-free-block reading agrees with
+  the one measured through the API. Getting that check right took two attempts —
+  the first compared readings taken at different moments and reported a mismatch
+  that meant nothing.
+
+### 5.5 `validate` and `get_stats` on the device
+
+| live | blocks | `validate` | per block | `get_stats` |
+|---|---|---|---|---|
+| 64 | 96 | 1,907.9 µs | 19,873.8 ns | 15,253 ns |
+| 128 | 192 | 5,883.3 µs | 30,642.2 ns | 24,586 ns |
+| 256 | 384 | **20,099.9 µs** | 52,343.4 ns | 43,253 ns |
+
+Fitted exponent **1.70** — quadratic confirmed again, on the target.
+
+The negative result transfers with a caveat: `get_stats` costs 43 µs at 384
+blocks (112.6 ns/block), which is still only ~0.04% of a core at 10 Hz, so it is
+**not worth optimising** — but that is 71x the host's per-block cost, not the
+12.5x the clock difference alone would explain. Same effect as section 5.3.
+
+`validate` at 20 ms for 384 blocks is a real constraint for anything that wants
+to call it from a health monitor on an MCU. It is a diagnostic path; this is the
+number that says so.
+
+### 5.6 Metadata sizing does not transfer across pointer widths
+
+| | x86-64 | ESP32-S3 |
+|---|---|---|
+| `sizeof(void*)` | 8 | **4** |
+| `sizeof(ObjectDesc)` | 64 | **52** |
+| `sizeof(Pool)` | 416 | 416 |
+| `sizeof(TlsfBins)` | 364 | 364 |
+| `metadata_bytes`, 256 objects / 16 pools | 32,776 (closed form) | **28,672 measured** |
+| `metadata_bytes`, 1024 objects / 16 pools | 108,040 measured | not measured |
+
+`ObjectDesc` holds a pointer, so the closed form published in `README.md`
+(`72 + 476 x POOLS + 98 x OBJ`) is an **x86-64** form. On the target the
+per-object term is smaller — 52 B of descriptor plus 30 B of plan scratch, i.e.
+82 B per object against 98 B on x86-64. The exact figure for any configuration is
+available on the target as `global_stats().metadata_bytes`, which is what a RAM
+budget should use; the closed form is an illustration, not a contract.
+
+---
+
+## 6. What these numbers do not say
+
+- **One device, one configuration.** Section 5 is a single ESP32-S3 at 240 MHz
+  with a 192 KiB region and 256 objects, on a Release-semantics build
+  (`PM_DEBUG=0`). The shapes should transfer; the absolutes are one part's.
+- **No compaction-window percentiles.** The device clock is free, so the raw
+  material exists, but the run above contains *one* compaction. A percentile
+  needs many events, which needs a workload with many failed probes over a long
+  run. Not measured.
+- **No soak.** The device benchmark firmware is ~25 s end to end, and the
+  acceptance suite was run twice from reset. Nothing here is a multi-hour
+  endurance result, and nothing here is a substitute for one.
+- **Section 5.3's explanation is a hypothesis.** The 20x per-cycle gap is
+  measured; the reason offered for it is not.
 - **Run-to-run spread is ±4%** on the pair metric and larger on anything
   per-event. Differences smaller than that are not meaningful in these tables.
 - **The host's virtualisation changed during this work** (the TSC trap appeared
-  after a guest reboot/resume). Absolute per-event figures taken before and after
-  that change are not comparable, which is a further reason the headline claims
-  rest on counts and on the pair metric rather than on per-event times.
+  after a guest reboot/resume). Absolute per-event host figures taken before and
+  after that change are not comparable, which is a further reason the headline
+  claims rest on counts and on the pair metric rather than on per-event host
+  times.

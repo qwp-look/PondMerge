@@ -12,8 +12,14 @@ Why this exists (task-book v2 section 12.3 wants a reproducible device record):
     and the ELF SHA256.
 
 Usage:
-    python3 serial_cap.py [port] [seconds] [baud]
+    python3 serial_cap.py [port] [seconds] [baud] [stop-marker]
     python3 serial_cap.py /dev/ttyACM0 900 115200
+    python3 serial_cap.py /dev/ttyACM0 600 115200 "=== benchmarks done"
+
+With no stop-marker the capture ends when the acceptance firmware's last verdict
+line appears. Any other firmware -- the benchmark project in bench/esp32, for
+instance -- ends on a different line, so it passes its own marker; the watchdog
+(seconds) is the backstop either way.
 
 Reset polarity gotcha: a NORMAL boot keeps IO0 HIGH (DTR=False) and only pulses
 EN (RTS). Pulling IO0 low enters download mode instead (the log then shows
@@ -28,6 +34,12 @@ import serial
 port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
 seconds = float(sys.argv[2]) if len(sys.argv) > 2 else 900.0
 baud = int(sys.argv[3]) if len(sys.argv) > 3 else 115200
+# Stop condition. The default is the acceptance firmware's own final verdict --
+# and the FAILED spelling counts too, or a failing run would be read to the
+# watchdog instead of ending. A caller that passes its own marker gets exactly
+# that marker and nothing else.
+stop_marker = sys.argv[4].encode() if len(sys.argv) > 4 else b"=== model PASSED"
+stop_also = None if len(sys.argv) > 4 else b"=== model FAILED"
 
 s = serial.Serial(port, baud, timeout=0.2)
 
@@ -83,7 +95,7 @@ while time.time() - t0 < seconds:
         buf += chunk
         sys.stdout.write(chunk.decode("utf-8", "replace"))
         sys.stdout.flush()
-        if b"=== model PASSED" in buf or b"=== model FAILED" in buf:
+        if stop_marker in buf or (stop_also is not None and stop_also in buf):
             break
 time.sleep(0.3)
 s.close()
@@ -92,7 +104,8 @@ sys.stdout.write(
     "\n[serial_cap] %u bytes captured in %.1fs (%u bytes discarded before reset)\n"
     % (len(buf), time.time() - t0, discard)
 )
-if b"=== model PASSED" not in buf and b"=== model FAILED" not in buf:
+if stop_marker not in buf and not (stop_also is not None and stop_also in buf):
     sys.stdout.write(
-        "[serial_cap] WARNING: no model verdict found in the capture\n")
+        "[serial_cap] WARNING: stop marker %r never appeared in the capture\n"
+        % (stop_marker.decode("utf-8", "replace"),))
     sys.exit(1)

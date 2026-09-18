@@ -1,6 +1,8 @@
 build/
 esp32/build/
+bench/esp32/build/
 esp32/sdkconfig
+bench/esp32/sdkconfig
 esp32/sdkconfig.old
 esp32/dependencies.lock
 *.o

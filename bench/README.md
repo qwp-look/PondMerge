@@ -1,12 +1,18 @@
 # bench/ — 性能与碎片基准
 
-三个可复现基准，用来把"性能/复杂度能不能优化"从猜想题变成工程题。
-**所有数字都必须在目标平台上实测后才能对外引用**；Host 数据只能说明形状
-（线性/二次/常数），不能外推绝对值。完整实测结果见 `RESULTS.md`。
+四个可复现基准，用来把"性能/复杂度能不能优化"从猜想题变成工程题，外加一个
+**设备专属**的独立分配器基线（见 §4 末）。**所有数字都必须在目标平台上实测后
+才能对外引用**；Host 数据只能说明形状（线性/二次/常数），不能外推绝对值。
+完整实测结果见 `RESULTS.md`（§5 是设备端）。
 
 ---
 
 ## 0. 先读这个：计时仪器（`bench_timer.h`）
+
+**仪器是分平台的，并且每次运行自报**。主机上 `std::chrono::steady_clock::now()`
+每次调用要 ~9,400 ns；设备上 `esp_cpu_get_cycle_count()`（`mcycle` 寄存器）只要
+**59 ns**。同一份基准源码因此在不同平台上处于完全不同的可信区间：主机只能说
+"批量值"，设备上逐次值本身可用。任何数字都必须和它的仪器一起引用。
 
 **探针主机上的 `std::chrono::steady_clock::now()` 每次调用要 ~9,400 ns**，
 而被测操作只要 36–90 ns。原因是该 VMware 客机的 `RDTSC` 被拦截：时间戳
@@ -89,7 +95,44 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
 -DPM_BENCH_ZONE_BYTES=8388608 -DPM_BENCH_SEGMENT=131072
 ```
 
-## 2. `validate_scaling.cpp` — 结构审计的成本标度
+## 2. `churn_overhead.cpp` — 一对操作里有多少是分配器
+
+**问题**：`alloc_latency.cpp` 的 `pair` 指标把"挑受害者槽位"的成本也算进了区间。
+在 x86-64 上那是几个 ns，可以忽略；在 32 位目标上不行——`rng()` 是 64 位 LCG、
+`% g_live` 是 64 位取模，两者在 Xtensa 上都是软件例程，而且就压在计时区间**内部**。
+设备端 `pair` 一度给出 9.2 µs/对（≈2,160 周期），在怪罪分配器之前必须先排除仪器。
+**先测量嫌疑对象，不要先假设。**
+
+**方法**：五行长区间，每行只与另一行差一件事——
+
+| 行 | 区间内含 |
+|---|---|
+| D | 循环 + 一次数组读取（测量下限） |
+| C | 只有地址生成（`rng() % LIVE`），不含任何库调用 |
+| A | `free`+`alloc`，地址生成**在区间外**（索引取自预生成的环形表） |
+| B | `free`+`alloc`，地址生成**在区间内**（即 `alloc_latency` 的形态） |
+| E / F | 只有 `alloc`（填充形态）/ 只有 `free`（随机序） |
+
+于是 `A − D` 与 `B − C` 是同一物理量的两个**独立**估计，它们的吻合是对整个
+构造的交叉验证，而不是同一式的移项。环形表由**同一个**发生器在区间外预生成，
+所以 A 行的地址序列仍是真随机序列，只是它的生成被移出了测量窗口。
+
+**E/F 的形态局限必须说清**：分配的地址由首次适配决定，所以"随机地址分配"不存在，
+E 只能测**填充形态**（恰好对地址序结构最有利）；F 则用预生成的随机排列释放。
+因此 **E + F ≠ A 是预期的**，它们各自给出该目标上单个操作的数量级，而不是 A 的
+加性分解。
+
+**该行是否可用是自报的**：会打印每操作的仪器偏置，并在偏置高于操作本身时直接
+警告"低于噪声底，勿引用"（主机上就会触发；设备上 50 ns/区间 ⇒ 0.2 ns/op，可用）。
+
+```sh
+g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
+    bench/churn_overhead.cpp src/core.cpp -o build/bench_churn
+./build/bench_churn
+# 调参：-DPM_BENCH_CHURN_LIVE / -DPM_BENCH_CHURN_OPS / -DPM_BENCH_IDX_RING
+```
+
+## 3. `validate_scaling.cpp` — 结构审计的成本标度
 
 **问题**：`validate` 声明的边界是 O((live + free)²)。真二次吗？`get_stats` 值不值得优化？
 
@@ -106,7 +149,7 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
 实测：`validate` 拟合指数 **1.83（二次）**；`get_stats` 指数 1.17（线性）、
 1.75 ns/块、最大规模 2.7 µs ⇒ **负结果：不值得优化**。
 
-## 3. `fragmentation.cpp` — 碎片治理到底有没有用
+## 4. `fragmentation.cpp` — 碎片治理到底有没有用
 
 本目录的**核心实验**，回答项目最根本的价值主张。
 
@@ -161,24 +204,82 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
 #   -DPM_BENCH_POPULATION / -DPM_BENCH_PROBE_BYTES / -DPM_BENCH_STEPS / -DPM_BENCH_PROBE_EVERY
 ```
 
-### `esp32/` — 设备端工程与独立基线
+### `esp32/` — 设备端工程、独立基线，以及三个必须知道的坑
 
 `bench/esp32/` 是一个**独立于验收固件**的 IDF 工程，编译**同一份**基准源码
-（`PM_BENCH_NO_HOST_MAIN=1` 去掉 host 的 `main()`，由 `app_main` 调用），
-所以设备数字与主机数字来自同一份代码。设备端配置显著缩小（128 KiB zone /
-256 对象）。
+（`PM_BENCH_NO_HOST_MAIN=1` 去掉各文件的 host `main()`，由 `app_main` 调用），
+所以设备数字与主机数字来自同一份代码，差异只有 sizing 宏。
 
-设备端的价值不在"重复主机结论"，而在三件主机做不到的事：
+**四个基准共用一块 192 KiB region。** 512 KiB SRAM 装不下四块独立区域，所以
+`PM_BENCH_SHARED_ZONE=1` 让各基准把 region 声明为 `extern`，由 `bench_main.cpp`
+定义；region 大小与各基准的 `PM_BENCH_*_BYTES` 来自**同一个 CMake 变量**，因此
+不可能各自漂移。region 只在同一时刻被一个基准使用，且第五步（基线）在
+PondMerge 用完之后接管它。
 
-1. **绝对值**。主机是 x86-64，绝对值不可外推。
-2. **逐次计时与百分位**。ESP32 的 `esp_cpu_get_cycle_count()`（mcycle 寄存器）
-   是免费的，`bench_timer.h` 在该平台上自动切换到它——主机上做不到的
-   compact 窗口 p50/p99 在这里可以测。
-3. **独立基线**。用 `heap_caps_add_region` 给 FreeRTOS `heap_4`（ESP-IDF 默认
-   分配器）划一块等大专用区域做真正的第三方对照，而不是自制品。
+**设备端的价值不在"重复主机结论"**，而在三件主机做不到的事：
 
-串口必须用**从不停止读取**的读端（`tests/serial_cap.py`）：USB-Serial-JTAG
-控制台的发送队列一满，`printf` 就会阻塞，看起来像"测试卡死"。
+1. **绝对值**。主机是 x86-64，绝对值不可外推（见 `RESULTS.md` §5.3：每周期成本
+   在设备上高约 20 倍，而一个平凡循环的周期数两边相同）。
+2. **逐次计时**。`esp_cpu_get_cycle_count()`（mcycle 寄存器）每次读取 59 ns，
+   `bench_timer.h` 在该平台自动切换，所以主机上必须靠差分的 `free`/`alloc` 拆分
+   在这里可以**直接测**（`churn_overhead.cpp` 的 E/F 行）。
+3. **独立基线**（见下）。
+
+#### 坑 1：`pm::init` 是"每实例一次"，而基准假设自己是独立进程
+
+四个基准各自 `init()`、**都不 `deinit()`**——在主机上每个基准是一个独立进程，
+这是对的；串在同一个 `app_main` 里就不是了。而 `deinit()` 在**还有存活对象时
+会拒绝**（返回 `BUSY` 且保持已初始化），于是"某个基准忘了清理"会立刻表现为
+下一个基准的 `init failed`，而不是一份悄悄错误的测量。
+**这不是假设：本文件第一、二版运行就是这样**（2/5 之后 3/5、4/5 全部
+`init failed`，fragmentation 报出 0 次需求）。
+
+#### 坑 2：任务看门狗会把测量打碎
+
+一次 churn 区间是几十毫秒的纯 CPU 循环、中途没有任何阻塞调用——正是任务看门狗
+要抓的形态。它打印的日志走 USB-Serial-JTAG，会给正在测量的区间注入数百微秒抖动。
+首版运行触发了 3 次，`free`/`alloc` 拆分全部被交叉校验判为 `REJECTED`。
+`bench/esp32/sdkconfig.defaults` 因此显式关闭任务看门狗与中断看门狗：这是专用
+基准固件，不是产品固件。
+
+#### 坑 3：串口读端必须从不停读
+
+USB-Serial-JTAG 控制台的发送队列一满，`printf` 就会阻塞，看起来像"测试卡死"。
+用 `tests/serial_cap.py`（它自己复位芯片，因此日志从 ROM banner 开始，含
+`App version`，可与提交对账），并给它一个停止标记：
+
+```sh
+python3 tests/serial_cap.py /dev/ttyACM0 600 115200 "=== benchmarks done"
+```
+
+不给标记时按验收固件的最后裁决行（`=== model PASSED/FAILED`）结束。
+
+#### 独立基线：是 TLSF，不是 heap_4
+
+`bench/esp32/main/idf_heap_baseline.cpp`（**仅设备端**——主机上没有第三方分配器
+可做对照）。用 `heap_caps_add_region_with_caps()` 把同一块 g_zone 注册成一个带
+**自定义能力位**的堆，然后用**同一份负载形状与同一组常数**跑同样两段需求。
+
+三点必须写明：
+
+- **IDF v6.0.2 里没有 heap_4**：`components/heap/tlsf/tlsf.c` 才是它的分配器，
+  即 TLSF。本文件第一版运行由 `assert failed: tlsf_free tlsf.c:630` 自己招认了
+  这件事（那个断言是基线夹具里的真实 bug，已修）。**TLSF 是同一 segregated-fit
+  家族的成熟生产实现**，所以这个对照比"heap_4"更有分量，不是更少。
+- **公平性与 `fragmentation.cpp` 同源**：两侧的常数由 CMake 从同一处下发，防止
+  漂移。但**"同尺寸重分配不可能被拒绝"是某个分配器的性质，不是定律**——TLSF
+  在本次负载下拒绝了 1 次，基线因此被标 `CONFOUNDED`。基线夹具在拒绝时把该槽位
+  移出追踪集合并计数，这才把一个双重释放崩溃变成了一个数字。
+- **它拿不到 `validate()` 的等价物**，改用 `heap_caps_get_info()` 做归账交叉核对：
+  free + allocated 应与注册区间相符，且分配器自报的最大空闲块应与经 API 测得的
+  一致。这个核对做了两次才对——第一版比较的是两个**不同时刻**的读数，报出了
+  一个毫无意义的 MISMATCH。
+
+#### 顺带：sizing 报告
+
+`bench_main.cpp` 启动时打印**目标 ABI** 的 `sizeof(ObjectDesc/Pool/TlsfBins/
+GlobalState)` 与元数据三项分解。这就是发现 `README.md` 那条闭式公式是 x86-64
+专属的地方：`ObjectDesc` 含一个指针，32 位目标上 52 B 而非 64 B。
 
 ---
 
@@ -188,7 +289,11 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
 - **计时仪器及其单次成本**（本目录任何数字都依赖这一项）
 - 编译期配置（`PM_MAX_OBJECTS`、`PM_SL_COUNT`、`PM_FL_MAX`、zone 大小）
 - 基准的参数（population / probe / steps / churn 区间长度）
-- 若是 `fragmentation.cpp`：`churn_refusals` 是否为 0
+- 若是 `fragmentation.cpp`：**两个变体的** `churn_refusals` 是否为 0
+- 若是独立基线：它是 TLSF 且**本次拒绝过同尺寸重分配**（标记 `CONFOUNDED`），
+  以及填充对象数与 PondMerge 不同（per-allocation 开销不同 ⇒ 不可按字节对比）
+- 若是设备端：`PM_DEBUG`（基准固件为 0，验收固件为 1）、看门狗已关闭、
+  使用的是共享 region 中的哪一块
 - 若是逐次计时：**已减去的偏置值**及其不确定性
 
 **负结果同样要保留。** 实测排除掉的候选（`PM_SL_COUNT` 调大、`get_stats` 优化）

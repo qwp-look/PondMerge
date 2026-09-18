@@ -64,6 +64,15 @@
 #include <cstdint>
 #include <cstdio>
 
+// The on-target driver supplies ONE scratch region that every benchmark shares.
+// The device runs them one after another, never at the same time, so the three
+// zone arrays do not all have to be resident in a 512 KiB-SRAM part. Naming the
+// driver's object requires external linkage, so this declaration sits OUTSIDE
+// the anonymous namespace below; host builds keep their own private array.
+#if defined(PM_BENCH_SHARED_ZONE)
+extern uint8_t g_zone[];
+#endif
+
 namespace {
 
 #ifndef PM_BENCH_ZONE_BYTES
@@ -71,6 +80,13 @@ namespace {
 #endif
 #ifndef PM_BENCH_SEGMENT
 #define PM_BENCH_SEGMENT 4096u
+#endif
+#ifndef PM_BENCH_SEGMENTS
+// Segments the benchmark's pool claims. It defaults to what the host zone holds
+// (256 KiB / 4 KiB) and is a caller-supplied number rather than a derived one,
+// so that shrinking the zone without shrinking the claim is a build failure
+// instead of a silent change in pool geometry.
+#define PM_BENCH_SEGMENTS 64u
 #endif
 #ifndef PM_BENCH_TARGET_LIVE
 #define PM_BENCH_TARGET_LIVE 1024u
@@ -81,6 +97,7 @@ namespace {
 
 constexpr uint32_t ZONE_BYTES  = PM_BENCH_ZONE_BYTES;
 constexpr uint32_t SEGMENT     = PM_BENCH_SEGMENT;
+constexpr uint32_t SEGMENTS    = PM_BENCH_SEGMENTS;
 constexpr uint32_t TARGET_LIVE = PM_BENCH_TARGET_LIVE;
 constexpr uint32_t CHURN_PAIRS = PM_BENCH_CHURN_PAIRS;
 
@@ -88,9 +105,13 @@ static_assert(TARGET_LIVE <= PM_MAX_OBJECTS,
               "target live count must fit the descriptor table");
 static_assert(ZONE_BYTES / SEGMENT <= PM_MAX_SEGMENTS,
               "the zone needs more segments than PM_MAX_SEGMENTS allows");
+static_assert(SEGMENTS <= ZONE_BYTES / SEGMENT,
+              "the pool cannot claim more segments than the zone contains");
 static_assert(TARGET_LIVE >= 16, "need room for at least one sample point");
 
+#if !defined(PM_BENCH_SHARED_ZONE)
 alignas(16) uint8_t g_zone[ZONE_BYTES];
+#endif
 
 const uint32_t kSizes[] = {32, 48, 64, 96, 128, 192, 256};
 constexpr uint32_t kSizeCount = sizeof(kSizes) / sizeof(kSizes[0]);
@@ -326,17 +347,17 @@ Row sample(uint32_t L) {
 int pm_bench_alloc_latency() {
     pm_bench::report("alloc latency: pair / free / alloc against live count");
 
-    pm::Config cfg{g_zone, sizeof(g_zone), SEGMENT};
+    pm::Config cfg{g_zone, ZONE_BYTES, SEGMENT};
     if (pm::init(cfg) != pm::Status::Ok) {
         std::printf("init failed\n");
         return 1;
     }
-    if (pm::create_pool(g_pool, 64) != pm::Status::Ok) {
+    if (pm::create_pool(g_pool, SEGMENTS) != pm::Status::Ok) {
         std::printf("create_pool failed\n");
         return 1;
     }
-    std::printf("zone %u B  target live %u  metadata_bytes %u\n",
-                (unsigned)ZONE_BYTES, (unsigned)TARGET_LIVE,
+    std::printf("zone %u B  segments %u  target live %u  metadata_bytes %u\n",
+                (unsigned)ZONE_BYTES, (unsigned)SEGMENTS, (unsigned)TARGET_LIVE,
                 (unsigned)pm::global_stats().metadata_bytes);
     std::printf("pair: churn interval of %u pairs, measured directly.\n"
                 "free/alloc: differentials of three long intervals"

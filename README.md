@@ -86,7 +86,19 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 
                  Debug 构建再加 9 字节（advice owner 门控：上下文 id + 标志）
 ```
 
-实测值（`metadata_bytes` 与链接器看到的真实 `.bss` 对照）：
+**这条闭式公式是 x86-64 的，不能照搬到 32 位目标。** `ObjectDesc` 里有一个
+指针，所以在 ESP32-S3 上它是 52 B 而不是 64 B，系数量级因此不同：目标上每对象
+约 **82 B**（52 描述符 + 30 计划 scratch），而不是 98 B。实测过的设备配置：
+
+| 平台 | `PM_MAX_OBJECTS` | `PM_MAX_POOLS` | `metadata_bytes` |
+|---|---|---|---|
+| x86-64 | 256 | 16 | 32,776（闭式） |
+| **ESP32-S3（32 位）** | **256** | **16** | **28,672（实测）** |
+| x86-64 | 1024 | 16 | 108,040（实测） |
+
+**要算 RAM 预算就用运行时的 `global_stats().metadata_bytes`**，它对任何 ABI 都是
+精确值；闭式公式只是图示，不是契约。下表是 x86-64 的实测值（`metadata_bytes` 与
+链接器看到的真实 `.bss` 对照）：
 
 | `PM_MAX_OBJECTS` | `PM_MAX_POOLS` | `metadata_bytes` | 真实 `.bss` | 适用 |
 |---|---|---|---|---|
@@ -100,11 +112,14 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 
 读法：
 
 - **默认 1024/16 约吃掉 105 KiB 静态 RAM。** 多数 MCU 承受不起，务必下调。
-  在 ESP-IDF 里把 `PM_MAX_OBJECTS` 设为 256 可降至约 31 KiB。
+  在 ESP-IDF 里把 `PM_MAX_OBJECTS` 设为 256 可降至 **28.7 KiB（实测）**。
 - `metadata_bytes` 已与真实 `.bss` 吻合到 ±8 字节；两者差异只来自对齐填充。
   **预算时仍留一点余量。**
 - 该字段在 v1.0.0 之前**漏计了整理建议缓存**（随 `PM_MAX_POOLS` 增长，实测少报
   128 B @2 pools 到 960 B @16 pools），现已计入，并以上表代替原来的口头描述。
+- 上表第 4 行的 x86-64 值 32,776 是闭式公式算出的；**同一配置在设备上实测为
+  28,672**，差 4,104 B 全部来自指针宽度。这条差异写在这里，是因为早先的本表
+  声称"Host/ESP32 同"——那是错的。
 
 ## 关键语义
 
