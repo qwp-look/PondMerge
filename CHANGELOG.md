@@ -5,19 +5,57 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **The host port was instrumenting itself, at ~15x the cost of the work it was
+  measuring.** `pm_port_ticks_us()`, which fills in `compact_time_us` — the
+  library's only performance statistic — was implemented with `clock()`, i.e.
+  `CLOCK_PROCESS_CPUTIME_ID`. On glibc that is a real syscall, measured at
+  **20.9 us per call**, and `compact()` calls it twice. That added ~42 us of
+  self-measurement to every compaction, against 2.8 us for the 184 KB copy it
+  actually performs. It also made `compact_time_us` a *CPU-time* figure, so a
+  maintenance window that was preempted was under-reported and could not be
+  compared with any wall-clock budget.
+
+  The host branch now uses `CLOCK_MONOTONIC`, which is the right quantity for a
+  maintenance window and an order of magnitude cheaper. Measured effect: the
+  fragmentation benchmark's compaction falls from 80 us to 61 us of raw wall
+  time purely from removing the library's own clock reads. The ESP32 branch is
+  unchanged — `esp_timer_get_time()` was already correct and is not a syscall.
+
+  No test asserted on the value, so only the reported magnitude changes.
+
 ### Changed
+
+- **Every absolute figure in `bench/RESULTS.md` has been re-measured**, after
+  discovering that the timing instrument on the measurement host was broken. A
+  VMware guest with a trapped `RDTSC` makes
+  `std::chrono::steady_clock::now()` cost ~9,400 ns against operations of 36-90
+  ns: the instrument was 100-250x the thing it measured, and the resulting
+  numbers looked plausible while being dominated by the clock. The *shapes* of
+  every conclusion survived; the absolute values did not.
+
+  `bench/bench_timer.h` now enforces the rule that replaces per-operation timing:
+  an interval contains N operations between two clock reads, so the instrument
+  contributes `2 * call_cost / N` instead of `2 * call_cost`; every benchmark
+  self-reports its backend, the measured clock cost and whether per-operation
+  figures are supportable; and no benchmark emits a per-operation timing unless
+  the operation is far longer than the clock, in which case the bias is stated.
+  This is machine-independent, so the same sources give valid numbers on a host,
+  in a VM and on the device.
 
 - **`alloc` is no longer linear in the live-object count.** It used to insert
   each new descriptor into an address-ordered list, and that insertion measured
-  as essentially 100% of alloc's cost, growing linearly with the live count
-  (232 ns at 256 objects, 799 ns at 1024). Address order is needed only by the
+  as essentially 100% of alloc's cost, growing linearly with the live count.
+  Re-measured A/B with the same benchmark source compiled against both core
+  revisions: **844.2 ns before, 38.4 ns after**, at 1024 live objects (22x);
+  58.0 ns to 38.0 ns at 16 live objects. Address order is needed only by the
   maintenance paths, so it is now re-established once per maintenance call on
   the cold path: alloc does an O(1) append, and `collect_live_sorted()` performs
-  a bounded collection plus an in-place heapsort. Measured after the change:
-  alloc is ~86-88 ns during fill and **37.6 ns steady state at 1024 objects**,
-  with **no dependence on the live count** (see `bench/RESULTS.md`). `free` and
-  `validate` show no regression, and the fragmentation benchmark's A/B results
-  are byte-identical, so only the cost moved, not the behaviour.
+  a bounded collection plus an in-place heapsort. With `PM_MAX_OBJECTS=256` the
+  pair cost is 36.7 ns and equally flat. `free` and `validate` show no
+  regression, and the fragmentation benchmark's A/B results are identical, so
+  only the cost moved, not the behaviour.
 
   The honest complexity statement changes accordingly: `alloc` is now
   O(bin chain length) rather than O(bin chain length + live objects);
@@ -37,6 +75,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   (`bench/RESULTS.md`), so that statements about performance are measurements
   rather than guesses: alloc latency against live count, `validate` / `get_stats`
   scaling, and a fragmentation A/B (compaction on vs off, same allocator).
+- `bench/bench_timer.h`, the shared measurement instrument. It batches, it
+  self-reports, and it refuses to emit per-operation timings the host cannot
+  support. On the device it switches to `esp_cpu_get_cycle_count()` (mcycle),
+  which is a free register read — per-operation timing and percentiles are
+  available there and are not available here. It deliberately avoids
+  `__uint128_t`, which the Xtensa toolchain does not have.
+- `bench/esp32/`, an ESP-IDF project that builds **the same** benchmark sources
+  for the ESP32-S3, separate from the acceptance firmware so that measuring never
+  disturbs the acceptance build. **Verified to configure, compile and link**
+  (elf 3.7 MB, DIRAM 204,361 / 341,760 B = 59.8%). It has **not** been run on
+  hardware: the board was disconnected when the attempt was made (kernel log
+  `usb 1-2.1: USB disconnect`; `lsusb` shows no Espressif device). No device
+  numbers exist yet, and none are claimed.
 - `tests/consumer_smoke.sh`, an end-to-end proof of the install + `find_package`
   consumption path.
 - `tests/run_host.sh --coverage`: line and branch coverage of the core over the

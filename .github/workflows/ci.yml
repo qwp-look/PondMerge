@@ -104,3 +104,48 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build, install, then consume via find_package
         run: tests/consumer_smoke.sh
+
+  benchmarks:
+    name: benchmarks build and run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # bench/ is not part of the library, but it is where every performance
+      # claim in the README and the docs comes from, and a benchmark that no
+      # longer compiles or no longer runs is a claim that quietly stops being
+      # true. This job is a correctness gate, not a performance gate: runners
+      # are shared and noisy, so no threshold is asserted on any timing. What it
+      # does check is that all three benchmarks compile clean under -Werror, run
+      # to completion, and pass their own internal consistency check.
+      - name: Build (host, Release, -Werror)
+        run: |
+          set -e
+          F="-std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra -Wno-unused-parameter -Werror -Iinclude -Isrc"
+          mkdir -p build/bench
+          for b in alloc_latency validate_scaling fragmentation; do
+            g++ $F bench/$b.cpp src/core.cpp -o build/bench/$b
+          done
+      - name: Run, and require each benchmark to report a consistent structure
+        run: |
+          set -e
+          ./build/bench/alloc_latency  | tee build/bench/alloc.log
+          ./build/bench/validate_scaling | tee build/bench/validate.log
+          ./build/bench/fragmentation | tee build/bench/frag.log
+          # The fragmentation benchmark's own audit must pass in both variants,
+          # and neither run may be confounded.
+          ok_count=$(grep -cE "structure audit +: OK" build/bench/frag.log)
+          test "$ok_count" = "2" || { echo "expected 2 clean audits, got $ok_count"; exit 1; }
+          if grep -q "CONFOUNDED" build/bench/frag.log; then
+            echo "fragmentation run was confounded"; exit 1
+          fi
+          # alloc_latency validates the pool after the run.
+          grep -qE "^validate: OK$" build/bench/alloc.log
+          # validate_scaling must actually have measured something.
+          grep -q "fitted exponent" build/bench/validate.log
+      - name: Upload raw benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-logs
+          path: build/bench/*.log
+          if-no-files-found: warn

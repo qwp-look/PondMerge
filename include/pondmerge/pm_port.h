@@ -19,12 +19,33 @@ static inline uintptr_t pm_port_context_id(void) {
     return (uintptr_t)xTaskGetCurrentTaskHandle();
 }
 #else
-#include <ctime>
 #include <pthread.h>
+#include <time.h>
 #define PM_LOCK()   ((void)0)
 #define PM_UNLOCK() ((void)0)
+// Host tick source: WALL time in microseconds.
+//
+// This used to be clock(), i.e. CLOCK_PROCESS_CPUTIME_ID. Two problems, both
+// measured rather than assumed:
+//
+//  1. Cost. On glibc clock() is a real syscall: 20.9 us per call on the x86-64
+//     reference host. compact() calls this twice, so the library's own
+//     maintenance-window statistic was adding ~42 us to every compaction --
+//     about 15x the cost of the memory it actually moved (the 184 KB workload
+//     behind it copies in 2.8 us; see bench/RESULTS.md). The instrumentation
+//     dominated the thing it was instrumenting.
+//  2. Semantics. clock() reports CPU time consumed by the process, not elapsed
+//     time, so compact_time_us under-reported any maintenance window that was
+//     preempted and could not be compared against a wall-clock budget. A
+//     "maintenance window statistic" is a wall-clock quantity.
+//
+// CLOCK_MONOTONIC is the right quantity and an order of magnitude cheaper. The
+// ESP32 branch is untouched: esp_timer_get_time() is already the correct
+// wall-clock source there, and is a register read rather than a syscall.
 static inline uint64_t pm_port_ticks_us() {
-    return (uint64_t)((double)clock() * 1000000.0 / CLOCKS_PER_SEC);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
 // Host: the POSIX thread id (glibc >= 2.34 keeps pthread_self in libc, so no
 // extra link flags are needed for the tests/demo).

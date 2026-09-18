@@ -55,9 +55,9 @@
 //   g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc bench/fragmentation.cpp src/core.cpp -o build/bench_frag
 //   ./build/bench_frag
 
+#include "bench_timer.h"
 #include "pondmerge/pondmerge.hpp"
 
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 
@@ -81,11 +81,14 @@ namespace {
 #ifndef PM_BENCH_SCATTER_MOD
 #define PM_BENCH_SCATTER_MOD 4u     // release every Nth movable object
 #endif
+#ifndef PM_BENCH_REGION_BYTES
+#define PM_BENCH_REGION_BYTES (256u * 1024u)
+#endif
 #ifndef PM_BENCH_PHASE1_TRIALS
 #define PM_BENCH_PHASE1_TRIALS 50u  // back-to-back demands, no churn between
 #endif
 
-constexpr uint32_t REGION_BYTES  = 256u * 1024u;
+constexpr uint32_t REGION_BYTES  = PM_BENCH_REGION_BYTES;
 constexpr uint32_t SEGMENT       = 4096u;
 constexpr uint32_t POPULATION    = PM_BENCH_POPULATION;
 constexpr uint32_t STEPS         = PM_BENCH_STEPS;
@@ -115,12 +118,13 @@ inline uint32_t rng() {
     return g_rng;
 }
 
-using clock_t_ = std::chrono::steady_clock;
-inline uint64_t now_ns() {
-    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-               clock_t_::now().time_since_epoch())
-        .count();
-}
+// The instrument is bench/bench_timer.h. Every interval timed below carries a
+// constant bias on a host whose clock is trapped, so per-event figures are
+// annotated with it (compaction timing) or batched away entirely. The headline
+// results here -- how many large demands fail, and how large the largest free
+// block is -- do not involve the clock at all, which is deliberate: the finding
+// this benchmark exists to establish must not depend on the instrument.
+inline uint64_t now_ns() { return pm_bench::now_ns(); }
 
 struct Report {
     const char* name = "";
@@ -138,8 +142,7 @@ struct Report {
     uint32_t p2_rescued = 0;
     uint32_t compactions = 0;
     uint32_t compact_refused = 0;
-    uint64_t compact_ns_total = 0;
-    uint64_t compact_ns_worst = 0;
+    uint64_t compact_ns_total = 0; // RAW, bias-inclusive; corrected in print
     uint32_t min_largest = 0xFFFFFFFFu;
     uint32_t final_largest = 0;
     uint32_t moved_objects = 0;
@@ -232,7 +235,6 @@ Report run_pondmerge(const char* name, bool compact_on_failure) {
         }
         r.compactions++;
         r.compact_ns_total += dt;
-        if (dt > r.compact_ns_worst) r.compact_ns_worst = dt;
 
         pm::RawRef again{};
         if (pm::alloc(pool, PROBE_BYTES, 8, pm::PM_MOVABLE, 0xFFFFu, again)
@@ -307,9 +309,26 @@ void print_report(const Report& r) {
     printf("    compactions              : %u ok, %u refused\n",
            (unsigned)r.compactions, (unsigned)r.compact_refused);
     if (r.compactions) {
-        printf("    compact time total       : %.3f ms (worst %.3f ms)\n",
-               (double)r.compact_ns_total / 1e6,
-               (double)r.compact_ns_worst / 1e6);
+        // Each compact() was timed as its own interval, so each carries one
+        // instrument bias. Report the raw figure, the bias, and the corrected
+        // figure together -- a per-event time on a host like this is only
+        // meaningful with its error budget attached.
+        uint64_t const bias = pm_bench::interval_cost_ns();
+        uint64_t const total_bias = bias * r.compactions;
+        uint64_t const corrected =
+            r.compact_ns_total > total_bias ? r.compact_ns_total - total_bias : 0;
+        printf("    compact time             : %.3f ms raw, %.3f ms corrected"
+               " (subtracted %u x %llu ns\n",
+               (double)r.compact_ns_total / 1e6, (double)corrected / 1e6,
+               (unsigned)r.compactions, (unsigned long long)bias);
+        printf("                               instrument bias) => %.1f us per"
+               " compaction\n",
+               (double)corrected / (double)r.compactions / 1e3);
+        printf("    (per-event WORST is not reported: one clock read on this"
+               " host has been\n");
+        printf("     measured at 2.7 ms, so a maximum here would be an artefact"
+               " of the clock,\n");
+        printf("     not of the allocator. Percentiles belong on the device.)\n");
         printf("    last compact moved       : %u objects / %u bytes\n",
                (unsigned)r.moved_objects, (unsigned)r.moved_bytes);
     }
@@ -324,7 +343,10 @@ void print_report(const Report& r) {
 
 } // namespace
 
-int main() {
+// Entry point shared by the host and the on-target build; the target build
+// defines PM_BENCH_NO_HOST_MAIN and calls this from app_main.
+int pm_bench_fragmentation() {
+    pm_bench::report("fragmentation A/B (compaction off vs on, same allocator)");
     printf("PondMerge fragmentation benchmark\n");
     printf("region=%u B segment=%u population<=%u steps=%u probe=%u B/%u steps\n",
            (unsigned)REGION_BYTES, (unsigned)SEGMENT, (unsigned)POPULATION,
@@ -357,10 +379,16 @@ int main() {
     printf("  smallest largest-free-block seen: A=%u B=%u bytes\n",
            (unsigned)a.min_largest, (unsigned)b.min_largest);
     if (b.compactions) {
-        printf("  cost: %u compactions, %.3f ms total, avg %.1f us, worst %.3f ms\n",
-               (unsigned)b.compactions, (double)b.compact_ns_total / 1e6,
-               (double)b.compact_ns_total / (double)b.compactions / 1e3,
-               (double)b.compact_ns_worst / 1e6);
+        uint64_t const bias = pm_bench::interval_cost_ns();
+        uint64_t const total_bias = bias * b.compactions;
+        uint64_t const corrected =
+            b.compact_ns_total > total_bias ? b.compact_ns_total - total_bias : 0;
+        printf("  cost: %u compactions, %.3f ms corrected (%.3f ms raw minus"
+               " %u x instrument bias),\n",
+               (unsigned)b.compactions, (double)corrected / 1e6,
+               (double)b.compact_ns_total / 1e6, (unsigned)b.compactions);
+        printf("        avg %.1f us per compaction\n",
+               (double)corrected / (double)b.compactions / 1e3);
     } else if (a.p1_fail || a.p2_fail) {
         printf("  compaction was never even attempted or never succeeded (%u refusals)\n",
                (unsigned)b.compact_refused);
@@ -370,3 +398,7 @@ int main() {
     }
     return 0;
 }
+
+#ifndef PM_BENCH_NO_HOST_MAIN
+int main() { return pm_bench_fragmentation(); }
+#endif
