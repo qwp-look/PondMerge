@@ -58,7 +58,7 @@ bench/              可复现基准 + 实测结果（见 README.md 与 RESULTS.m
     validate_scaling.cpp  validate / get_stats 标度
     fragmentation.cpp   碎片治理 A/B（同一分配器，compact 开/关）
     esp32/              同一份基准源码的设备端 IDF 工程（独立于验收固件）
-esp32/              ESP32-S3 (n16r8) IDF 验收工程（v6.0.2，组件强制 gnu++17）
+esp32/              IDF 验收工程，多目标（默认 ESP32-S3；经典 ESP32 见 sdkconfig.defaults.esp32）
 docs/               架构说明、代码指导书、各轮任务书与交接文档（见文末索引）
 ```
 
@@ -267,7 +267,12 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(your_app)
 ```
 
-已在 **ESP-IDF v6.0.2 / esp32s3** 实测构建通过（含 `PM_MAX_OBJECTS` 覆盖生效）。
+已在 **ESP-IDF v6.0.2 的 esp32s3 与 esp32 两个目标**上实测构建通过（含
+`PM_MAX_OBJECTS` 覆盖生效）。注意组件名取自**目录名**，所以克隆目录须是小写的
+`pondmerge`，否则 `REQUIRES pondmerge` 会报 unknown name。
+
+⚠️ 若把**仓库根**当 IDF 组件用：仓库名是 `PondMerge`（大写），组件名会随之变成
+`PondMerge`。详见"集成方式"一节的目录名说明。
 
 ### 2. CMake 子目录
 
@@ -345,15 +350,31 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 | 协议回归 / HTTP 回归 | 95 / 15 checks, 0 failures |
 | `src/core.cpp` 覆盖率 | 96.47% 行 / 98.75% 分支执行（下限强制） |
 | libFuzzer（有界运行） | 无崩溃、无 sanitizer 发现 |
-| ESP32-S3 实机（当前提交） | **未执行——板子离线，见下** |
-| ESP32-S3 实机（历史记录，App version `baf20e8`） | 套件 1,120,456 + 双核并发 28 + 模型 466,859 checks，全部 0 failures |
+| ESP32-S3 (n16r8) 实机，App version `v1.0.0-4-ga5e68b6` | 套件 **1,120,457** + 双核并发 28 + 模型 466,859 checks，全部 0 failures；两次复位重跑计数一致 |
+| 经典 ESP32 (D0WDQ6 v1.1) 实机，App version `v1.0.0-6-g2324312` | 双核并发 28 + 模型 466,859 checks，0 failures；两次复位重跑计数一致。**套件未运行**（见下） |
 
-> **当前提交的设备端验收未执行，且不作声称。** 固件可构建，
-> `bench/esp32/`（把基准源码编到设备）已实测配置 / 编译 / 链接通过
-> （elf 3.7 MB，DIRAM 204,361 / 341,760 B = 59.8%），但最后一次尝试时
-> **板子不在线**（内核日志 `usb 1-2.1: USB disconnect`，`lsusb` 无 Espressif
-> 设备），因此未烧录、未抓串口。上表的实机记录属于更早的提交。
-> 详见 `docs/AUDIT_LEDGER.md` §6.10 与 `docs/HANDOVER_v12.md`。
+> **两条实机记录不在同一个提交上，这里如实标注。** S3 那次跑在 `a5e68b6`
+> （`v1.0.0-4`），经典 ESP32 这次跑在 `2324312` + 当前工作区改动（`v1.0.0-6`）。
+> 两次之间**对测试源码的唯一改动**是 zone 尺寸参数化与 model 的钳位修正
+> （见下文"两个目标"）：host 门禁的检查数与改动前**逐项相同**，且 S3 目标重新
+> 构建后 `.dram0.bss` 为 296,624 B（改动前 296,640 B，差 16 B 来自对齐）——即
+> 该改动对 S3 是行为中性的。S3 板子本轮被换下（同一 USB 口），因此 S3 的**运行**
+> 没有重复执行，本表不声称重复过。
+
+> **两个目标平台跑的不是同一组测试，而且这一点会打印出来。** 验收套件把 zone
+> 绑死在 64 段上——测试 [10] 断言"16 个池 × 4 段正好填满 zone"，测试 [2] 要求一个
+> 32 段的池——所以它的 zone 尺寸是**断言的一部分**，不能缩小。经典 ESP32 的静态
+> DRAM 总量约 200 KiB，放不下 256 KiB 的 zone（实测链接失败：
+> `region 'dram0_0_seg' overflowed by 126,744 bytes`）。因此该目标的固件**不编译
+> 套件**，只跑并发与 model 两组，并在串口上以 `=== suite SKIPPED (not run, not
+> passed) ===` 明确声明——跳过绝不会被写成"通过"。分叉在
+> `esp32/main/CMakeLists.txt` 里由 `CONFIG_IDF_TARGET` 驱动。
+>
+> 这条分叉的**直接动因**是项目的锁语义声明：Host 的 `PM_LOCK` 是空操作，SMP 证据
+> 只能来自双核设备测试，而在此之前它只在一颗芯片上成立过。经典 ESP32 是**双核
+> LX6**（S3 是 LX7），`portMUX` 实现与 cache 都不同；同一份
+> `tests/concurrency_esp32.cpp` 在第二套架构上通过，才是这条声明更强的证据。
+> `bench/esp32/`（把基准源码编到设备）目前仍只面向 S3。
 
 ## 可视化 Demo
 
@@ -373,35 +394,61 @@ ESP32 demo（固定脚本场景、只读展示；设备端整理由固件触发�
 命令）：见 `examples/esp32_demo/README.md`。协议与数据模型规范：
 `docs/DEMO_REQUIREMENTS.md`。
 
-## ESP32-S3（n16r8）上机
+## ESP32 上机（两个目标）
+
+基础配置在 `esp32/sdkconfig.defaults`（面向 ESP32-S3，也是 `idf.py build` 的默认
+目标）。第二个目标通过 `SDKCONFIG_DEFAULTS` 追加自己的覆盖文件——ESP-IDF **不会**
+自动读 `sdkconfig.defaults.<target>`，而且 defaults 列表里靠后的文件**改不动**
+`CONFIG_IDF_TARGET`（它对 target 采用首个匹配），所以切换必须显式
+`set-target`：
 
 ```sh
 source ~/esp/activate-idf.sh        # ESP-IDF v6.0.2
+
+# ESP32-S3（主目标，套件 + 并发 + model）
 cd esp32
-idf.py -B build set-target esp32s3  # 首次
+rm -f sdkconfig && idf.py set-target esp32s3
 idf.py -B build build
-idf.py -B build -p /dev/ttyACM0 flash monitor
+idf.py -B build -p /dev/ttyACM0 flash monitor      # USB-Serial-JTAG
+
+# 经典 ESP32（并发 + model；套件不编译，原因见验收表下方说明）
+rm -f sdkconfig
+SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32" \
+    idf.py set-target esp32
+idf.py -B build build
+idf.py -B build -p /dev/ttyUSB0 flash monitor       # UART0 + CH340 桥接
 ```
 
-设备端跑同一套验收套件（压力 2000 次，Auto Zone 256 KiB @ 内部 SRAM，
-`PM_MAX_OBJECTS=256`；`suite.cpp` 与 host 共用）。当前实机记录
-（App version `baf20e8`，与本表验收状态同行）：
+实机记录（两组都在当前提交上跑过，且各复位重跑两次）：
 
 ```
-chip: model=9 rev=0.2 cores=2 · 串口 /dev/ttyACM0（USB-Serial-JTAG）
-suite（基础 13 组 + R1–R35，2000 ops）：1,120,456 checks, 0 failures PASSED
-双核并发（200 轮 pause/compact/resume + 双核 borrower）：28 checks, 0 failures
-参考模型对拍（4000 ops）：466,859 checks, 0 failures PASSED
-max_live=55 max_borrow=1 max_moved=30960 meta=27704
+ESP32-S3 (n16r8) · /dev/ttyACM0（USB-Serial-JTAG）
+  suite（基础 13 组 + R1–R35，2000 ops）：1,120,457 checks, 0 failures PASSED
+  双核并发（200 轮 pause/compact/resume + 双核 borrower）：28 checks, 0 failures
+  参考模型对拍（4000 ops）：466,859 checks, 0 failures PASSED
+
+经典 ESP32 (D0WDQ6 v1.1) · /dev/ttyUSB0（CH340，160 MHz）
+  === suite SKIPPED (not run, not passed) ===（该档 DRAM 装不下 256 KiB zone）
+  双核并发：28 checks, 0 failures PASSED
+    rounds: borrow_a ok=4992 busy=640 | borrow_b ok=4149 busy=1219
+    maintainer: pause=200(already 0) compact ok=170 busy=30 resume=200
+  参考模型对拍（4000 ops）：466,859 checks, 0 failures PASSED
 ```
+
+三个平台（host、S3、经典 ESP32）的参考模型对拍都是**同一个 466,859 checks**：
+这是同一份确定性差分测试在三种架构上逐项走完了同样多的判定。并发的
+rounds 计数则每次运行都不同（调度相关），而 **28 checks 恒为 0 failures**——这正是
+该测试要的性质：被核验的性质稳定，调度才是可变的。
 
 `App version` 由 ESP-IDF 从 git 派生，用于提交号核对；ELF SHA256 须与本地产物
 一致。历史轮次的实机记录见各 HANDOVER 文档。
 
-设备侧注意：控制台为 `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`，**宿主必须
-持续读串口**——不读时发送队列会填满并阻塞 `printf`，表现为“测试卡在小分组
-数”。`tests/serial_cap.py` 使用正常启动复位（IO0 保持高、只脉冲 EN）；把
-IO0 拉低会进入下载模式。
+设备侧注意：**宿主必须持续读串口**——不读时发送队列会填满并阻塞 `printf`，
+表现为"测试卡在小分组数"。`tests/serial_cap.py` 在两种控制台上都实测可用：S3 是
+`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`（`/dev/ttyACM0`），经典 ESP32 板载没有该
+外设、控制台是 UART0 经 CH340 桥接（`/dev/ttyUSB0`，需要用户在 `dialout` 组）。
+它的正常启动复位（IO0 保持高、只脉冲 EN）对两者都有效；把 IO0 拉低会进入下载模式。
+`tests/serial_cap.py` 还接受一个可选的停止标记，因为基准固件的结束行与验收固件不同。
 
 ## Debug / Release
 

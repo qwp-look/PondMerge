@@ -19,7 +19,7 @@
 | live-slot list | alloc 的追加是 **O(1) 且不可能失败**，故 alloc 在任何物理字节变更之后**已无失败路径** | `order_append()` + `alloc()` | 三条指针写入，无遍历；环链/断链改由每个维护入口与 `validate()` 有界拒绝（R29(5) 已按新语义重写） | R29(5) | ✅（本轮） |
 | state | 池状态机 Entry(Running/Paused) → Merging/Splitting/Compacting → 提交发布；失败恢复入口状态 | `compact()`/`merge()`/`split()` 的 arming 与最终提交锁段 | 所有发布在锁内一次性完成；计划失败仅恢复状态、其余字节不动 | R7、R16、R22、R28 | ✅ |
 | state | 新池在最终提交前不可观测为可用 | `split()` arming 段（认领为 Splitting） | state ∉ {Running} 时 alloc/borrow 全部 Busy | R16(C)、R28(c) | ✅ |
-| borrow | begin/end 一一对应；token（index+generation+pool）在锁内校验；任何失配不动计数 | `borrow_begin()`/`borrow_end()` | 全部校验与递减在同一 PM_LOCK 内；active_borrows/borrow_count 双计数下溢不可能 | R10、R16、R25、设备并发测试 | ✅ |
+| borrow | begin/end 一一对应；token（index+generation+pool）在锁内校验；任何失配不动计数 | `borrow_begin()`/`borrow_end()` | 全部校验与递减在同一 PM_LOCK 内；active_borrows/borrow_count 双计数下溢不可能 | R10、R16、R25、设备并发测试（S3 LX7 + 经典 ESP32 LX6 两颗芯片） | ✅ |
 | object lifetime | 构造（placement-new）、析构（destroy thunk）恰好一次；movable 不带析构 | `pm_make`/`pm_make_pinned`/`detail::destroy_thunk`/`set_destroy_fn()` | movable 拒绝 destroy_fn（NotRelocatable）；pinned 析构在 free 验证后恰好跑一次 | R6、R19、R24 | ✅ |
 | object lifetime | 可搬移类型显式 opt-in 且经审计（不含 Auto Zone 自指针/DMA/同步原语） | `pm_is_relocatable` 特化（tests/suite.cpp 顶部） | 测试中注册的 5 个类型均为 POD；含裸指针的 RawHolder 特化被 static_assert 拒绝 | R5 | ✅ |
 | 统计 | used/free/fragment/live 与物理布局精确互锁 | `validate()` 第三段覆盖审计 | live+free+slack==capacity 且 free_total==free_bytes-fragment_bytes | R21、模型对拍 | ✅ |
@@ -65,7 +65,7 @@
 | alloc/free | 单 owner | pondmerge.hpp 并发契约；README |
 | resolve/get_stats/validate | 单 owner（后两者只读，仍不承诺并发） | pondmerge.hpp 并发契约（第五轮明确列出）；README 并发表 |
 | resolve/get_stats | 单 owner 或 quiescent | pondmerge.hpp（resolve 注释）；get_stats 为只读统计 |
-| borrow_begin/end | 内部锁 + token | 同一 PM_LOCK 内校验并递减；设备双核测试 |
+| borrow_begin/end | 内部锁 + token | 同一 PM_LOCK 内校验并递减；设备双核测试（两颗芯片：LX7 + LX6） |
 | pause/resume | 内部锁 | 状态翻转在 PM_LOCK 内 |
 | compact/merge/split | 单 owner 串行（scratch 共享，跨池并发亦禁止）；入口与最终提交持锁；搬移在锁外，安全性由单 owner + 外部静默契约承担 | pondmerge.hpp 并发契约（含 PM_LOCK 范围声明）；README 并发表；设备并发测试 |
 | 重复 end / 错误 token | 任何失配不动计数 | host Release R25；设备固件为 Debug 构建，重复 end 属调用方 bug 会断言——**已接受边界**（见 §6） |
@@ -99,7 +99,11 @@
 5. **RawRef 可伪造**：第三轮指南兼容方案（R27 固定语义）；local 绑定在解析期
    强制，伪造无法越界。
 6. **Host PM_LOCK 为空操作**（第五轮指南 P3）：Host 运行不能证明锁语义；
-   SMP 证据只来自双核设备测试；已写入 pondmerge.hpp 并发契约与 README。
+   SMP 证据只来自双核设备测试，**已在两颗不同芯片上取得**：ESP32-S3
+   （LX7）与经典 ESP32（D0WDQ6，**LX6**，portMUX 实现与 cache 均不同）。
+   两平台的 `tests/concurrency_esp32.cpp` 均为 28 checks / 0 failures，且
+   各自复位重跑两次的核验计数一致（调度计数可变，被核验的性质不变）。
+   已写入 pondmerge.hpp 并发契约与 README。
 7. **维护期并发模型**：解锁搬移 + 单 owner/外部静默契约是 v1 既定架构
    （第五轮指南 §4：真正 SMP 安全需重新覆盖全部读写，属重设计，不在 v1）。
    debug-only owner token 评估后不采用：host 单线程下无执行价值，设备上

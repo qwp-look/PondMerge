@@ -1,7 +1,9 @@
-// PondMerge v1 - ESP32-S3 dual-core lock-boundary test (HANDOVER_v4 T1 /
-// round-3 guide R25 device part). Host builds NEVER compile this file: the
-// host PM_LOCK is a no-op, so only the real FreeRTOS spinlock on two cores
-// can exercise the borrow/pause/compact boundary.
+// PondMerge v1 - dual-core lock-boundary test (HANDOVER_v4 T1 / round-3 guide
+// R25 device part). Host builds NEVER compile this file: the host PM_LOCK is a
+// no-op, so only the real FreeRTOS spinlock on two cores can exercise the
+// borrow/pause/compact boundary. It has been run on the ESP32-S3 (LX7) and on a
+// classic ESP32 (LX6) -- two different cores and two different portMUX
+// implementations, which is the point of running it on more than one part.
 //
 // What is tested (and what is deliberately NOT tested):
 //   * borrow_begin/borrow_end on DIFFERENT objects from two tasks running on
@@ -31,7 +33,12 @@
 #include <cstdio>
 #include <cstdint>
 
-extern uint8_t g_zone[]; // 256 KiB, 16-byte aligned (tests/suite.cpp)
+// 16-byte aligned, and at least two segments: this test only ever uses the first
+// two (see the Config below). Its provider depends on the target -- tests/suite.cpp
+// for a target that runs the acceptance suite, esp32/main/main.cpp for one that
+// does not -- so no size is named here. Deliberately an incomplete type: the
+// linker resolves it against whichever translation unit defines it.
+extern uint8_t g_zone[];
 
 namespace {
 
@@ -58,11 +65,11 @@ uint32_t c_fails = 0;
         }                                                                             \
     } while (0)
 
-// The device Auto Zone for this test lives in the low segments of the
-// suite's zone buffer (shared with tests/suite.cpp): static DRAM is too
-// tight for another zone-sized buffer. g_zone has external linkage in
-// tests/suite.cpp; the extern declaration must stay OUTSIDE the anonymous
-// namespace below, or it would declare a NEW internal-linkage object.
+// The device Auto Zone for this test lives in the low segments of a zone buffer
+// shared with the rest of the device firmware: static DRAM is too tight for
+// another zone-sized buffer. g_zone has external linkage wherever it is defined;
+// the extern declaration must stay OUTSIDE the anonymous namespace below, or it
+// would declare a NEW internal-linkage object.
 uint8_t* const c_zone = ::g_zone;
 
 // Task-safe accounting: every mutation happens inside this test's own

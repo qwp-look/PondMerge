@@ -210,6 +210,14 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Iinclude -Isrc \
 （`PM_BENCH_NO_HOST_MAIN=1` 去掉各文件的 host `main()`，由 `app_main` 调用），
 所以设备数字与主机数字来自同一份代码，差异只有 sizing 宏。
 
+**目标范围（重要）**：本目录目前只有 **ESP32-S3** 一种目标配置
+（`bench/esp32/sdkconfig.defaults`）。`esp32/`（验收固件）已经在第二个目标——经典
+ESP32（双核 LX6）——上跑过并发与 model 两组，但**基准还没有搬过去**：这里的
+192 KiB region 是照 S3 的内存预算选的，而经典 ESP32 的静态 DRAM 总量只有约
+200 KiB，搬过去要重新选参数（region 与 PM_MAX_OBJECTS 都要下调），属未完成项。
+因此 **`RESULTS.md` §5 的设备绝对值目前仍是单芯片的**；任何跨芯片性能结论都要先
+补齐这一步。
+
 **四个基准共用一块 192 KiB region。** 512 KiB SRAM 装不下四块独立区域，所以
 `PM_BENCH_SHARED_ZONE=1` 让各基准把 region 声明为 `extern`，由 `bench_main.cpp`
 定义；region 大小与各基准的 `PM_BENCH_*_BYTES` 来自**同一个 CMake 变量**，因此

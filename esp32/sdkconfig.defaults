@@ -1,4 +1,21 @@
-# PondMerge v1 on-target acceptance tests (ESP32-S3 N16R8)
+# PondMerge v1 on-target acceptance firmware.
+#
+# This file carries the ESP32-S3 defaults and is the one a plain `idf.py build`
+# uses, so the S3 path is unchanged from before the second target was added.
+#
+# A different target is selected by pointing SDKCONFIG_DEFAULTS at this file AND
+# at its own, because ESP-IDF does not read sdkconfig.defaults.<target> by itself
+# (verified in tools/cmake/project.cmake) and because a second file cannot
+# override CONFIG_IDF_TARGET from the defaults list -- IDF guesses the target with
+# a first-match rule, so `idf.py set-target` is what actually switches it:
+#
+#   rm -f sdkconfig && \
+#   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32" \
+#       idf.py set-target esp32 build
+#
+# The classic ESP32 entry point does not run the acceptance suite; it cannot,
+# because the suite pins its zone to 64 segments inside its own assertions. See
+# esp32/main/CMakeLists.txt and esp32/sdkconfig.defaults.esp32.
 CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

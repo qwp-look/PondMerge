@@ -34,7 +34,12 @@ g++ -std=c++17 -Wall -Wextra -Iinclude -Isrc \
 
 ## 3. ESP32 环境依赖与构建
 
-依赖：ESP-IDF v6.0.2（`~/esp/activate-idf.sh`）、ESP32-S3。
+依赖：ESP-IDF v6.0.2（`~/esp/activate-idf.sh`）、ESP32-S3 或经典 ESP32。
+
+下面的默认流程面向 ESP32-S3（`sdkconfig.defaults` 里的默认目标）。经典 ESP32 需要
+显式追加它自己的覆盖文件并 `set-target`（原因：IDF 不会自动读
+`sdkconfig.defaults.<target>`，且 defaults 列表里靠后的文件改不动
+`CONFIG_IDF_TARGET`）：
 
 ```sh
 source ~/esp/activate-idf.sh

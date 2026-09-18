@@ -1,0 +1,33 @@
+# PondMerge v1 on-target acceptance tests -- classic ESP32 (ESP32-D0WDQ6, LX6).
+#
+# This file is applied ON TOP of the shared sdkconfig.defaults by naming both in
+# SDKCONFIG_DEFAULTS. ESP-IDF does not pick up sdkconfig.defaults.<target> on its
+# own (verified in tools/cmake/project.cmake: the defaults list is exactly
+# sdkconfig.defaults unless SDKCONFIG_DEFAULTS says otherwise), and the later
+# file in the list wins -- which is what lets this file override the target and
+# the console that the shared file pins for the ESP32-S3:
+#
+#   rm -f sdkconfig && \
+#   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32" idf.py build
+#
+# (rm -f sdkconfig first: with a stale sdkconfig present, the target is guessed
+#  from it and the defaults are never consulted.)
+
+CONFIG_IDF_TARGET="esp32"
+
+# 4 MB on this board, against 16 MB on the ESP32-S3 one.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# The console has to change, and not for taste: the classic ESP32 has NO
+# USB-Serial-JTAG peripheral, so CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG does not
+# exist for this target at all. The console is UART0 behind the board's USB-UART
+# bridge (a CH340 here), which is why this is a different file and not a
+# one-line change to the shared one.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# The shared file asks for 16 KiB; the classic part has less DRAM to spare and
+# the acceptance firmware's deepest stack use is the suite's own frames, so 8 KiB
+# is the number this target gets. If a stack overflow appears, this is the first
+# knob, and the symptom will be a "***ERROR*** A stack overflow in task main_task"
+# panic rather than a wrong result.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

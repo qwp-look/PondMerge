@@ -198,8 +198,10 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(your_app)
 ```
 
-Verified to build on **ESP-IDF v6.0.2 / esp32s3**, with the `PM_MAX_OBJECTS`
-override confirmed to reach the compiler.
+Verified to build on **ESP-IDF v6.0.2 for both `esp32s3` and `esp32`**, with the
+`PM_MAX_OBJECTS` override confirmed to reach the compiler. Component names come
+from the **directory** name, so a clone must live in a lower-case `pondmerge`
+directory or `REQUIRES pondmerge` reports an unknown name.
 
 **2. CMake subdirectory**
 
@@ -287,28 +289,55 @@ test `tests/concurrency_esp32.cpp`, which is never compiled on the host.
 | Demo protocol / HTTP smoke | 95 / 15 checks, 0 failures |
 | Coverage of `src/core.cpp` | 96.47% of lines, 98.75% of branches executed (floor enforced) |
 | libFuzzer, bounded run | no crash, no sanitizer finding |
-| **ESP32-S3 (n16r8) on hardware** | **pending — see below** |
+| **ESP32-S3 (n16r8) on hardware** | suite **1,120,457** + dual-core concurrency 28 + model 466,859 checks, **all 0 failures**; two runs from reset, identical counts |
+| **Classic ESP32 (D0WDQ6 v1.1) on hardware** | dual-core concurrency 28 + model 466,859 checks, 0 failures; two runs from reset, identical counts. **The suite is not run** — see below |
 
 `tests/run_host.sh --release | --san | --cppcheck | --configs | --coverage | --fuzz`
 runs the host gates. CI executes all of them on every push, plus a consumer smoke
 test, the two demo protocol smoke tests, and a benchmarks job.
 
-### The on-hardware run is pending, and is not claimed
+### Two targets, and they do not run the same groups
 
-The firmware for the ESP32-S3 acceptance suite builds, and `bench/esp32/` — which
-compiles the benchmark sources for the device — has been verified to configure,
-compile and link (elf 3.7 MB, DIRAM 204,361 / 341,760 B). But **the board was
-disconnected when the last attempt was made** (kernel log `usb 1-2.1: USB
-disconnect`; `lsusb` shows no Espressif device), so nothing was flashed and no
-console output was captured for the current revision. The most recent on-hardware
-acceptance record is at an earlier commit (`App version baf20e8`): suite
-1,120,456 + dual-core concurrency 28 + model 466,859 checks, all 0 failures.
+The two device rows above are deliberately not presented as one number, because
+the acceptance suite cannot run on the second part and the firmware says so out
+loud rather than reporting a pass.
 
-Device-side notes: the console is `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`, so the
-**host must keep reading the port** — if it stops, the transmit queue fills and
-`printf` blocks, which looks like a hang after a few test groups.
-`tests/serial_cap.py` handles this and uses a normal-boot reset (IO0 high, EN
-pulsed); pulling IO0 low enters download mode instead.
+The suite pins its own zone to 64 segments inside its assertions — test [10]
+asserts that 16 pools x 4 segments fills the zone and test [2] creates a
+32-segment pool — so the zone size is part of what those tests assert rather than
+a parameter they tolerate. A classic ESP32 has ~200 KiB of static DRAM in total
+and the 256 KiB zone does not fit: measured, the link fails with
+`region 'dram0_0_seg' overflowed by 126,744 bytes`. That target therefore compiles
+without the suite, runs the concurrency and model groups (8 KiB and 64 KiB), and
+prints `=== suite SKIPPED (not run, not passed) ===` on the console. The fork is
+driven by `CONFIG_IDF_TARGET` in `esp32/main/CMakeLists.txt`.
+
+The reason for adding the second target at all is the lock claim: the host
+`PM_LOCK` is a no-op, so SMP evidence can only come from the dual-core device
+test — and until now that evidence existed on exactly one chip. The classic ESP32
+is a **dual-core LX6** (the S3 is LX7) with a different `portMUX` implementation
+and cache, and the same `tests/concurrency_esp32.cpp` passes on it. Its counters
+also show the race being exercised harder than on the S3: 30 of the maintainer's
+200 compactions were refused because a borrow was live, and both borrowers
+observed paused windows.
+
+One number is worth singling out: the reference-model differential reports
+**466,859 checks on host, on the S3, and on the classic ESP32** — one
+deterministic differential test walking the same number of judgements on three
+architectures.
+
+Device-side notes: **the host must keep reading the port** — if it stops, the
+transmit queue fills and `printf` blocks, which looks like a hang after a few test
+groups. The S3 console is `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` (`/dev/ttyACM0`);
+the classic ESP32 has no such peripheral, so its console is UART0 behind a
+USB-UART bridge (`/dev/ttyUSB0`, needs the user in `dialout`).
+`tests/serial_cap.py` was verified on both, uses a normal-boot reset (IO0 high, EN
+pulsed) that works for both, and takes an optional stop marker because the
+benchmark firmware ends on a different line than the acceptance firmware.
+
+`bench/esp32/` (the benchmark sources compiled for the device) is still
+ESP32-S3-only.
+
 
 ## Debug vs Release
 

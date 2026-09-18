@@ -230,14 +230,28 @@ bool adjacent(pm::PoolStats const& a, pm::PoolStats const& b) {
 } // namespace
 
 // Runs the differential test. Returns the number of failed checks.
+//
+// The zone buffer size the device build borrows; tests/suite.cpp defines the
+// same default. It is spelled out here too so that this file is correct when a
+// target supplies a smaller buffer (the classic-ESP32 firmware does).
+#ifndef PM_TEST_ZONE_BYTES
+#define PM_TEST_ZONE_BYTES (256u * 1024u)
+#endif
+
 uint32_t pondmerge_run_model(uint32_t zone_bytes, uint32_t ops) {
 #ifdef PM_DEVICE_BUILD
     // Device build (round-5 guide section 7): static DRAM is too tight for a
-    // second 64 KiB zone, so the model reuses the suite's zone buffer -- it
-    // runs strictly AFTER pondmerge_run_tests(), which has deinited.
-    extern uint8_t g_zone[]; // tests/suite.cpp, 256 KiB, 16-byte aligned
+    // second zone buffer, so the model reuses the one the device firmware
+    // provides -- it runs strictly AFTER pondmerge_run_tests(), which has
+    // deinited.
+    //
+    // The clamp is against THAT ARRAY's size, not against a hard-coded 256 KiB.
+    // The two were the same thing while every device target had a 256 KiB
+    // buffer; on a part with less DRAM the buffer really is smaller, and a clamp
+    // to the wrong number would let this function walk off the end of it.
+    extern uint8_t g_zone[PM_TEST_ZONE_BYTES];
     uint8_t* zone = g_zone;
-    if (zone_bytes > 256u * 1024u) zone_bytes = 256u * 1024u;
+    if (zone_bytes > (uint32_t)sizeof(g_zone)) zone_bytes = (uint32_t)sizeof(g_zone);
 #else
     static uint8_t zone[64 * 1024] __attribute__((aligned(16)));
     if (zone_bytes > sizeof(zone)) zone_bytes = sizeof(zone);

@@ -7,6 +7,64 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **A second hardware target, and the reason it is worth having: the dual-core
+  lock claim now has evidence from two different cores.** The acceptance firmware
+  builds and runs on a classic ESP32 (ESP32-D0WDQ6 v1.1, dual-core **LX6**) as well
+  as on the ESP32-S3 (LX7). On the classic part:
+
+  ```
+  === suite SKIPPED (not run, not passed) ===
+  dual-core concurrency : 28 checks, 0 failures PASSED
+  reference model       : 466,859 checks, 0 failures PASSED
+  ```
+
+  The project states that SMP/lock semantics can only be proven by the dual-core
+  device test, because the host `PM_LOCK` is a no-op. Until now that evidence
+  existed on exactly one chip. Two runs from reset produce identical check counts
+  while the scheduling-dependent counters differ, and the classic part exercises
+  the race harder than the S3 did: 30 of the maintainer's 200 compactions were
+  refused because a borrow was live, and both borrowers observed paused windows
+  (the S3 run had one borrower at zero paused hits).
+
+  One number is worth singling out: the reference-model differential reports
+  **466,859 checks on host, on the S3 and on the classic ESP32** — one
+  deterministic differential test, three architectures, the same number of
+  judgements.
+
+- **`esp32/` is now a two-target project**, and the reason it has to be explicit
+  is recorded rather than left to the reader. ESP-IDF does not read
+  `sdkconfig.defaults.<target>` on its own (verified in `tools/cmake/project.cmake`),
+  and a second file in `SDKCONFIG_DEFAULTS` can override every key *except* the
+  target — IDF guesses the target with a first-match rule. So switching targets
+  takes `idf.py set-target`, and the classic ESP32 has its own
+  `esp32/sdkconfig.defaults.esp32` (4 MB flash, UART0 console, 8 KiB main stack).
+  Applying those overrides to an `esp32s3` build breaks it, which is what a
+  wrong-target build looks like and is why the flow is documented in both files.
+
+### Fixed
+
+- **The acceptance suite cannot run on a small-DRAM part, and nothing said so.**
+  `tests/suite.cpp` pins its own zone to 64 segments inside its assertions: test
+  [10] asserts that 16 pools x 4 segments fills the zone, and test [2] creates a
+  32-segment pool. So the zone size is part of what those tests assert, not a
+  parameter they tolerate, and the suite is a 256 KiB-zone artifact by
+  construction. A classic ESP32 has ~200 KiB of static DRAM in total and the link
+  fails with `region 'dram0_0_seg' overflowed by 126,744 bytes`. The suite is now
+  excluded per target, the firmware announces the skip loudly instead of letting a
+  reader mistake it for a pass, and `tests/suite.cpp` carries the reason next to
+  the buffer so nobody shortens it and wonders why tests fail.
+
+- **`pondmerge_run_model()` clamped its zone argument to a hard-coded 256 KiB**
+  while borrowing a buffer whose size it did not know. That was harmless while
+  every device target had a 256 KiB buffer; on a part with a smaller one the clamp
+  would have allowed an overrun. It now clamps against the array's own size, which
+  requires declaring the array with its size — hence the shared
+  `PM_TEST_ZONE_BYTES` macro.
+
+- **`README.md` claimed the current-commit device acceptance had not been run**
+  ("board disconnected"). It had been, in the previous round, and the numbers were
+  already in `CHANGELOG.md`. Both READMEs now carry the real on-hardware rows.
+
 - **On-target benchmark results, and an independent allocator baseline.**
   `bench/esp32/` runs four benchmarks — alloc latency, a churn-harness
   decomposition, the fragmentation A/B, and validate/`get_stats` scaling — plus a

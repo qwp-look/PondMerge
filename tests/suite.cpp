@@ -41,7 +41,24 @@ static uint32_t g_fails = 0;
         }                                                                              \
     } while (0)
 
-uint8_t g_zone[256 * 1024] __attribute__((aligned(16))); // extern: the device concurrency test borrows the low segments
+// Auto Zone byte size for the acceptance suite.
+//
+// It is a macro and not a constant because it is the suite's own DRAM footprint,
+// and DRAM is what decides whether this firmware fits a given part at all. The
+// default is the 256 KiB zone every published run has used.
+//
+// Do not expect to lower it and have the suite still run: as written it needs
+// EXACTLY 64 segments. Test [10] asserts that 16 pools x 4 segments fills the
+// zone, and test [2] asks for a 32-segment pool, so neither a 32- nor a
+// 48-segment zone is a configuration this file supports. A part with less DRAM
+// than the 256 KiB class therefore does not run the suite at all -- it runs the
+// concurrency and model groups, which use 8 KiB and 64 KiB respectively. See
+// esp32/main/CMakeLists.txt for where that fork is expressed.
+#ifndef PM_TEST_ZONE_BYTES
+#define PM_TEST_ZONE_BYTES (256u * 1024u)
+#endif
+
+uint8_t g_zone[PM_TEST_ZONE_BYTES] __attribute__((aligned(16))); // extern: the device concurrency test borrows the low segments
 
 static void fresh() {
     pm::Config cfg{g_zone, sizeof(g_zone), 4096};
