@@ -383,14 +383,17 @@ hardware isolation; hard real-time compaction guarantees.
 
 | document | contents |
 |---|---|
+| [CONTRIBUTING.md](CONTRIBUTING.md) | **For contributors and AI assistants**: the rules, how to run the gates, how to add a device target, and a document map — written to be self-sufficient |
+| [README.md](README.md) | The main README (Chinese): integration, metadata budget, verification records; the deep links point there and into docs/ |
 | [QUICKSTART.md](QUICKSTART.md) | 5-minute first example → full compaction flow → common mistakes *(Chinese)* |
 | [docs/USAGE_GUIDE.md](docs/USAGE_GUIDE.md) | Three-zone model, API contract tables, concurrency, error codes, complexity *(Chinese)* |
 | [docs/COMPACTION_POLICY.md](docs/COMPACTION_POLICY.md) | Advice semantics, decision matrix, thresholds, the standard flow *(Chinese)* |
 | [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) | The invariant ledger: invariant → code location → proof → test *(Chinese)* |
 | [docs/DEMO_REQUIREMENTS.md](docs/DEMO_REQUIREMENTS.md) | Demo composition, snapshot protocol v1.1, JSON subset, acceptance *(Chinese)* |
+| [bench/README.md](bench/README.md) | Benchmark method, fairness rules, the timing-instrument rules, and what quoting a number requires |
 | [bench/RESULTS.md](bench/RESULTS.md) | Every measured number, the instrument's limits, and the negative results |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes and known boundaries |
-| docs/HANDOVER_v2–v12.md | Per-round audit reports |
+| docs/HANDOVER_v2–v13.md | Per-round audit reports |
 
 ## Licence
 
