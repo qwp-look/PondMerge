@@ -84,3 +84,22 @@ verdict 上提前结束（本轮连续三次抓取被坑）。新增可选第 5 
   `CONTRIBUTING.md` §3 已同步（十一项 + 集成参考指引）。
 - 提交链：本轮代码/文档提交 → 提交后重烧的正式设备记录（App version
   对齐提交号，追加于文末）。
+
+## 7. 正式设备记录（提交后重烧，App version 对齐）
+
+固件：`v1.0.0-15-gc86294c`（提交后从干净树重建、烧录），两次独立抓取
+（serial_cap discard=6 s），**两轮 summary 逐字节一致**（状态确定）：
+
+```
+S3 (n16r8, 160 MHz IDF 默认主频, zone 196608 B, history<=240, export 49152 B)
+  exports: direct 193, rescued by compaction 1, failed after compaction 6,
+           skipped by advice 0
+  compactions: 7 ok, 0 refused
+  payload integrity: 1648 checks, 0 failures
+  accounting: used 135584 + free 61024 = 196608 OK
+  structure audit: OK;  deinit: OK;  run time ~2.0 s
+  === sensor pipeline done: ALL AUDITS PASSED ===
+```
+
+与提交前工作树的预演记录（f855789 树，未跟踪源码）逐字节一致——
+确定性不受重布局影响（示例不经基准那样的逐周期计时）。
