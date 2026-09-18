@@ -96,6 +96,21 @@ jobs:
         run: python3 examples/protocol_smoke.py build/host_demo
       - name: HTTP layer regression (15 checks)
         run: python3 examples/http_smoke.py build/host_demo
+      - name: Sensor-pipeline example (integration reference, self-audited)
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude -Isrc \
+              examples/sensor_pipeline.cpp src/core.cpp -o build/sensor_pipeline
+          ./build/sensor_pipeline | tee build/sensor_pipeline.log
+          # The example audits itself; a regression here means a reference
+          # that no longer does what it claims.
+          grep -q "payload integrity: .* 0 failures" build/sensor_pipeline.log
+          grep -qE "structure audit +: OK" build/sensor_pipeline.log
+          grep -q "accounting: .* OK" build/sensor_pipeline.log
+          grep -q "=== sensor pipeline done: ALL AUDITS PASSED ===" build/sensor_pipeline.log
+          # The compaction flow must actually fire at this sizing -- if a
+          # change pushes the workload into the always-fits regime, the
+          # reference stops exercising what it exists to demonstrate.
+          grep -qE "compactions: [1-9]" build/sensor_pipeline.log
 
   consumer-smoke:
     name: cmake consumer (install + find_package)

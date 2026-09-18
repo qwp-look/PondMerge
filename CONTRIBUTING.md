@@ -61,11 +61,18 @@ g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc \
     examples/host_demo.cpp src/core.cpp -o build/host_demo
 python3 examples/protocol_smoke.py build/host_demo   # 95 checks
 python3 examples/http_smoke.py build/host_demo       # 15 checks
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude -Isrc \
+    examples/sensor_pipeline.cpp src/core.cpp -o build/sensor_pipeline
+./build/sensor_pipeline                              # 末行必须 ALL AUDITS PASSED，
+                                                     # 且 compactions > 0（流程必须真的触发）
 g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra \
     -Wno-unused-parameter -Werror -Iinclude -Isrc \
     bench/$b.cpp src/core.cpp -o build/bench_$b     # b ∈ {alloc_latency,
     validate_scaling, fragmentation, compaction_window}（CI 的 benchmarks job）
 ```
+
+真实场景集成参考是 `examples/sensor_pipeline.cpp`（host/设备同一份源码，
+设备工程在 `examples/sensor_pipeline_esp32/`）——写新集成时先读它。
 
 全部通过应看到 **5,409,619 (Debug) / 5,409,626 (Release) / 1,508,630 (San)
 checks, 0 failures**，模型对拍 **466,859**。CI（`.github/workflows/ci.yml`）

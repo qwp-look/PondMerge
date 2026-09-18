@@ -7,6 +7,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **A real-scenario integration reference: `examples/sensor_pipeline.cpp`.**
+  One product-shaped workload -- a sensor node with a rotating pinned DMA
+  ring, typed movable message history, and a periodic large batch-upload that
+  exercises the advice -> compact -> retry flow of COMPACTION_POLICY.md
+  section 6 -- on the SAME source for host and device
+  (`examples/sensor_pipeline_esp32/`). It audits itself on every run (payload
+  checksums re-derived through borrows after every compaction: 9,053 checks,
+  0 failures across 22 compactions on the host reference run; byte accounting;
+  `validate()`), and its four export outcomes are counted, not promised: the
+  host run records 170 direct / 13 rescued / 9 failed-after-compact /
+  8 skipped-on-advice, and the S3 records what its sizing actually produces
+  (see docs/HANDOVER_v15.md section 3 for the measured sizing band). CI and
+  `scripts/gates.sh` assert the audits and that the flow really fires.
+
+- `tests/serial_cap.py` gained an optional discard-window argument: a firmware
+  whose run is longer than the default 1.5 s pre-reset drain leaks the tail of
+  its PREVIOUS run into a new capture, where a leaked stop marker ends the
+  capture early on someone else's verdict. (Hit three times while capturing
+  the example; the acceptance firmware fits the default, longer-running
+  firmware must pass a larger window.)
+
 - **The compaction window now has a distribution, not just a single point.**
   Every record of what one `compact()` call costs was one event, because
   `fragmentation.cpp` contains exactly one compaction (the first heals the

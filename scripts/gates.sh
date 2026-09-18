@@ -1,11 +1,11 @@
 #!/bin/sh
-# PondMerge host gate runner: the ten checks from CONTRIBUTING.md section 3,
+# PondMerge host gate runner: the eleven checks from CONTRIBUTING.md section 3,
 # one command. Everything here is a straight call into tests/run_host.sh (or
 # the demo smokes), so this file documents the gates rather than replacing
 # them: each line is the same command a human would run by hand, and each
 # gate's own output is what you read when it fails.
 #
-#   scripts/gates.sh            # all ten gates, in CONTRIBUTING.md's order
+#   scripts/gates.sh            # all eleven gates, in CONTRIBUTING.md's order
 #   scripts/gates.sh -v         # same, without collapsing each gate's output
 #
 # The expected pass counts (5,409,619 / 5,409,626 / 1,508,630 checks; model
@@ -59,7 +59,17 @@ run_gate "6/10 coverage (floor 85%)"             tests/run_host.sh --coverage
 run_gate "7/10 libFuzzer (bounded)"              tests/run_host.sh --fuzz
 run_gate "8/10 demo protocol regression"         python3 examples/protocol_smoke.py build/host_demo
 run_gate "9/10 demo HTTP regression"             python3 examples/http_smoke.py build/host_demo
-run_gate "10/10 benchmarks build (Release -Werror)" sh -c '
+run_gate "10/11 sensor-pipeline example (self-audited)" sh -c '
+    g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude -Isrc \
+        examples/sensor_pipeline.cpp src/core.cpp -o build/sensor_pipeline || exit 1
+    ./build/sensor_pipeline > build/sensor_pipeline.log || exit 1
+    grep -q "=== sensor pipeline done: ALL AUDITS PASSED ===" build/sensor_pipeline.log || {
+        echo "example audits did not all pass"; exit 1
+    }
+    grep -qE "compactions: [1-9]" build/sensor_pipeline.log || {
+        echo "compaction flow did not fire at this sizing"; exit 1
+    }'
+run_gate "11/11 benchmarks build (Release -Werror)" sh -c '
     F="-std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra -Wno-unused-parameter -Werror -Iinclude -Isrc"
     status=0
     for b in alloc_latency validate_scaling fragmentation compaction_window; do

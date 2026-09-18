@@ -45,7 +45,11 @@ tests/
     serial_cap.py       ESP32 串口抓取（正常启动复位 + 完整日志/测试输出）
     run_host.sh     构建 + 运行（--release / --san / --cppcheck / --configs）
     config_matrix.sh    配置矩阵（SL 2/4/8/16、FL 31、非法配置编译期拒绝）
-examples/           Demo 与协议回归
+examples/           Demo、真实场景参考与协议回归
+    sensor_pipeline.cpp 真实场景集成参考：传感器节点（pinned DMA 环 + 消息历史
+                        + 大块导出触发建议/整理流程），host/设备同一份源码，
+                        自带载荷完整性/账目/结构三重自检（CI 断言）
+    sensor_pipeline_esp32/  上例的设备端 IDF 工程（复用验收固件的组件）
     host_demo.cpp       Host demo 进程（stdin 命令 -> stdout JSON 快照）
     demo_server.py      HTTP 服务 + 浏览器 UI（--host 子进程 / --serial 设备）
     esp32_demo/         ESP32 demo 固件（独立 IDF 工程，固定脚本场景）

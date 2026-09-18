@@ -12,7 +12,7 @@ Why this exists (task-book v2 section 12.3 wants a reproducible device record):
     and the ELF SHA256.
 
 Usage:
-    python3 serial_cap.py [port] [seconds] [baud] [stop-marker]
+    python3 serial_cap.py [port] [seconds] [baud] [stop-marker] [discard-secs]
     python3 serial_cap.py /dev/ttyACM0 900 115200
     python3 serial_cap.py /dev/ttyACM0 600 115200 "=== benchmarks done"
 
@@ -20,6 +20,15 @@ With no stop-marker the capture ends when the acceptance firmware's last verdict
 line appears. Any other firmware -- the benchmark project in bench/esp32, for
 instance -- ends on a different line, so it passes its own marker; the watchdog
 (seconds) is the backstop either way.
+
+DISCARD WINDOW (the fifth argument, default 1.5 s): the pre-reset drain that
+throws away whatever a previous run still has in flight. Its length must
+EXCEED the previous run's remaining output, or the tail of that run leaks into
+the recorded capture -- and if the leaked tail contains the stop marker, the
+capture stops early on another boot's verdict. The acceptance firmware fits
+the default; a benchmark or example firmware that runs longer than 1.5 s must
+pass a discard longer than its own run (measured: the sensor-pipeline example
+runs ~2 s, so its captures pass 6).
 
 Reset polarity gotcha: a NORMAL boot keeps IO0 HIGH (DTR=False) and only pulses
 EN (RTS). Pulling IO0 low enters download mode instead (the log then shows
@@ -40,6 +49,7 @@ baud = int(sys.argv[3]) if len(sys.argv) > 3 else 115200
 # that marker and nothing else.
 stop_marker = sys.argv[4].encode() if len(sys.argv) > 4 else b"=== model PASSED"
 stop_also = None if len(sys.argv) > 4 else b"=== model FAILED"
+discard_secs = float(sys.argv[5]) if len(sys.argv) > 5 else 1.5
 
 def open_port():
     """Open the port, retrying transient failures.
@@ -99,9 +109,11 @@ def reset():
 
 # 1) opening the port can itself toggle DTR/RTS and start a spurious boot, and
 #    a previous run may still be blocked on a full transmit queue: reset once
-#    and throw the result away, so the boot recorded below is complete.
+#    and throw the result away, so the boot recorded below is complete. The
+#    window must cover the previous run's remaining output -- see the usage
+#    note above.
 reset()
-discard = drain(1.5)
+discard = drain(discard_secs)
 
 # 2) the boot we record
 reset()
