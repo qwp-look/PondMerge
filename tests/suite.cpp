@@ -3882,6 +3882,951 @@ static void test_advice_estimate_and_counters() {
 }
 
 // ---------------------------------------------------------------------------
+// (R44) round-11 fix 4 (A1-4): pool geometry (segment_first/segment_count) is
+// corruptible metadata, but pool_end()/pool_capacity() derived the usable byte
+// range from it with no zone-limit proof. A pool whose window crosses the zone
+// end made free() read/write past the Auto Zone (ASan global-buffer-overflow,
+// free returned OK), let alloc's split path write past the zone, and let
+// compact finalize a layout beyond the zone. Every entry that trusts pool
+// geometry must prove it once, O(1), and refuse with CorruptMetadata.
+// ---------------------------------------------------------------------------
+static void test_pool_geometry_zone_limit() {
+    printf("  [R44] pool geometry crossing the zone end is refused\n");
+    fresh();
+    pm::PoolId x{}, a{};
+    CHECK_ST(pm::create_pool(x, 60), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(a, 4), pm::Status::Ok); // segments [60,64): zone end
+    pm::RawRef o{};
+    CHECK_ST(pm::alloc(a, 16376, 8, 0, 1, o), pm::Status::Ok); // block ends at zone end
+    fill(o, 16376, 44);
+    VALIDATE(a);
+    using namespace pm::internal;
+    Pool& Pa = g().pools[a];
+    uint16_t const saved_count = Pa.segment_count;
+    Pa.segment_count = (uint16_t)(saved_count + 1); // [60,65): crosses the end
+
+    CHECK_ST(pm::free(o), pm::Status::CorruptMetadata);
+    pm::RawRef b{};
+    CHECK_ST(pm::alloc(a, 64, 8, 0, 2, b), pm::Status::CorruptMetadata);
+    CHECK(b.generation == 0); // R30: a failed alloc clears the output
+    CHECK_ST(pm::compact(a), pm::Status::CorruptMetadata);
+    CHECK(get_stats_state(a) == 1); // refusal restored Running
+
+    Pa.segment_count = saved_count;
+    VALIDATE(a);
+    verify(o, 16376, 44);
+    CHECK_ST(pm::free(o), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R43) round-11 fix 3 (A1-3/A4-04): create_pool marked used[segment_first+s]
+// for every existing pool without proving the window in bounds. A corrupt
+// segment_first wrote far outside bool[PM_MAX_SEGMENTS] (UBSan), and a shifted
+// window let create_pool hand out segments that physically overlap a live
+// pool (the new pool's creation header overwrote live block bytes).
+// ---------------------------------------------------------------------------
+static void test_create_pool_segment_bounds() {
+    printf("  [R43] create_pool validates existing pools' segment windows\n");
+
+    // (a) window shifted up across the zone end: [61,65) on a 64-segment zone.
+    {
+        fresh();
+        pm::PoolId x{}, a{};
+        CHECK_ST(pm::create_pool(x, 60), pm::Status::Ok);
+        CHECK_ST(pm::create_pool(a, 4), pm::Status::Ok); // [60,64)
+        pm::RawRef o{};
+        CHECK_ST(pm::alloc(a, 128, 8, 0, 1, o), pm::Status::Ok);
+        fill(o, 128, 43);
+        auto rd32 = [](void const* p) { uint32_t v; memcpy(&v, p, 4); return v; };
+        auto wr32 = [](void* p, uint32_t v) { memcpy(p, &v, 4); };
+        using namespace pm::internal;
+        uint8_t* oblk = g().objects[o.index].address - BLOCK_HEADER_SIZE;
+        uint32_t const hdr_before = rd32(oblk);
+        Pool& Pa = g().pools[a];
+        uint16_t const saved_first = Pa.segment_first;
+        Pa.segment_first = (uint16_t)(saved_first + 1); // [61,65): overruns
+        pm::PoolId nid{};
+        CHECK_ST(pm::create_pool(nid, 1), pm::Status::CorruptMetadata);
+        Pa.segment_first = saved_first;
+        // Pre-fix repair only (a no-op once the guard exists): the corrupt
+        // create_pool built its creation header over o's live block.
+        bool const hdr_intact = (rd32(oblk) == hdr_before);
+        if (!hdr_intact) wr32(oblk, hdr_before);
+        if (hdr_intact) verify(o, 128, 43);
+        CHECK_ST(pm::free(o), pm::Status::Ok);
+        VALIDATE(a);
+        done();
+    }
+
+    // (b) huge segment_first: the used[] write itself would be ~60 KB past
+    //     the stack array (the PoC's UBSan bool[64] overflow).
+    {
+        fresh();
+        pm::PoolId a{};
+        CHECK_ST(pm::create_pool(a, 4), pm::Status::Ok);
+        pm::RawRef o{};
+        CHECK_ST(pm::alloc(a, 128, 8, 0, 1, o), pm::Status::Ok);
+        using namespace pm::internal;
+        Pool& Pa = g().pools[a];
+        uint16_t const saved_first = Pa.segment_first;
+        Pa.segment_first = 60000;
+        pm::PoolId nid{};
+        CHECK_ST(pm::create_pool(nid, 1), pm::Status::CorruptMetadata);
+        Pa.segment_first = saved_first;
+        VALIDATE(a);
+        CHECK_ST(pm::free(o), pm::Status::Ok);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (R38) round-11 fix 1 (A1-1): alloc() appends to the live-slot list in O(1)
+// and order_append() dereferences the pool's order_head without any walk, so
+// a head outside [0, PM_MAX_OBJECTS) was written through (SEGV for far values
+// like 0x400000, a silent GlobalState overrun at the boundary value
+// PM_MAX_OBJECTS). alloc must screen the head BEFORE any mutation and report
+// CorruptMetadata with a cleared output reference (R30 semantics).
+// ---------------------------------------------------------------------------
+static void test_alloc_order_head_guard() {
+    printf("  [R38] alloc screens a corrupt order_head\n");
+    uint32_t const bad_heads[2] = {(uint32_t)PM_MAX_OBJECTS, 5000};
+    for (uint32_t tc = 0; tc < 2; ++tc) {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef old{};
+        CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, old), pm::Status::Ok);
+        fill(old, 64, 41);
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        CHECK(P.order_head == old.index);
+        uint32_t const saved_head = P.order_head;
+        // The unguarded append writes objects[order_head].addr_prev; in this
+        // binary that collateral write lands on old's block header, so the
+        // header is saved/restored around the injection (a no-op once the
+        // guard exists).
+        uint8_t* oblk = g().objects[old.index].address - BLOCK_HEADER_SIZE;
+        uint8_t hdr_copy[8];
+        memcpy(hdr_copy, oblk, sizeof(hdr_copy));
+        P.order_head = bad_heads[tc];
+        pm::RawRef out{};
+        CHECK_ST(pm::alloc(pool, 64, 8, 0, 2, out), pm::Status::CorruptMetadata);
+        CHECK(out.generation == 0 && out.index == 0 && out.pool_hint == 0);
+        P.order_head = saved_head;
+        memcpy(oblk, hdr_copy, sizeof(hdr_copy)); // pre-fix collateral repair
+        // Pre-fix repair only (dead code once the guard exists): the
+        // unguarded alloc really created an object; release it so the
+        // sub-case stays teardown-clean.
+        if (out.generation != 0) pm::free(out);
+        memcpy(oblk, hdr_copy, sizeof(hdr_copy)); // free(out) repeats the OOB link write
+        verify(old, 64, 41); // the refused alloc changed nothing else
+        CHECK_ST(pm::free(old), pm::Status::Ok);
+        VALIDATE(pool);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (R39) round-11 fix 2 (A1-2): free() unlinks with O(1) order_unlink(), which
+// dereferences the descriptor's addr_prev/addr_next directly; neither
+// check_ref nor verify_neighbours read the link fields, so an out-of-table
+// link was written through (SEGV / silent corruption at 0x400000-style
+// values). The Live-descriptor link-bounds proof in check_ref covers every
+// referencing entry (free/borrow/resolve alike) in O(1).
+// ---------------------------------------------------------------------------
+static void test_free_order_link_guard() {
+    printf("  [R39] free refuses out-of-table order links\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef a{}, b{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, a), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 2, b), pm::Status::Ok);
+    fill(a, 64, 42);
+    fill(b, 64, 43);
+    VALIDATE(pool);
+    using namespace pm::internal;
+    Pool& P = g().pools[pool];
+    ObjectDesc& da = g().objects[a.index];
+    uint32_t const saved_prev = da.addr_prev;
+
+    // free must refuse, and the refusal must leave every metadata domain --
+    // counters, descriptors, physical bytes -- byte-identical.
+    pm::RawRef refs[2] = {a, b};
+    snap_all(pool, pool, refs, 2, seg_base(P.segment_first), 2 * 4096);
+    da.addr_prev = 5000; // far outside the descriptor table
+    CHECK_ST(pm::free(a), pm::Status::CorruptMetadata);
+    da.addr_prev = saved_prev;
+    check_all_unchanged(pool, pool, refs, 2, seg_base(P.segment_first), 2 * 4096);
+
+    // The same guard protects every referencing entry, not just free.
+    da.addr_prev = 5000;
+    void* p = nullptr;
+    CHECK_ST(pm::borrow_begin(a, 64, 1, p), pm::Status::CorruptMetadata);
+    CHECK(p == nullptr);
+    CHECK_ST(pm::resolve(a, 0, 1, p), pm::Status::CorruptMetadata);
+    CHECK(p == nullptr);
+    da.addr_prev = saved_prev;
+    VALIDATE(pool);
+    verify(a, 64, 42);
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    CHECK_ST(pm::free(b), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R36) A4-01: the mid-gap/slack interaction. A split leaves an 8 B pool-tail
+// slack; after freeing the upper objects and re-allocating a pinned object
+// there, a merge + compact must keep the slack as fragment_bytes (8), and a
+// later free of a movable just below a pinned object must neither merge the
+// slack into a free block nor break validity.
+// ---------------------------------------------------------------------------
+static void test_midgap_slack() {
+    printf("  [R36] mid-gap slack: pinned neighbours, tail slack preserved\n");
+    fresh();
+    pm::PoolId p{};
+    CHECK_ST(pm::create_pool(p, 2), pm::Status::Ok); // [0,8192)
+    pm::RawRef L{}, B{}, F{};
+    CHECK_ST(pm::alloc(p, 4080, 8, 0, 1, L), pm::Status::Ok); // block 4088 [0,4088)
+    CHECK_ST(pm::alloc(p, 8, 8, 0, 2, B), pm::Status::Ok);    // block 16  [4088,4104)
+    CHECK_ST(pm::alloc(p, 4064, 8, 0, 3, F), pm::Status::Ok); // block 4072 [4104,8176)
+    fill(L, 4080, 31); fill(B, 8, 32); fill(F, 4064, 33);
+    VALIDATE(p);
+    CHECK_ST(pm::free(B), pm::Status::Ok); // 16 B hole straddling the boundary
+    VALIDATE(p);
+
+    // split at 4096 cuts the hole: the lower half becomes 8 B pool-tail
+    // slack, the upper half packs F left over its half and keeps a real
+    // 24 B binned tail block.
+    pm::PoolId n{};
+    CHECK_ST(pm::split(p, 1, n), pm::Status::Ok);
+    VALIDATE(p); VALIDATE(n);
+    CHECK(pm::get_stats(p).fragment_bytes == 8);
+    CHECK(pm::get_stats(n).fragment_bytes == 0);
+
+    // A pinned object occupies the upper segment's tail block exactly.
+    pm::RawRef P2{};
+    CHECK_ST(pm::alloc(n, 16, 8, pm::PM_PINNED, 4, P2), pm::Status::Ok); // [8168,8192)
+    CHECK_ST(pm::merge(n, p), pm::Status::Ok);
+    pm::PoolStats st = pm::get_stats(p);
+    CHECK(st.fragment_bytes == 8); // the 8 B slack now sits before pinned P2
+    CHECK_ST(pm::compact(p), pm::Status::Ok);
+    st = pm::get_stats(p);
+    CHECK(st.fragment_bytes == 8);
+    VALIDATE(p);
+
+    // Free the movable directly below pinned P2: the 8 B slack between them
+    // must stay out of the freed block (no wrongful merge).
+    pm::RawRef cF = F; cF.pool_hint = pm::CROSS_HINT;
+    CHECK_ST(pm::free(cF), pm::Status::Ok);
+    st = pm::get_stats(p);
+    CHECK(st.fragment_bytes == 8);
+    CHECK(st.largest_free_block == 4072); // the freed F block, slack excluded
+    VALIDATE(p);
+
+    pm::RawRef cP2 = P2; cP2.pool_hint = pm::CROSS_HINT;
+    CHECK_ST(pm::free(L), pm::Status::Ok);
+    CHECK_ST(pm::free(cP2), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(p), pm::Status::Ok); // n vanished in the merge
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R37) A4-06: after deinit() every public entry must refuse with its
+// documented status and without reinitializing anything; a fresh init() then
+// brings the system back.
+// ---------------------------------------------------------------------------
+static void test_post_deinit() {
+    printf("  [R37] post-deinit refusals for every entry\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, r), pm::Status::Ok);
+    CHECK_ST(pm::free(r), pm::Status::Ok);
+    CHECK_ST(pm::deinit(), pm::Status::Ok);
+
+    pm::RawRef out{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, out), pm::Status::CorruptMetadata);
+    CHECK(out.generation == 0);
+    CHECK_ST(pm::free(out), pm::Status::CorruptMetadata);
+    void* p = nullptr;
+    CHECK_ST(pm::resolve(out, 0, 1, p), pm::Status::CorruptMetadata);
+    CHECK(p == nullptr);
+    CHECK_ST(pm::borrow_begin(out, 0, 1, p), pm::Status::CorruptMetadata);
+    CHECK(p == nullptr);
+    CHECK_ST(pm::set_destroy_fn(out, &counting_destroy), pm::Status::CorruptMetadata);
+    pm::PoolId nid{};
+    CHECK_ST(pm::create_pool(nid, 1), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::destroy_pool(pool), pm::Status::InvalidPool);
+    CHECK_ST(pm::pause(pool), pm::Status::InvalidPool);
+    CHECK_ST(pm::resume(pool), pm::Status::InvalidPool);
+    CHECK_ST(pm::compact(pool), pm::Status::InvalidPool);
+    CHECK_ST(pm::merge(pool, (pm::PoolId)3), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::split(pool, 1, nid), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    CHECK(pm::analyze_compaction(pool).verdict == pm::CompactionVerdict::INVALID_METADATA);
+    CHECK(pm::get_stats(pool).valid == 0);
+    CHECK(pm::global_stats().max_live_objects == 0);
+    bool changed = true;
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == false); // identical INVALID_METADATA observation: suppressed
+    CHECK_ST(pm::deinit(), pm::Status::InvalidPool); // already down
+
+    // A normal init() brings the system back.
+    CHECK_ST(pm::init(pm::Config{g_zone, sizeof(g_zone), 4096}), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    VALIDATE(pool);
+    CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R40) A4-02: two live descriptors of one pool claiming the same address.
+// collect_live_sorted sorts by (address, index) -- the index tie-break makes
+// the duplicate pair adjacent -- and refuses; validate and compact both
+// report CorruptMetadata.
+// ---------------------------------------------------------------------------
+static void test_dup_address() {
+    printf("  [R40] duplicate live addresses refused\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef a{}, b{}, c{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, a), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 2, b), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 3, c), pm::Status::Ok);
+    VALIDATE(pool);
+    using namespace pm::internal;
+    ObjectDesc& db = g().objects[b.index];
+    uint8_t* const saved_b = db.address;
+    db.address = g().objects[a.index].address; // chain links stay consistent
+
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::compact(pool), pm::Status::CorruptMetadata);
+    CHECK(get_stats_state(pool) == 1); // restored to Running
+
+    db.address = saved_b;
+    VALIDATE(pool);
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    CHECK_ST(pm::free(b), pm::Status::Ok);
+    CHECK_ST(pm::free(c), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R41) A4-03 residual: split must refuse descriptor damage (block_size
+// misaligned) and counter drift (used_bytes+8) at its precheck with zero side
+// effects: out_new untouched, no pool claimed, epoch unchanged, data intact,
+// and a healthy split still succeeds afterwards.
+// ---------------------------------------------------------------------------
+static void test_split_injection() {
+    printf("  [R41] split refuses damage with zero side effects\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef a{}, b{};
+    CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 128, 8, pm::PM_PINNED, 2, b), pm::Status::Ok);
+    fill(a, 128, 45); fill(b, 128, 46);
+    VALIDATE(pool);
+    using namespace pm::internal;
+    Pool& P = g().pools[pool];
+    // The slot split() would claim: first Empty id, same scan as split().
+    pm::PoolId would = PM_MAX_POOLS;
+    for (uint32_t i = 0; i < PM_MAX_POOLS; ++i)
+        if (g().pools[i].state == PoolState::Empty) { would = (pm::PoolId)i; break; }
+    CHECK(would < PM_MAX_POOLS);
+    uint32_t const saved_epoch = P.structure_epoch;
+    pm::PoolId out_new = (pm::PoolId)0x00AB; // sentinel: untouched on failure
+
+    // (1) descriptor block_size + 1 (alignment broken)
+    uint32_t const saved_bs = g().objects[a.index].block_size;
+    g().objects[a.index].block_size = saved_bs + 1;
+    CHECK_ST(pm::split(pool, 1, out_new), pm::Status::CorruptMetadata);
+    CHECK(out_new == (pm::PoolId)0x00AB);
+    CHECK(P.structure_epoch == saved_epoch);
+    CHECK(g().pools[would].state == PoolState::Empty); // claim undone
+    g().objects[a.index].block_size = saved_bs;
+    VALIDATE(pool);
+    verify(a, 128, 45); verify(b, 128, 46);
+
+    // (2) used_bytes + 8 (counter drift)
+    uint32_t const saved_used = P.used_bytes;
+    P.used_bytes = saved_used + 8;
+    CHECK_ST(pm::split(pool, 1, out_new), pm::Status::CorruptMetadata);
+    CHECK(out_new == (pm::PoolId)0x00AB);
+    CHECK(P.structure_epoch == saved_epoch);
+    CHECK(g().pools[would].state == PoolState::Empty);
+    P.used_bytes = saved_used;
+    VALIDATE(pool);
+    verify(a, 128, 45); verify(b, 128, 46);
+
+    // A healthy split still succeeds afterwards.
+    pm::PoolId n{};
+    CHECK_ST(pm::split(pool, 1, n), pm::Status::Ok);
+    VALIDATE(pool); VALIDATE(n);
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    pm::RawRef cb = b; cb.pool_hint = pm::CROSS_HINT;
+    CHECK_ST(pm::free(cb), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+    CHECK_ST(pm::destroy_pool(n), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R42) A4-05 residual: free() must refuse a damaged free-list in bounded
+// time, before ANY bins write and before the destroy callback. Two shapes:
+// a reciprocal 2-cycle that excludes the merge target (the bounded walk
+// refuses), and an out-of-pool cursor (the range screen refuses).
+// ---------------------------------------------------------------------------
+static void test_bin_cycle_free() {
+    printf("  [R42] free refuses cyclic / out-of-pool bin lists\n");
+    using namespace pm::internal;
+    // Layout: o0 [0,16) o1 [16,32,pinned) o2 [32,48) o3 [48,64) o4 [64,80)
+    // o5 [80,96) -- o5 keeps o4's freed block from merging with the tail.
+    // After freeing o0/o2/o4 the 16 B bin is head->Y(64)->X(32)->T(0); the
+    // block being freed (o1) merges backward with T, whose bin walk must
+    // terminate on the injected damage.
+    auto setup = [&](pm::PoolId& pool, pm::RawRef (&o)[6], pm::internal::FreeBlock*& fbT,
+                     pm::internal::FreeBlock*& fbX, pm::internal::FreeBlock*& fbY) {
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        for (uint32_t i = 0; i < 6; ++i)
+            CHECK_ST(pm::alloc(pool, 8, 8, i == 1 ? pm::PM_PINNED : 0, i, o[i]),
+                     pm::Status::Ok);
+        CHECK_ST(pm::free(o[0]), pm::Status::Ok); // T
+        CHECK_ST(pm::free(o[2]), pm::Status::Ok); // X
+        CHECK_ST(pm::free(o[4]), pm::Status::Ok); // Y (head); o5 keeps it unmerged
+        VALIDATE(pool);
+        using namespace pm::internal;
+        uint8_t* base = seg_base(g().pools[pool].segment_first);
+        fbT = reinterpret_cast<FreeBlock*>(base);
+        fbX = reinterpret_cast<FreeBlock*>(base + 32);
+        fbY = reinterpret_cast<FreeBlock*>(base + 64);
+        CHECK((fbT->header & BLOCK_FREE_BIT) != 0 && (fbX->header & BLOCK_FREE_BIT) != 0 &&
+              (fbY->header & BLOCK_FREE_BIT) != 0);
+    };
+    auto restore_links = [&](pm::internal::FreeBlock* fbT, pm::internal::FreeBlock* fbX,
+                             pm::internal::FreeBlock* fbY,
+                             uint32_t stn, uint32_t stp,
+                             uint32_t sx, uint32_t sxb, uint32_t sy, uint32_t syb) {
+        fbT->next = stn; fbT->prev = stp;
+        fbX->next = sx; fbX->prev = sxb;
+        fbY->next = sy; fbY->prev = syb;
+    };
+
+    // (1) reciprocal 2-cycle X <-> Y excluding the merge target T.
+    {
+        fresh();
+        pm::PoolId pool{};
+        pm::RawRef o[6];
+        pm::internal::FreeBlock *fbT, *fbX, *fbY;
+        setup(pool, o, fbT, fbX, fbY);
+        uint32_t const stn = fbT->next, stp = fbT->prev;
+        uint32_t const sx = fbX->next, sxb = fbX->prev, sy = fbY->next, syb = fbY->prev;
+        CHECK_ST(pm::set_destroy_fn(o[1], &counting_destroy), pm::Status::Ok);
+        g_destroy_calls = 0;
+        pm::RawRef const refs[1] = {o[1]};
+        snap_all(pool, pool, refs, 1, seg_base(g().pools[pool].segment_first), 2 * 4096);
+        using namespace pm::internal;
+        fbX->next = fbX->prev = off_of(fbY);
+        fbY->next = fbY->prev = off_of(fbX);
+        CHECK_ST(pm::free(o[1]), pm::Status::CorruptMetadata); // bounded walk
+        restore_links(fbT, fbX, fbY, stn, stp, sx, sxb, sy, syb);
+        check_all_unchanged(pool, pool, refs, 1, seg_base(g().pools[pool].segment_first),
+                            2 * 4096); // no bins write, no counter drift
+        CHECK(g_destroy_calls == 0);   // the callback waits for the proof
+        CHECK_ST(pm::free(o[1]), pm::Status::Ok); // healthy again
+        CHECK(g_destroy_calls == 1);
+        CHECK_ST(pm::free(o[3]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[5]), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+        done();
+    }
+
+    // (2) bin cursor pushed outside the pool.
+    {
+        fresh();
+        pm::PoolId pool{};
+        pm::RawRef o[6];
+        pm::internal::FreeBlock *fbT, *fbX, *fbY;
+        setup(pool, o, fbT, fbX, fbY);
+        uint32_t const stn = fbT->next, stp = fbT->prev;
+        uint32_t const sx = fbX->next, sxb = fbX->prev, sy = fbY->next, syb = fbY->prev;
+        g_destroy_calls = 0;
+        CHECK_ST(pm::set_destroy_fn(o[1], &counting_destroy), pm::Status::Ok);
+        pm::RawRef const refs[1] = {o[1]};
+        snap_all(pool, pool, refs, 1, seg_base(g().pools[pool].segment_first), 2 * 4096);
+        fbY->next = 0xFFFFFFF0u; // out-of-pool cursor behind the head
+        CHECK_ST(pm::free(o[1]), pm::Status::CorruptMetadata);
+        restore_links(fbT, fbX, fbY, stn, stp, sx, sxb, sy, syb);
+        check_all_unchanged(pool, pool, refs, 1, seg_base(g().pools[pool].segment_first),
+                            2 * 4096);
+        CHECK(g_destroy_calls == 0);
+        CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[3]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[5]), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (R47) A4-10: free-block header surgery that validate() must refuse.
+//   (a) a middle free block shrunk by 32 B with bin and successor prev_size
+//       updated consistently -- the created internal hole cannot hide (the
+//       successor's prev_size chain or the coverage audit refuses);
+//   (b) the same surgery on the LAST free block -- a pure tail hole, refused
+//       by the coverage audit's tail check;
+//   (c) a size-class-consistent free block (prev_size 0) stamped over a live
+//       payload -- refused as an overlap.
+// All three refusals are side-effect free (snapshot compare).
+// ---------------------------------------------------------------------------
+static void test_validate_stage3() {
+    printf("  [R47] free-block header surgery refused\n");
+    auto wr32 = [](void* p, uint32_t v) { memcpy(p, &v, 4); };
+    // core.cpp reads a block size as header & ~BLOCK_FREE_BIT; mirrored here
+    // because blk_size_of() is deliberately not exported.
+    auto blksz = [](void const* p) {
+        uint32_t v;
+        memcpy(&v, p, 4);
+        return v & ~pm::internal::BLOCK_FREE_BIT;
+    };
+
+    // (a) middle free block shrunk by 32 B.
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef a{}, b{}, c{};
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 2, b), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 3, c), pm::Status::Ok);
+        CHECK_ST(pm::free(b), pm::Status::Ok);
+        VALIDATE(pool);
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        auto* fb = reinterpret_cast<FreeBlock*>(seg_base(P.segment_first) + 136);
+        CHECK(blksz(fb) == 136 && (fb->header & pm::internal::BLOCK_FREE_BIT) != 0);
+        uint8_t* cblk = g().objects[c.index].address - BLOCK_HEADER_SIZE;
+        pm::RawRef refs[2] = {a, c};
+        snap_all(pool, pool, refs, 2, seg_base(P.segment_first), 2 * 4096);
+        bins_remove(P.bins, fb);
+        fb->header = (136 - 32) | BLOCK_FREE_BIT;
+        bins_insert(P.bins, fb);
+        wr32(cblk + 4, 104); // successor's prev_size follows the new size
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+        // restore
+        bins_remove(P.bins, fb);
+        fb->header = 136 | BLOCK_FREE_BIT;
+        bins_insert(P.bins, fb);
+        wr32(cblk + 4, 136);
+        check_all_unchanged(pool, pool, refs, 2, seg_base(P.segment_first), 2 * 4096);
+        VALIDATE(pool);
+        CHECK_ST(pm::free(a), pm::Status::Ok);
+        CHECK_ST(pm::free(c), pm::Status::Ok);
+        done();
+    }
+
+    // (b) the last free block shrunk by 32 B: pure tail hole.
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef a{}, b{};
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 2, b), pm::Status::Ok);
+        CHECK_ST(pm::free(b), pm::Status::Ok); // merges with the tail block
+        VALIDATE(pool);
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        auto* fb = reinterpret_cast<FreeBlock*>(seg_base(P.segment_first) + 136);
+        uint32_t const sz = blksz(fb);
+        CHECK(sz == 2 * 4096 - 136);
+        pm::RawRef refs[1] = {a};
+        snap_all(pool, pool, refs, 1, seg_base(P.segment_first), 2 * 4096);
+        bins_remove(P.bins, fb);
+        fb->header = (sz - 32) | BLOCK_FREE_BIT;
+        bins_insert(P.bins, fb);
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata); // 32 B tail hole
+        bins_remove(P.bins, fb);
+        fb->header = sz | BLOCK_FREE_BIT;
+        bins_insert(P.bins, fb);
+        check_all_unchanged(pool, pool, refs, 1, seg_base(P.segment_first), 2 * 4096);
+        VALIDATE(pool);
+        CHECK_ST(pm::free(a), pm::Status::Ok);
+        done();
+    }
+
+    // (c) a class-consistent free block stamped over live payload.
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        pm::RawRef a{}, b{}, c{};
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 2, b), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, 128, 8, 0, 3, c), pm::Status::Ok);
+        fill(c, 128, 55);
+        CHECK_ST(pm::free(b), pm::Status::Ok);
+        VALIDATE(pool);
+        using namespace pm::internal;
+        Pool& P = g().pools[pool];
+        uint8_t* base = seg_base(P.segment_first);
+        pm::RawRef refs[2] = {a, c};
+        snap_all(pool, pool, refs, 2, base, 2 * 4096);
+        // Stamp a 96 B free block at base+304 -- inside c's payload
+        // [280,408) -- with prev_size 0, binned in its own size class.
+        auto* fake = reinterpret_cast<FreeBlock*>(base + 304);
+        uint8_t stamp[16];
+        memcpy(stamp, fake, sizeof(stamp)); // c's payload bytes under the stamp
+                                            // (header, prev_size, prev, next)
+        fake->header = 96 | BLOCK_FREE_BIT;
+        fake->prev_size = 0;
+        fake->prev = fake->next = NULL_OFF;
+        bins_insert(P.bins, fake);
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata); // overlap
+        bins_remove(P.bins, fake);
+        memcpy(fake, stamp, sizeof(stamp)); // un-stamp c's payload
+        check_all_unchanged(pool, pool, refs, 2, base, 2 * 4096);
+        VALIDATE(pool);
+        verify(c, 128, 55); // payload untouched by the refused validate
+        CHECK_ST(pm::free(a), pm::Status::Ok);
+        CHECK_ST(pm::free(c), pm::Status::Ok);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (R48) A4-11: advice negativity. An INVALID_REQUEST is reported on EVERY
+// poll (never suppressed, never cached); a damaged order list is
+// INVALID_METADATA and reported once, recovery again; alignment 0 in a
+// request defaults to 8 instead of being rejected.
+// ---------------------------------------------------------------------------
+static void test_advice_negative() {
+    printf("  [R48] advice: repeated INVALID_REQUEST, cycle, align 0\n");
+    using Verdict = pm::CompactionVerdict;
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef o[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+        CHECK_ST(pm::alloc(pool, 800, 8, 0, i, o[i]), pm::Status::Ok);
+        fill(o[i], 800, 60 + i);
+    }
+    CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+
+    bool changed = false;
+    pm::CompactionAdvice base = pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == true);
+    CHECK(base.verdict == Verdict::NO_ACTION);
+    pm::poll_compaction_advice(pool, nullptr, &changed);
+    CHECK(changed == false);
+
+    // The same illegal request twice: changed == true both times.
+    pm::CompactionRequest bad{800, 3, 0, 1};
+    pm::CompactionAdvice r1 = pm::poll_compaction_advice(pool, &bad, &changed);
+    CHECK(changed == true);
+    CHECK(r1.verdict == Verdict::INVALID_REQUEST);
+    pm::CompactionAdvice r2 = pm::poll_compaction_advice(pool, &bad, &changed);
+    CHECK(changed == true);
+    CHECK(r2.verdict == Verdict::INVALID_REQUEST);
+
+    // alignment == 0 defaults to PM_ALIGNMENT: a normal verdict.
+    pm::CompactionRequest align0{800, 0, 0, 1};
+    pm::CompactionAdvice r3 = pm::poll_compaction_advice(pool, &align0, &changed);
+    CHECK(r3.verdict != Verdict::INVALID_REQUEST);
+
+    // Damaged order list (self-cycle): INVALID_METADATA, reported once.
+    {
+        using namespace pm::internal;
+        uint32_t const saved_next = g().objects[o[2].index].addr_next;
+        g().objects[o[2].index].addr_next = o[2].index;
+        pm::CompactionAdvice r4 = pm::poll_compaction_advice(pool, nullptr, &changed);
+        CHECK(changed == true);
+        CHECK(r4.verdict == Verdict::INVALID_METADATA);
+        pm::poll_compaction_advice(pool, nullptr, &changed);
+        CHECK(changed == false); // identical damage suppressed
+        g().objects[o[2].index].addr_next = saved_next;
+        pm::poll_compaction_advice(pool, nullptr, &changed);
+        CHECK(changed == true); // recovery reported
+    }
+    VALIDATE(pool);
+    CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+    CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R49) A4-13: a refused maintenance operation on a Paused pool restores the
+// Paused state (not Running), keeps the epoch, and a healthy path still
+// works after resume.
+// ---------------------------------------------------------------------------
+static void test_paused_restore() {
+    printf("  [R49] refused maintenance keeps a paused pool paused\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef a{}, b{};
+    CHECK_ST(pm::alloc(pool, 128, 8, 0, 1, a), pm::Status::Ok);
+    CHECK_ST(pm::alloc(pool, 128, 8, 0, 2, b), pm::Status::Ok);
+    fill(a, 128, 51); fill(b, 128, 52);
+    CHECK_ST(pm::pause(pool), pm::Status::Ok);
+    CHECK(get_stats_state(pool) == 2); // Paused
+    using namespace pm::internal;
+    Pool const& P = g().pools[pool];
+    uint32_t const saved_bs = g().objects[a.index].block_size;
+    g().objects[a.index].block_size = saved_bs + 1; // unaligned: refused
+    uint32_t const saved_epoch = P.structure_epoch;
+    pm::RawRef const refs[2] = {a, b};
+    snap_all(pool, pool, refs, 2, seg_base(P.segment_first), 2 * 4096);
+
+    pm::PoolId out_new = (pm::PoolId)0x00CD;
+    CHECK_ST(pm::compact(pool), pm::Status::CorruptMetadata);
+    CHECK(get_stats_state(pool) == 2); // still Paused
+    CHECK_ST(pm::split(pool, 1, out_new), pm::Status::CorruptMetadata);
+    CHECK(out_new == (pm::PoolId)0x00CD); // out untouched
+    CHECK(get_stats_state(pool) == 2);    // still Paused
+    CHECK(P.structure_epoch == saved_epoch);
+    check_all_unchanged(pool, pool, refs, 2, seg_base(P.segment_first), 2 * 4096);
+    g().objects[a.index].block_size = saved_bs;
+
+    CHECK_ST(pm::resume(pool), pm::Status::Ok);
+    CHECK_ST(pm::compact(pool), pm::Status::Ok); // healthy path
+    VALIDATE(pool);
+    verify(a, 128, 51); verify(b, 128, 52);
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    CHECK_ST(pm::free(b), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R50) A2M F-01: a zero-length access AT the tail offset (offset == size,
+// access 0) is legal and resolves to payload + size; one byte more (access
+// size or offset) is InvalidRef.
+// ---------------------------------------------------------------------------
+static void test_zero_len_access() {
+    printf("  [R50] zero-length tail access legal, one byte past refused\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, r), pm::Status::Ok);
+    void* base = nullptr;
+    CHECK_ST(pm::resolve(r, 0, 1, base), pm::Status::Ok);
+
+    pm::RawRef tail = r;
+    tail.offset = 64;
+    void* p = nullptr;
+    CHECK_ST(pm::borrow_begin(tail, 0, 1, p), pm::Status::Ok);
+    CHECK(p == static_cast<uint8_t*>(base) + 64);
+    pm::borrow_end(tail);
+    p = nullptr;
+    CHECK_ST(pm::resolve(tail, 0, 1, p), pm::Status::Ok);
+    CHECK(p == static_cast<uint8_t*>(base) + 64);
+
+    pm::RawRef one = tail;
+    p = nullptr;
+    CHECK_ST(pm::borrow_begin(one, 1, 1, p), pm::Status::InvalidRef); // 1 byte at tail
+    CHECK(p == nullptr);
+    pm::RawRef past = r;
+    past.offset = 65;
+    CHECK_ST(pm::resolve(past, 0, 1, p), pm::Status::InvalidRef); // offset N+1
+    CHECK(p == nullptr);
+    CHECK_ST(pm::free(r), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R51) A2M F-02 / A4-14: generation wrap skips the reserved zero, on both
+// paths that bump it: free's post-increment and alloc's next_generation on a
+// reused slot. The 0xFFFF reference is dead afterwards.
+// ---------------------------------------------------------------------------
+static void test_generation_wrap() {
+    printf("  [R51] generation wrap skips zero, on both bump paths\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, r), pm::Status::Ok);
+    using namespace pm::internal;
+    // Path 1: free()'s post-increment wraps 0xFFFF -> 1.
+    g().objects[r.index].generation = 0xFFFF;
+    r.generation = 0xFFFF; // the ref must match for free() to accept it
+    CHECK_ST(pm::free(r), pm::Status::Ok);
+    CHECK(g().objects[r.index].generation == 1); // skipped 0
+
+    // Path 2: alloc()'s next_generation wraps the FREE slot's 0xFFFF -> 1.
+    CHECK(g().free_slot_head == r.index); // the freed slot is the LIFO head
+    g().objects[r.index].generation = 0xFFFF;
+    pm::RawRef r2{};
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 2, r2), pm::Status::Ok);
+    CHECK(r2.index == r.index);  // same slot reused
+    CHECK(r2.generation == 1);   // wrapped, never 0
+    void* p = nullptr;
+    CHECK_ST(pm::resolve(r2, 0, 1, p), pm::Status::Ok); // the new ref is usable
+    pm::RawRef stale = r2;
+    stale.generation = 0xFFFF;
+    CHECK_ST(pm::resolve(stale, 0, 1, p), pm::Status::InvalidRef); // old ref dead
+    CHECK_ST(pm::free(r2), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R52) A2M F1/R6: a gap of EXACTLY PM_MIN_BLOCK (16 B) between live blocks
+// is a real binned free block after compact -- never poisoned into slack.
+// A pinned filler consumes the segment tail so the 16 B hole is the only
+// free block and largest_free_block pins it exactly.
+// ---------------------------------------------------------------------------
+static void test_gap16_boundary() {
+    printf("  [R52] 16 B gap is binned, not poisoned\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 1), pm::Status::Ok);
+    pm::RawRef a{}, b{}, c{}, tail{};
+    CHECK_ST(pm::alloc(pool, 16, 8, 0, 1, a), pm::Status::Ok);            // [0,24)
+    CHECK_ST(pm::alloc(pool, 8, 8, 0, 2, b), pm::Status::Ok);             // [24,40)
+    CHECK_ST(pm::alloc(pool, 8, 8, pm::PM_PINNED, 3, c), pm::Status::Ok); // [40,56)
+    CHECK_ST(pm::alloc(pool, 4032, 8, pm::PM_PINNED, 4, tail), pm::Status::Ok); // [56,4096)
+    CHECK_ST(pm::free(b), pm::Status::Ok);
+    VALIDATE(pool);
+    CHECK_ST(pm::compact(pool), pm::Status::Ok);
+    pm::PoolStats st = pm::get_stats(pool);
+    CHECK(st.fragment_bytes == 0);      // the hole is a block, not slack
+    CHECK(st.largest_free_block == 16); // exactly PM_MIN_BLOCK
+    VALIDATE(pool);
+    CHECK_ST(pm::free(a), pm::Status::Ok);
+    CHECK_ST(pm::free(c), pm::Status::Ok);
+    CHECK_ST(pm::free(tail), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R53) A4-09: the overflow band. size 0xFFFFFFF8 passes alloc's first
+// overflow check but must fail the payload+header one (NoSpace), and the
+// same request to the advice is INVALID_REQUEST at the same checkpoint --
+// distinct from R32's FL-ceiling vector.
+// ---------------------------------------------------------------------------
+static void test_overflow_band() {
+    printf("  [R53] 0xFFFFFFF8 refused on the payload overflow band\n");
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(pool, 0xFFFFFFF8u, 8, 0, 1, r), pm::Status::NoSpace);
+    CHECK(r.generation == 0);
+    pm::CompactionRequest req{0xFFFFFFF8u, 8, 0, 1};
+    CHECK(pm::analyze_compaction(pool, &req).verdict ==
+          pm::CompactionVerdict::INVALID_REQUEST);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R46) A4-07: exhaustion matrix. (a) all PM_MAX_OBJECTS descriptor slots go
+// live; a further alloc is NoSpace while old refs stay freeable and the slot
+// chain recycles LIFO. (b) pool-table exhaustion (16 pools with segments
+// still free) vs segment exhaustion (free slot with no segments). (c) the
+// refusal parameter matrix, including init() alignment refusals while down.
+// ---------------------------------------------------------------------------
+static void test_exhaustion_matrix() {
+    printf("  [R46] slot / pool-table / segment exhaustion matrix\n");
+
+    // (a) slot exhaustion.
+    {
+        fresh();
+        pm::PoolId pool{};
+        CHECK_ST(pm::create_pool(pool, 60), pm::Status::Ok);
+        static pm::RawRef refs[PM_MAX_OBJECTS];
+        uint32_t n = 0;
+        for (; n < PM_MAX_OBJECTS; ++n) {
+            if (pm::alloc(pool, 1, 8, 0, n, refs[n]) != pm::Status::Ok) break;
+        }
+        CHECK(n == PM_MAX_OBJECTS); // the whole slot table is live
+        fill(refs[7], 1, 7);
+        fill(refs[900], 1, 900);
+        pm::RawRef extra{};
+        CHECK_ST(pm::alloc(pool, 1, 8, 0, 0xFFFF, extra), pm::Status::NoSpace);
+        CHECK(extra.generation == 0);
+        // Old refs still free; the freed slots recycle LIFO.
+        verify(refs[900], 1, 900);
+        CHECK_ST(pm::free(refs[7]), pm::Status::Ok);
+        CHECK_ST(pm::free(refs[900]), pm::Status::Ok);
+        pm::RawRef re7{};
+        CHECK_ST(pm::alloc(pool, 1, 8, 0, 7, re7), pm::Status::Ok);
+        CHECK(re7.index == 900); // LIFO: the most recently freed slot
+        CHECK(re7.generation != refs[900].generation);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (i == 7 || i == 900) continue; // freed above
+            CHECK_ST(pm::free(refs[i]), pm::Status::Ok);
+        }
+        CHECK_ST(pm::free(re7), pm::Status::Ok);
+        VALIDATE(pool);
+        done();
+    }
+
+    // (b1) pool-table exhaustion: 16 pools with 3 segments still free.
+    {
+        fresh();
+        pm::PoolId ids[16];
+        for (uint32_t i = 0; i < 15; ++i)
+            CHECK_ST(pm::create_pool(ids[i], 4), pm::Status::Ok);
+        pm::PoolId tiny{};
+        CHECK_ST(pm::create_pool(tiny, 1), pm::Status::Ok); // 16 pools, 61/64 segments
+        pm::PoolId extra{};
+        CHECK_ST(pm::create_pool(extra, 1), pm::Status::NoSpace); // table full
+        CHECK_ST(pm::create_pool(extra, 0), pm::Status::NoSpace);
+        CHECK_ST(pm::destroy_pool(tiny), pm::Status::Ok);
+        CHECK_ST(pm::create_pool(extra, 3), pm::Status::Ok); // the 3 free segments
+        CHECK_ST(pm::create_pool(extra, 1), pm::Status::NoSpace); // full again
+        for (uint32_t i = 0; i < 15; ++i)
+            CHECK_ST(pm::destroy_pool(ids[i]), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(extra), pm::Status::Ok);
+        done();
+    }
+
+    // (b2) segment exhaustion with a free pool-table slot.
+    {
+        fresh();
+        pm::PoolId ids[16];
+        for (uint32_t i = 0; i < 14; ++i)
+            CHECK_ST(pm::create_pool(ids[i], 4), pm::Status::Ok);
+        pm::PoolId big{};
+        CHECK_ST(pm::create_pool(big, 8), pm::Status::Ok); // 15 pools, 64/64 segments
+        pm::PoolId extra{};
+        CHECK_ST(pm::create_pool(extra, 1), pm::Status::NoSpace); // zone full
+        CHECK_ST(pm::destroy_pool(big), pm::Status::Ok);
+        CHECK_ST(pm::create_pool(extra, 9), pm::Status::NoSpace); // only 8 free
+        CHECK_ST(pm::create_pool(extra, 8), pm::Status::Ok);      // exact fit
+        for (uint32_t i = 0; i < 14; ++i)
+            CHECK_ST(pm::destroy_pool(ids[i]), pm::Status::Ok);
+        CHECK_ST(pm::destroy_pool(extra), pm::Status::Ok);
+        done();
+    }
+
+    // (c) refusal parameter matrix. The init() refusals run while down.
+    CHECK_ST(pm::init(pm::Config{g_zone, sizeof(g_zone), 512}), pm::Status::InvalidAlignment);
+    CHECK_ST(pm::init(pm::Config{reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(g_zone) + 4),
+                                 sizeof(g_zone) - 4, 4096}),
+             pm::Status::InvalidAlignment); // zone pointer misaligned
+    fresh();
+    pm::PoolId p{};
+    CHECK_ST(pm::create_pool(p, 4), pm::Status::Ok);
+    pm::PoolId out{};
+    CHECK_ST(pm::split(p, 0, out), pm::Status::NoSpace);
+    CHECK_ST(pm::split(p, 4, out), pm::Status::NoSpace);
+    CHECK_ST(pm::merge(p, p), pm::Status::InvalidPool);
+    CHECK_ST(pm::pause((pm::PoolId)9), pm::Status::InvalidPool);
+    CHECK_ST(pm::resume((pm::PoolId)9), pm::Status::InvalidPool);
+    CHECK_ST(pm::validate((pm::PoolId)9), pm::Status::InvalidPool);
+    CHECK_ST(pm::destroy_pool((pm::PoolId)9), pm::Status::InvalidPool);
+    CHECK_ST(pm::create_pool(out, 0), pm::Status::NoSpace);
+    CHECK_ST(pm::destroy_pool(p), pm::Status::Ok);
+    done();
+}
+
+// ---------------------------------------------------------------------------
 static void run(const char* name, void (*fn)()) {
     printf("[TEST] %s\n", name);
     uint32_t const f0 = g_fails;
@@ -3946,6 +4891,23 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R33_advice_change_key", test_advice_change_key);
     run("R34_advice_owner_gate", test_advice_owner_gate);
     run("R35_advice_estimate_and_counters", test_advice_estimate_and_counters);
+    run("R36_midgap_slack", test_midgap_slack);
+    run("R37_post_deinit", test_post_deinit);
+    run("R38_alloc_order_head_guard", test_alloc_order_head_guard);
+    run("R39_free_order_link_guard", test_free_order_link_guard);
+    run("R40_dup_address", test_dup_address);
+    run("R41_split_injection", test_split_injection);
+    run("R42_bin_cycle_free", test_bin_cycle_free);
+    run("R43_create_pool_segment_bounds", test_create_pool_segment_bounds);
+    run("R44_pool_geometry_zone_limit", test_pool_geometry_zone_limit);
+    run("R46_exhaustion_matrix", test_exhaustion_matrix);
+    run("R47_validate_stage3", test_validate_stage3);
+    run("R48_advice_negative", test_advice_negative);
+    run("R49_paused_restore", test_paused_restore);
+    run("R50_zero_len_access", test_zero_len_access);
+    run("R51_generation_wrap", test_generation_wrap);
+    run("R52_gap16_boundary", test_gap16_boundary);
+    run("R53_overflow_band", test_overflow_band);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

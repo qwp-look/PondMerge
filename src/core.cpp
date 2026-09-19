@@ -151,11 +151,47 @@ inline uint8_t* pool_start(Pool const& P) { return seg_base(P.segment_first); }
 inline uint8_t* pool_end(Pool const& P) { return seg_base((uint32_t)P.segment_first + P.segment_count); }
 inline uint32_t pool_capacity(Pool const& P) { return (uint32_t)P.segment_count * g().segment_size; }
 
+// O(1) geometry proof for a pool's segment window (round-11 fix 4). Both the
+// segment sum and the byte volume are computed in uint64 so a corrupted
+// segment_count can neither wrap nor overflow its way into a valid-looking
+// window; the byte bound also holds the window against G.zone_size
+// independently of the segment count. Every entry that derives a range or a
+// pointer from pool geometry calls this exactly once:
+//   check_ref()        -- free/borrow_begin/resolve/set_destroy_fn
+//   alloc()            -- before any mutation
+//   precheck_pool()    -- compact/merge/split (and the advice audit via its
+//                         own counter reconciliation)
+//   create_pool()      -- for every EXISTING pool (round-11 fix 3: the
+//                         used[] scan below must never trust an unproven
+//                         window, or it writes out of bounds and hides live
+//                         segments from the free-run search)
+inline bool pool_geometry_ok(Pool const& P) {
+    GlobalState const& G = g();
+    uint64_t const seg_end = (uint64_t)P.segment_first + P.segment_count;
+    if (seg_end > G.segment_count) return false;
+    return seg_end * (uint64_t)G.segment_size <= (uint64_t)G.zone_size;
+}
+
 Pool* pool_at(PoolId id) {
     if (id >= PM_MAX_POOLS) return nullptr;
     Pool& P = g().pools[id];
     return P.state == PoolState::Empty ? nullptr : &P;
 }
+
+// Round-11 fix 7 (task-book section 4: "Debug should report an impending
+// wrap"): the two counters below remap their wrap to 1 because 0 is reserved.
+// The remap was silent; Debug now reports it. Compiled to nothing in Release,
+// and the branch is reachable only after 2^32 epoch bumps or 65535 slot
+// reuses, so the hot paths pay nothing.
+#if PM_DEBUG
+void pm_wrap_note(char const* what) {
+#if defined(PM_ESP32)
+    printf("PM_DEBUG: %s wrapped; counter remapped to 1 (0 is reserved)\n", what);
+#else
+    fprintf(stderr, "PM_DEBUG: %s wrapped; counter remapped to 1 (0 is reserved)\n", what);
+#endif
+}
+#endif
 
 inline void bump_epoch(uint32_t& epoch) {
     // Wrap-around guard: 0 is reserved (doc section 4). Only reachable after
@@ -163,7 +199,12 @@ inline void bump_epoch(uint32_t& epoch) {
     // a zero epoch would read as "no address change" to a caller.
     // cppcheck-suppress knownConditionTrueFalse ; the wrap from 0xFFFFFFFF is
     // real, cppcheck's value-range analysis cannot see the counter's history.
-    if (++epoch == 0) epoch = 1;
+    if (++epoch == 0) {
+#if PM_DEBUG
+        pm_wrap_note("address_epoch");
+#endif
+        epoch = 1;
+    }
 }
 
 // --- address-order list (sorted by block address) ---------------------------
@@ -192,6 +233,10 @@ void order_unlink(Pool& P, uint32_t idx) {
 // that round-4 R29 was written to guarantee.
 void order_append(Pool& P, uint32_t idx) {
     ObjectDesc* D = g().objects;
+    // The head is screened by alloc() (round-11 fix 1) because the write
+    // below dereferences it without a walk; the assert keeps a Debug tripwire
+    // on the write itself.
+    PM_ASSERT(P.order_head == NO_ORDER || P.order_head < PM_MAX_OBJECTS);
     D[idx].addr_prev = NO_ORDER;
     D[idx].addr_next = P.order_head;
     if (P.order_head != NO_ORDER) D[P.order_head].addr_prev = idx;
@@ -294,7 +339,13 @@ inline uint16_t next_generation(uint16_t gen) {
     uint16_t n = (uint16_t)(gen + 1); // wraps at 0xFFFF -> 0
     // cppcheck-suppress knownConditionTrueFalse ; the wrap is real, cppcheck
     // cannot prove the incoming value's range.
-    return n == 0 ? 1 : n;            // 0 reserved as invalid (doc section 4)
+    if (n == 0) {                     // 0 reserved as invalid (doc section 4)
+#if PM_DEBUG
+        pm_wrap_note("generation");
+#endif
+        return 1;
+    }
+    return n;
 }
 
 // --- reference validation (doc section 5 resolution rules 1-4) --------------
@@ -325,6 +376,15 @@ Status check_ref(RawRef const& ref, uint32_t access_size, uint32_t access_align,
     if (d.state != ObjState::Live) return Status::InvalidRef;
     if (d.generation != ref.generation) return Status::InvalidRef;
     if (!desc_block_consistent(d)) return Status::CorruptMetadata;
+    // Round-11 fix 2: order_unlink() dereferences these links directly during
+    // free() (O(1) contract, no walk), so a Live descriptor whose links point
+    // outside the descriptor table must be refused before any caller reaches
+    // a mutation path. One O(1) check here covers free/borrow/resolve alike;
+    // collect_live_sorted() keeps its own (stronger) chain checks on the
+    // maintenance side and is not duplicated.
+    if ((d.addr_prev != NO_ORDER && d.addr_prev >= PM_MAX_OBJECTS) ||
+        (d.addr_next != NO_ORDER && d.addr_next >= PM_MAX_OBJECTS))
+        return Status::CorruptMetadata;
     Pool* P = pool_at((PoolId)d.pool_id);
     if (!P) return Status::CorruptMetadata;
     // Pool-range proof (round-3 guide 5.1): the descriptor's block must sit
@@ -333,6 +393,10 @@ Status check_ref(RawRef const& ref, uint32_t access_size, uint32_t access_align,
     // arithmetic on a forged address would be undefined behaviour, and a
     // pool-outside-but-aligned address must never be handed out (R23).
     {
+        // Round-11 fix 4: pstart/pend below are derived from the pool's own
+        // segment fields; prove the geometry against the zone limit first
+        // (O(1)) or an inflated window widens the proof past the zone end.
+        if (!pool_geometry_ok(*P)) return Status::CorruptMetadata;
         uint64_t const zbase = (uint64_t)(uintptr_t)G.zone;
         uint64_t const aabs = (uint64_t)(uintptr_t)d.address;
         if (aabs < zbase + BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
@@ -432,6 +496,11 @@ Status precheck_pool(Pool const& P, PoolId pid, uint8_t const* start,
                      uint8_t const* end, uint16_t* out, uint32_t out_cap,
                      uint32_t& out_n) {
     GlobalState const& G = g();
+    // Round-11 fix 4: every range below is derived from the pool's segment
+    // fields; prove the geometry against the zone limit once (O(1)) before
+    // any of it is used, or compact/merge/split plan against a window that
+    // crosses the zone end.
+    if (!pool_geometry_ok(P)) return Status::CorruptMetadata;
     const uint64_t zone_base = (uint64_t)(uintptr_t)G.zone;
     const uint64_t start_off = (uint64_t)(uintptr_t)start - zone_base;
     const uint64_t end_off = (uint64_t)(uintptr_t)end - zone_base;
@@ -901,6 +970,12 @@ Status create_pool(PoolId& out, uint32_t segment_count) {
     for (uint32_t i = 0; i < PM_MAX_POOLS; ++i) {
         Pool const& P = G.pools[i];
         if (P.state == PoolState::Empty) continue;
+        // Round-11 fix 3: the window is written into used[] below and hides
+        // its segments from the free-run search, so an unproven window meant
+        // an out-of-bounds used[] write (bool[PM_MAX_SEGMENTS]) and/or a new
+        // pool created physically on top of a live pool's blocks. The proof
+        // is the same O(1) geometry check every other entry uses (fix 4).
+        if (!pool_geometry_ok(P)) return Status::CorruptMetadata;
         for (uint32_t s = 0; s < P.segment_count; ++s)
             used[P.segment_first + s] = true;
     }
@@ -1041,6 +1116,15 @@ Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
     Pool* P = pool_at(pool_id);
     if (!P) return Status::InvalidPool;
     if (P->state != PoolState::Running) return Status::Busy;
+    // O(1) corruption screens before any mutation (round-11 fixes 1 and 4):
+    // order_append() dereferences the pool's order_head without a walk, so a
+    // head outside [0, PM_MAX_OBJECTS) would write past the descriptor table;
+    // and the pool's byte range is derived from corruptible segment fields.
+    // Both refusals clear the output reference already (first statement) and
+    // touch nothing else -- the rollback below stays exactly as it was.
+    if (P->order_head != NO_ORDER && P->order_head >= PM_MAX_OBJECTS)
+        return Status::CorruptMetadata;
+    if (!pool_geometry_ok(*P)) return Status::CorruptMetadata;
     if (size == 0) return Status::InvalidRef;
     if (alignment == 0 || (alignment & (alignment - 1)) != 0 || alignment > PM_MAX_ALIGNMENT)
         return Status::InvalidAlignment;
@@ -1210,13 +1294,23 @@ Status free(RawRef const& ref) {
     };
     if (verify_neighbours() != Status::Ok) return Status::CorruptMetadata;
 
-    d.state = ObjState::Destroying;
-    if (d.destroy_fn) d.destroy_fn(d.address);
-    if (d.state != ObjState::Destroying) return Status::CorruptMetadata;
-    // The callback may allocate/free OTHER objects; that can change the
-    // physical layout around this block, so the proof is repeated before
-    // anything is mutated.
-    if (verify_neighbours() != Status::Ok) return Status::CorruptMetadata;
+    // Round-11 fix 5: the destroy callback, the post-callback state check and
+    // the second verification are one unit -- without a callback no code ran
+    // between the two verifications (single-owner contract: no allocator
+    // mutation can interleave), so the second proof would be a deterministic
+    // replay of the first. R24's "re-prove after the callback" contract is
+    // preserved verbatim for every object that HAS a callback, and the
+    // failure-output semantics are unchanged on every path (nothing is
+    // mutated before this block succeeds either way).
+    if (d.destroy_fn) {
+        d.state = ObjState::Destroying;
+        d.destroy_fn(d.address);
+        if (d.state != ObjState::Destroying) return Status::CorruptMetadata;
+        // The callback may allocate/free OTHER objects; that can change the
+        // physical layout around this block, so the proof is repeated before
+        // anything is mutated.
+        if (verify_neighbours() != Status::Ok) return Status::CorruptMetadata;
+    }
 
     // --- mutation phase: cannot fail ----------------------------------------
     uint32_t bsize = d.block_size;
@@ -1539,10 +1633,21 @@ CompactionAdvice analyze_compaction(PoolId pool_id, CompactionRequest const* exp
     // definition; fragment_bytes alone stays near zero in normal operation).
     uint64_t const stranded =
         (uint64_t)a.free_bytes - a.fragment_bytes - a.largest_free_block;
+    // Round-11 fix 6: the ratio test is cross-multiplied instead of divided.
+    // stranded*1000/capacity >= ratio_permille and
+    // stranded*1000 >= ratio_permille*capacity are equivalent for non-negative
+    // integers (floor(x/y) >= z  <=>  x >= z*y), and both sides are
+    // overflow-free in uint64: stranded < capacity <= zone size < 2^24 (the
+    // FL ceiling init() enforces), so the left side is < 2^34, and a
+    // caller-set uint32 permille times the capacity stays < 2^56. The
+    // division is a 64-bit soft divide (__udivdi3) on Xtensa; the reported
+    // fragment_ratio_permille field below keeps its division -- it is a
+    // public report value computed once, not a decision.
     bool const fragmented =
         (stranded >= s_advice_thresholds.fragment_min_bytes) &&
         (a.capacity != 0 &&
-         stranded * 1000 / a.capacity >= s_advice_thresholds.fragment_ratio_permille);
+         stranded * 1000 >=
+             (uint64_t)s_advice_thresholds.fragment_ratio_permille * a.capacity);
     if (blocked) {
         a.verdict = CompactionVerdict::COMPACT_BLOCKED;
     } else if (have_request) {

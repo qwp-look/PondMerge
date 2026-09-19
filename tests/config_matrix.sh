@@ -34,4 +34,36 @@ for fl in 16 24; do
     ./build/config_limits_$fl refuse
     ./build/config_limits_$fl accept
 done
+# PM_MIN_BLOCK=32 (A4-08): the minimum block grows to 32 B; alloc(1) and
+# alloc(8) must both occupy a 32-byte block and the pool must stay valid.
+# The variant carries its own assertions, so it is generated here rather than
+# reusing config_smoke.cpp (which asserts nothing about block sizes).
+cat > build/config_minblock32.cpp <<'EOF'
+#include "pondmerge/pondmerge.hpp"
+#include "../src/internal.h"
+#include <cstdio>
+
+static uint8_t zone[64 * 1024] __attribute__((aligned(16)));
+
+int main() {
+    if (pm::init({zone, sizeof(zone), 4096}) != pm::Status::Ok) return 1;
+    pm::PoolId pool{};
+    if (pm::create_pool(pool, 8) != pm::Status::Ok) return 1;
+    pm::RawRef r1{}, r8{};
+    if (pm::alloc(pool, 1, 8, 0, 1, r1) != pm::Status::Ok) return 1;
+    if (pm::alloc(pool, 8, 8, 0, 2, r8) != pm::Status::Ok) return 1;
+    using namespace pm::internal;
+    if (g().objects[r1.index].block_size != 32) return 1; // PM_MIN_BLOCK, not 16
+    if (g().objects[r8.index].block_size != 32) return 1;
+    if (pm::get_stats(pool).used_bytes != 64) return 1;
+    if (pm::validate(pool) != pm::Status::Ok) return 1;
+    if (pm::free(r1) != pm::Status::Ok || pm::free(r8) != pm::Status::Ok) return 1;
+    if (pm::deinit() != pm::Status::Ok) return 1;
+    printf("config smoke OK (PM_MIN_BLOCK=32)\n");
+    return 0;
+}
+EOF
+g++ -std=c++17 -Wall -Wextra -Wno-unused-parameter -O1 -DPM_MIN_BLOCK=32 -Iinclude -Isrc \
+    src/core.cpp build/config_minblock32.cpp -o build/config_minblock32
+./build/config_minblock32
 echo "configuration matrix PASSED"
