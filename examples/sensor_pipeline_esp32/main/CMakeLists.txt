@@ -50,9 +50,13 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
 
 # PM_SENSOR_NO_HOST_MAIN compiles out the example's host main(); app_main
 # drives it instead. The zone bytes and history cap are the ONLY differences
-# from the host run.
+# from the host run. PM_MAX_OBJECTS must match the value the pondmerge
+# component itself is built with (256, set via the root CMakeLists) so the
+# static_assert guarding the descriptor table at sensor_pipeline.cpp:126
+# checks against the REAL table size, not the 1024 default.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PM_SENSOR_NO_HOST_MAIN=1
+    PM_MAX_OBJECTS=256
     PM_SP_ZONE_BYTES=${PM_SP_ZONE_BYTES}
     PM_SP_KEEP_MAX=${PM_SP_KEEP_MAX}
     PM_SP_EXPORT_BYTES=${PM_SP_EXPORT_BYTES}

@@ -1,6 +1,10 @@
 // PondMerge v1 - platform port layer.
-// Single-core critical sections + a microsecond tick source for maintenance
-// window statistics. Define PM_ESP32 when building inside ESP-IDF.
+// Task-context critical section (on PM_ESP32: an SMP spinlock plus local
+// interrupt disable via portENTER_CRITICAL; on host: compiled to nothing) +
+// a microsecond tick source for maintenance window statistics. The locked
+// section must stay SHORT: it is a spinlock that other cores spin on, and
+// FreeRTOS forbids most API calls inside it. Define PM_ESP32 when building
+// inside ESP-IDF.
 #pragma once
 
 #include <stdint.h>

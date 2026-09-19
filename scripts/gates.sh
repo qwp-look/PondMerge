@@ -8,9 +8,11 @@
 #   scripts/gates.sh            # all eleven gates, in CONTRIBUTING.md's order
 #   scripts/gates.sh -v         # same, without collapsing each gate's output
 #
-# The expected pass counts (5,409,619 / 5,409,626 / 1,508,630 checks; model
+# The expected pass counts (5,428,675 / 5,428,682 / 1,527,686 checks; model
 # 466,859; protocol 95; HTTP 15) are stated in CONTRIBUTING.md section 3 -- a
 # gate that "passes" with different numbers is itself worth investigating.
+# (The San figure is the 3000-op default of run_host.sh --san; Debug and
+# Release run 10000 ops.)
 #
 # This script does NOT cover the device targets: flashing and capturing a real
 # board is documented in CONTRIBUTING.md section 4 and is deliberately not
@@ -50,15 +52,15 @@ run_gate() {
     fi
 }
 
-run_gate "1/10 suite + model (Debug, 10000 ops)" tests/run_host.sh
-run_gate "2/10 suite + model (Release)"          tests/run_host.sh --release
-run_gate "3/10 suite + model (ASan+UBSan)"       tests/run_host.sh --san
-run_gate "4/10 cppcheck (2.19.0-calibrated)"     tests/run_host.sh --cppcheck
-run_gate "5/10 TLSF configuration matrix"        tests/run_host.sh --configs
-run_gate "6/10 coverage (floor 85%)"             tests/run_host.sh --coverage
-run_gate "7/10 libFuzzer (bounded)"              tests/run_host.sh --fuzz
-run_gate "8/10 demo protocol regression"         python3 examples/protocol_smoke.py build/host_demo
-run_gate "9/10 demo HTTP regression"             python3 examples/http_smoke.py build/host_demo
+run_gate "1/11 suite + model (Debug, 10000 ops)" tests/run_host.sh
+run_gate "2/11 suite + model (Release)"          tests/run_host.sh --release
+run_gate "3/11 suite + model (ASan+UBSan)"       tests/run_host.sh --san
+run_gate "4/11 cppcheck (2.19.0-calibrated)"     tests/run_host.sh --cppcheck
+run_gate "5/11 TLSF configuration matrix"        tests/run_host.sh --configs
+run_gate "6/11 coverage (Debug + Release, floor 85%)" tests/run_host.sh --coverage
+run_gate "7/11 libFuzzer (bounded)"              tests/run_host.sh --fuzz
+run_gate "8/11 demo protocol regression"         python3 examples/protocol_smoke.py build/host_demo
+run_gate "9/11 demo HTTP regression"             python3 examples/http_smoke.py build/host_demo
 run_gate "10/11 sensor-pipeline example (self-audited)" sh -c '
     g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude -Isrc \
         examples/sensor_pipeline.cpp src/core.cpp -o build/sensor_pipeline || exit 1

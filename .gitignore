@@ -5,6 +5,13 @@ esp32/sdkconfig
 bench/esp32/sdkconfig
 esp32/sdkconfig.old
 esp32/dependencies.lock
+# ESP-IDF example projects generate their own sdkconfig / dependencies.lock on
+# first configure; they are machine-local like the ones above. Note: a gitignore
+# entry does NOT untrack an already-tracked file (examples/esp32_demo/sdkconfig
+# was committed before this line existed) -- whether to untrack it is the
+# maintainer's call, recorded in docs/HANDOVER_v16.md.
+examples/*/sdkconfig
+examples/*/dependencies.lock
 *.o
 # gcov writes one .gcov per source into the directory it was invoked from;
 # tests/run_host.sh --coverage invokes it inside build/cov. This is a safety net

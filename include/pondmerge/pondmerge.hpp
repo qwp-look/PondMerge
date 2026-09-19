@@ -12,6 +12,14 @@
 //   * alloc / free / resolve / get_stats / validate run in ONE owner
 //     execution context (thread/task). PondMerge does not make them safe for
 //     concurrent callers.
+//   * LIFECYCLE BOUNDARY (round-14): init/deinit/create_pool/destroy_pool are
+//     lifecycle-serial operations -- they must not run concurrently with ANY
+//     other API, including each other. They rewrite the pool table and global
+//     state directly and hold no borrow lock.
+//   * set_destroy_fn is a single-owner call, same level as alloc/free.
+//   * global_stats() is a RELAXED read of high-water counters: safe only under
+//     the single-owner contract, and it promises no per-field consistency --
+//     fields may straddle an in-flight operation.
 //   * borrow_begin/borrow_end and the pool state flips (pause/resume/compact
 //     entry) are internally synchronized, so pausing can never race a new
 //     borrow into existence.
@@ -158,8 +166,8 @@ Status validate(PoolId pool);
 // --- objects ----------------------------------------------------------------
 // alloc: first-fit inside the bin the TLSF bitmap selects, so it is
 // O(bin chain length) -- see the complexity note in the maintenance section.
-// Requests at or above 2^PM_FL_MAX are refused with NoSpace rather than being
-// clamped into the top bin.
+// PM_ZERO_INIT adds O(size) zeroing on top. Requests at or above 2^PM_FL_MAX
+// are refused with NoSpace rather than being clamped into the top bin.
 Status alloc(PoolId pool, uint32_t size, uint32_t alignment, uint16_t flags,
              uint32_t user_tag, RawRef& out);
 Status free(RawRef const& ref);

@@ -59,17 +59,26 @@ metadata_bytes = 72 + 476 * PM_MAX_POOLS + 98 * PM_MAX_OBJECTS   (Release)
                  Debug adds 9 bytes (advice owner gate: context id + flags)
 ```
 
+The closed form above is an **x86-64** figure and must not be carried to 32-bit
+targets: `ObjectDesc` contains one pointer, so on the ESP32-S3 it is 52 B
+rather than 64 B and the per-object term differs accordingly — about **82 B**
+per object (52 descriptor + 30 plan scratch) instead of 98 B. Measured device
+configuration: **256 objects / 16 pools → 28,672 B**. **For a RAM budget, read
+the runtime `global_stats().metadata_bytes`** — it is exact on every ABI; the
+closed formula is an illustration, not a contract.
+
 | `PM_MAX_OBJECTS` | `PM_MAX_POOLS` | `metadata_bytes` | real `.bss` | suits |
 |---|---|---|---|---|
 | 64 | 2 | 7,296 | 7,296 | very small targets |
 | 128 | 4 | 14,520 | 14,528 | small MCU |
 | 256 | 4 | 27,064 | 27,072 | small MCU (recommended start) |
-| **256** | **16** | **32,776** | **32,768** | **the ESP32-S3 acceptance firmware** |
+| **256** | **16** | **32,776** | **32,768** | **the ESP32-S3 acceptance firmware (x86-64 form; 28,672 B measured on the part)** |
 | 512 | 8 | 54,056 | 54,048 | medium |
 | 1024 | 16 | 108,040 | 108,032 | default (host / large-memory targets) |
 
 **The default costs about 105 KiB of static RAM, which most MCUs cannot afford.**
-Set `PM_MAX_OBJECTS=256` to bring it to roughly 31 KiB. `metadata_bytes` now
+At `PM_MAX_OBJECTS=256` the table is roughly 32 KiB on x86-64 and **28 KiB on a
+32-bit target** (28,672 B measured on the ESP32-S3). `metadata_bytes` now
 matches the linker's `.bss` to within ±8 bytes; leave a little margin anyway.
 (Before v1.0.0 that figure silently omitted the advice cache, under-reporting by
 128 B at 2 pools up to 960 B at 16 pools. It is included now.)
@@ -107,12 +116,12 @@ matches the linker's `.bss` to within ±8 bytes; leave a little margin anyway.
 
 | operation | worst case | note |
 |---|---|---|
-| `alloc` | **O(SL bin chain length)**, bounded by `zone_size / PM_MIN_BLOCK` | TLSF bitmap locates the bin, first-fit within it, then an **O(1)** append to the live-slot table. Not strictly O(1) — but **independent of the live-object count**. |
+| `alloc` | **O(SL bin chain length)**, bounded by `zone_size / PM_MIN_BLOCK` | TLSF bitmap locates the bin, first-fit within it, then an **O(1)** append to the live-slot table and two O(1) corruption screens. `PM_ZERO_INIT` adds O(size) zeroing on top. Not strictly O(1) — but **independent of the live-object count**. |
 | `free` | O(1 + neighbour free-bin chain length) | Read-only proof before merging; `CorruptMetadata` with zero side effects on damage. |
 | `pause` / `resume` | O(1) | |
 | `compact` / `split` | O(objects + moved bytes), plus O(objects log objects) to restore address order | |
 | `merge` | O(objects + free_blocks + moved bytes) | Audits both pools read-only; plan failure leaves both byte-identical. |
-| `validate` | O(live_objects × free_blocks) | Diagnostic. Quadratic; see below. |
+| `validate` | O((live_objects + free_objects)^2) | Diagnostic. Quadratic; see below. |
 | `get_stats` | O(free_blocks) | Measured at 2.7 µs with 1536 blocks — **not worth optimising**. |
 | `borrow_begin` / `resolve` / `borrow_end` | O(1) | |
 | `analyze_compaction` | O(objects log objects + free_blocks) | |
@@ -193,7 +202,8 @@ idf_component_register(SRCS "main.cpp" REQUIRES pondmerge)
 ```
 
 ```cmake
-set(PM_MAX_OBJECTS 256)   # ~105 KiB -> ~31 KiB of static RAM
+set(PM_MAX_OBJECTS 256)   # ~105 KiB -> ~28 KiB on a 32-bit target (28,672 B
+                          # measured on ESP32-S3; ~32 KiB on x86-64)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(your_app)
 ```
@@ -280,14 +290,14 @@ test `tests/concurrency_esp32.cpp`, which is never compiled on the host.
 
 | gate | result |
 |---|---|
-| Host Debug, 10000 ops | 5,409,619 checks, 0 failures |
-| Host Release, 10000 ops | 5,409,626 checks, 0 failures |
-| ASan + UBSan | 1,508,630 checks, 0 failures |
+| Host Debug, 10000 ops | 5,428,675 checks, 0 failures |
+| Host Release, 10000 ops | 5,428,682 checks, 0 failures |
+| ASan + UBSan, 3000 ops | 1,527,686 checks, 0 failures |
 | Reference-model differential (independent oracle, fixed seed) | 466,859 checks, 0 failures |
 | cppcheck (warning/style/performance) | exit 0 |
 | TLSF configuration matrix | PASSED |
 | Demo protocol / HTTP smoke | 95 / 15 checks, 0 failures |
-| Coverage of `src/core.cpp` | 96.47% of lines, 98.75% of branches executed (floor enforced) |
+| Coverage of `src/core.cpp` | 97.59% of lines, 98.80% of branches executed, 81.15% taken (Debug pass); the same gate also runs a Release pass (97.77% lines, 83.30% taken) — floor enforced on both |
 | libFuzzer, bounded run | no crash, no sanitizer finding |
 | **ESP32-S3 (n16r8) on hardware** | suite **1,120,457** + dual-core concurrency 28 + model 466,859 checks, **all 0 failures**; two runs from reset, identical counts |
 | **Classic ESP32 (D0WDQ6 v1.1) on hardware** | dual-core concurrency 28 + model 466,859 checks, 0 failures; two runs from reset, identical counts. **The suite is not run** — see below |
@@ -393,7 +403,7 @@ hardware isolation; hard real-time compaction guarantees.
 | [bench/README.md](bench/README.md) | Benchmark method, fairness rules, the timing-instrument rules, and what quoting a number requires |
 | [bench/RESULTS.md](bench/RESULTS.md) | Every measured number, the instrument's limits, and the negative results |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes and known boundaries |
-| docs/HANDOVER_v2–v14.md | Per-round audit reports |
+| docs/HANDOVER_v2–v16.md | Per-round audit reports (v16 is the latest) |
 
 ## Licence
 

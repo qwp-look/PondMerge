@@ -41,11 +41,11 @@ compact/merge/split。核心约束：**C++17 子集，无异常、无 RTTI、无
 
 ## 3. 怎么跑验证（host，改任何东西之后）
 
-一把全跑（十项，等价于下面逐条命令；CI 的 `benchmarks` job 是其中第 10 项
+一把全跑（十一项，等价于下面逐条命令；CI 的 `benchmarks` job 是其中第 11 项
 的来源）：
 
 ```sh
-scripts/gates.sh                # 全部十项；输出折叠，失败时保留末 30 行
+scripts/gates.sh                # 全部十一项；输出折叠，失败时保留末 30 行
 scripts/gates.sh -v             # 不折叠输出
 ```
 
@@ -55,9 +55,10 @@ scripts/gates.sh -v             # 不折叠输出
 tests/run_host.sh            # Debug，10000 ops（默认档）
 tests/run_host.sh --release  # Release
 tests/run_host.sh --san      # ASan+UBSan
-tests/run_host.sh --cppcheck # 静态检查（用 2.19.0 校准过；换版本先看 §0）
+tests/run_host.sh --cppcheck # 静态检查（用 2.19.0 校准过；换版本先看
+                             # tests/run_host.sh --cppcheck 分支的版本注释）
 tests/run_host.sh --configs  # TLSF 配置矩阵
-tests/run_host.sh --coverage # 覆盖率（下限 85%，低于即失败）
+tests/run_host.sh --coverage # 覆盖率（Debug + Release 两档，行覆盖下限 85%）
 tests/run_host.sh --fuzz     # libFuzzer 有界运行
 g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc \
     examples/host_demo.cpp src/core.cpp -o build/host_demo
@@ -76,9 +77,9 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra \
 真实场景集成参考是 `examples/sensor_pipeline.cpp`（host/设备同一份源码，
 设备工程在 `examples/sensor_pipeline_esp32/`）——写新集成时先读它。
 
-全部通过应看到 **5,409,619 (Debug) / 5,409,626 (Release) / 1,508,630 (San)
-checks, 0 failures**，模型对拍 **466,859**。CI（`.github/workflows/ci.yml`）
-在每次 push 上跑这十项 + 消费路径冒烟 + 基准构建。
+全部通过应看到 **5,428,675 (Debug) / 5,428,682 (Release) / 1,527,686 (San，
+3000 ops) checks, 0 failures**，模型对拍 **466,859**。CI（`.github/workflows/ci.yml`）
+在每次 push 上跑这十一项 + 消费路径冒烟 + 基准构建。
 
 ## 4. 怎么跑设备端（需要真实硬件）
 
@@ -126,9 +127,9 @@ idf.py -p /dev/ttyUSB0 flash          # UART0 经 CH340 桥接
 
 | 要知道什么 | 去哪 |
 |---|---|
-| 最新一轮的完整交接（第二颗芯片 + 指令数） | `docs/HANDOVER_v13.md` |
+| 最新一轮的完整交接（多代理审查与元数据筛查修复轮） | `docs/HANDOVER_v16.md` |
 | 全部实测数字、仪器限制、负结果 | `bench/RESULTS.md` |
 | 基准方法、公平性规则、引用数字的必备条件 | `bench/README.md` |
 | 不变式与证据（代码位置 + 证明 + 测试） | `docs/AUDIT_LEDGER.md` |
 | 用户侧集成（4 种方式）与元数据预算 | `README.md` |
-| 各轮收口报告 | `docs/HANDOVER_v2–v13.md` |
+| 各轮收口报告 | `docs/HANDOVER_v2–v16.md` |

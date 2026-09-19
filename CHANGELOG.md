@@ -7,6 +7,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Seventeen new red-test groups for the metadata-screening fixes (R36-R44,
+  R46-R53; R45 deliberately unused), plus a `PM_MIN_BLOCK=32` variant in
+  `tests/config_matrix.sh`.** Every fix below is pinned by at least one of
+  these groups, and the 32-byte minimum-block variant is what actually
+  exercises the `need < PM_MIN_BLOCK` clamps that are structurally dead at the
+  default 16 (`docs/AUDIT_LEDGER.md` section 7 records which branches are dead
+  at which configuration, so future rounds do not mistake them for gaps).
+
 - **A real-scenario integration reference: `examples/sensor_pipeline.cpp`.**
   One product-shaped workload -- a sensor node with a rotating pinned DMA
   ring, typed movable message history, and a periodic large batch-upload that
@@ -141,6 +149,57 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Four high-severity metadata-screening gaps are closed, each with an O(1)
+  proof and a red test** (found by a six-way multi-agent review with
+  adversarial rebuttal):
+
+    * `alloc()` appended to the live-slot list by dereferencing the pool's
+      `order_head` without a walk, so a corrupted head outside
+      `[0, PM_MAX_OBJECTS)` could write past the descriptor table. It is now
+      screened in O(1) before any mutation (R38).
+    * `free()`'s `order_unlink()` dereferences a live descriptor's
+      `addr_prev`/`addr_next` with no bounds check (the O(1) contract walks
+      nothing). `check_ref()` now refuses out-of-table links on
+      free/borrow/resolve alike, before any caller reaches a mutation path
+      (R39).
+    * `create_pool()` marked `used[segment_first + s]` for every existing pool
+      without proving the window, so a corrupted segment window meant an
+      out-of-bounds write into `bool[PM_MAX_SEGMENTS]` and/or a new pool
+      created physically on top of a live pool's blocks. Every existing
+      pool's window is now proven with the same O(1) geometry check before it
+      is used (R43).
+    * That geometry check (`pool_geometry_ok`, new) bounds the segment sum AND
+      the byte volume in uint64 against the zone size, so a corrupted
+      `segment_count` can neither wrap nor overflow its way into a
+      valid-looking window (R44).
+
+  Legitimate-path behaviour is unchanged: the gate counts moved only because
+  of the new test groups (Debug 5,409,619 -> 5,428,675; Release 5,409,626 ->
+  5,428,682; San 1,508,630 -> 1,527,686; model 466,859 unchanged).
+
+- **`free()` re-proves its neighbours a second time only when a destroy
+  callback exists.** Without a callback no code can run between the two
+  proofs (single-owner contract), so the second was a deterministic replay of
+  the first; the round-11 "re-prove after the callback" contract is preserved
+  verbatim for every object that has one. Measured on host x86-64 with
+  callgrind's deterministic instruction counts (two-run-length differential):
+  **756.7 -> 728.5 instructions per free+alloc pair, -3.7%**.
+
+- **The advice's `fragmented` decision is a cross-multiplied identity instead
+  of a division.** `stranded*1000/capacity >= permille` and
+  `stranded*1000 >= permille*capacity` are equivalent for non-negative
+  integers, and both sides are overflow-free in uint64. The 64-bit soft divide
+  (`__udivdi3`) is gone from the decision path on Xtensa; the reported
+  `fragment_ratio_permille` field keeps its one division, as a report value.
+
+- **Generation wrap-around is now reported in Debug builds** instead of
+  wrapping silently.
+
+- **`validate`'s complexity was published inconsistently**: the READMEs said
+  O(live_objects x free_blocks) while the ledger (and the code's nested
+  accounting) says O((live_objects + free_objects)^2). The READMEs now match
+  the ledger.
+
 - **A USB-UART bridge can fail in two ways that both look like broken firmware,
   and both are now handled.** Measured on the classic-ESP32 board's CH340:
 
@@ -204,8 +263,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Applying those overrides to an `esp32s3` build breaks it, which is what a
   wrong-target build looks like and is why the flow is documented in both files.
 
-### Fixed
-
 - **The acceptance suite cannot run on a small-DRAM part, and nothing said so.**
   `tests/suite.cpp` pins its own zone to 64 segments inside its assertions: test
   [10] asserts that 16 pools x 4 segments fills the zone, and test [2] creates a
@@ -265,8 +322,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   rewritten test carrying one extra assertion — which is an independent check
   that the two builds are measuring the same code.
 
-### Fixed
-
 - **The `metadata_bytes` sizing claim was wrong about being platform-independent.**
   `README.md` published `72 + 476 x POOLS + 98 x OBJ` and stated that it held for
   host and ESP32 alike. It is an **x86-64** closed form: `ObjectDesc` contains a
@@ -306,6 +361,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   No test asserted on the value, so only the reported magnitude changes.
 
 ### Changed
+
+- **The coverage gate now runs the suite twice: Debug (`PM_DEBUG=1`) and
+  Release (`PM_DEBUG=0`), each with its own object directory
+  (`build/cov`, `build/cov_rel`) and the 85% line floor enforced on both.**
+  The second pass exists because R25's negative paths compile only under
+  Release — a Debug-only coverage gate structurally cannot see them. Measured
+  at this round: Debug 97.59% lines / 81.15% branches taken; Release 97.77%
+  lines / 83.30% taken. `scripts/gates.sh` keeps eleven gates; its labels and
+  the expected pass counts in its header and in CONTRIBUTING.md section 3 are
+  updated.
 
 - **`bench/esp32/` is reproducible from the repository.** Its generated
   `sdkconfig` is no longer committed; `sdkconfig.defaults` replaces it and pins

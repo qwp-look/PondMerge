@@ -71,9 +71,9 @@ init(cfg) → create_pool → alloc/对象操作 → 维护（compact/merge/spli
 
 | 操作 | 入口状态 | 失败语义 | 成功结果 | 复杂度（最坏） |
 |---|---|---|---|---|
-| `compact` | Running/Paused | 规划失败零改动；借用拒绝时**留在 Paused** | Running，epoch+1 | O(objects + moved) |
-| `merge(s,t)` | 两池 Running/Paused | 规划失败两池逐字节不变 | target Running（epoch+1），source Empty | O(objects + free + moved) |
-| `split(s,n)` | Running/Paused | 零改动；新池槽位回收 | 两池 Running；新池 epoch=1 | O(objects + moved) |
+| `compact` | Running/Paused | 规划失败零改动；借用拒绝时**留在 Paused** | Running，epoch+1 | O(objects + moved)，另加 O(objects log objects) 恢复地址序 |
+| `merge(s,t)` | 两池 Running/Paused | 规划失败两池逐字节不变 | target Running（epoch+1），source Empty | O(objects + free + moved)，另加 O(objects log objects) 恢复地址序 |
+| `split(s,n)` | Running/Paused | 零改动；新池槽位回收 | 两池 Running；新池 epoch=1 | O(objects + moved)，另加 O(objects log objects) 恢复地址序 |
 | `validate` | 任意非 Empty | — | Ok / CorruptMetadata | O((live+free)²) |
 
 - 结构（四阶段）：加锁 arming → 只读审计+规划（scratch）→ 不可失败执行 →

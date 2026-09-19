@@ -23,7 +23,7 @@ OS 线程）的**用户态托管内存系统**。在一段固定 Auto Zone 上�
 | 跑可视化 Demo（浏览器 + 设备） | [examples/](examples/) 与 [docs/DEMO_REQUIREMENTS.md](docs/DEMO_REQUIREMENTS.md) |
 | 审计与不变量证据 | [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) |
 | **实测性能数字与仪器限制** | [bench/RESULTS.md](bench/RESULTS.md) |
-| 历史轮次报告 | [docs/HANDOVER_v13.md](docs/HANDOVER_v13.md)（含 v2–v12 索引） |
+| 历史轮次报告 | [docs/HANDOVER_v16.md](docs/HANDOVER_v16.md)（含 v2–v15 索引） |
 
 ## 目录结构
 
@@ -36,7 +36,7 @@ src/
     internal.h      内部结构（Pool / ObjectDesc / TlsfBins / FreeBlock）
     core.cpp        核心实现（单一翻译单元）
 tests/
-    suite.cpp       验收测试套件（基础 1–13 + R1–R35，host 与 ESP32 共用）
+    suite.cpp       验收测试套件（基础 1–13 + R1–R53，host 与 ESP32 共用）
     model.cpp       参考模型对拍（固定 seed，独立预言机；host）
     concurrency_esp32.cpp  双核借用/暂停/整理锁边界测试（仅 ESP32 构建）
     main.cpp        主机 runner（套件 + 模型）
@@ -44,7 +44,10 @@ tests/
     config_limits.cpp   FL 容量契约（zone 上限拒绝 / 上限以下接受）
     serial_cap.py       ESP32 串口抓取（正常启动复位 + 完整日志/测试输出）
     run_host.sh     构建 + 运行（--release / --san / --cppcheck / --configs）
-    config_matrix.sh    配置矩阵（SL 2/4/8/16、FL 31、非法配置编译期拒绝）
+    config_matrix.sh    配置矩阵（SL 2/4/8/16、FL 31、非法配置编译期拒绝、
+                        PM_MIN_BLOCK=32 变体）
+    consumer_smoke.sh   消费路径冒烟（CMake 子目录 / find_package 两种集成
+                        端到端构建并运行）
 examples/           Demo、真实场景参考与协议回归
     sensor_pipeline.cpp 真实场景集成参考：传感器节点（pinned DMA 环 + 消息历史
                         + 大块导出触发建议/整理流程），host/设备同一份源码，
@@ -60,8 +63,11 @@ bench/              可复现基准 + 实测结果（见 README.md 与 RESULTS.m
     bench_timer.h       计时仪器：按批计时 + 自报 + 拒绝不可支持的逐次计时
     alloc_latency.cpp   alloc/free 与 live 数的标度（含对历史 core 的 A/B）
     validate_scaling.cpp  validate / get_stats 标度
+    churn_overhead.cpp  一对 free/alloc 里有多少是分配器、多少是测试夹具
+                        （两行差分互证；设备端三行分解的前置）
     fragmentation.cpp   碎片治理 A/B（同一分配器，compact 开/关）
     compaction_window.cpp  整理窗口分布：512 次 compact() 的逐次计时与百分位（设备端）
+    host_insn.cpp       host 侧 free+alloc 的指令数（callgrind 差分计数）
     esp32/              同一份基准源码的设备端 IDF 工程（独立于验收固件）
 esp32/              IDF 验收工程，多目标（默认 ESP32-S3；经典 ESP32 见 sdkconfig.defaults.esp32）
 docs/               架构说明、代码指导书、各轮任务书与交接文档（见文末索引）
@@ -117,7 +123,8 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 
 读法：
 
 - **默认 1024/16 约吃掉 105 KiB 静态 RAM。** 多数 MCU 承受不起，务必下调。
-  在 ESP-IDF 里把 `PM_MAX_OBJECTS` 设为 256 可降至 **28.7 KiB（实测）**。
+  在 ESP-IDF 里把 `PM_MAX_OBJECTS` 设为 256 可降至 **28.0 KiB（ESP32-S3 实测
+  28,672 B；x86-64 同配置为 32 KiB）**。
 - `metadata_bytes` 已与真实 `.bss` 吻合到 ±8 字节；两者差异只来自对齐填充。
   **预算时仍留一点余量。**
 - 该字段在 v1.0.0 之前**漏计了整理建议缓存**（随 `PM_MAX_POOLS` 增长，实测少报
@@ -161,12 +168,12 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 
 
 | 操作 | 最坏复杂度 | 说明 |
 |---|---|---|
-| `alloc` | **O(SL bin 链长)**，上界 O(zone_size / PM_MIN_BLOCK) | TLSF 位图定位到 bin 后链内 first-fit（R2），再加 O(1) 追加到 live-slot 表。**不是严格 O(1)**，但**已与 live 对象数无关** —— 见下方说明。 |
+| `alloc` | **O(SL bin 链长)**，上界 O(zone_size / PM_MIN_BLOCK) | TLSF 位图定位到 bin 后链内 first-fit（R2），再加 O(1) 追加到 live-slot 表与 O(1) 损坏筛查（R38/R44）。`PM_ZERO_INIT` 另加 O(size) 清零。**不是严格 O(1)**，但**已与 live 对象数无关** —— 见下方说明。 |
 | `free` | O(1 + 邻块空闲 bin 链长)，上界 O(zone_size / PM_MIN_BLOCK) | 合并前只读证明：自身块头、prev_size 链、后继块、邻块 bin 成员资格与互逆链接（R24）。损坏时 `CorruptMetadata` 且零副作用。 |
 | `pause` / `resume` | O(1) | 单次状态翻转。 |
 | `compact` / `split` | O(objects + moved_bytes)，另加 O(objects log objects) 恢复地址序 | 只读规划（有界收集 + heapsort）+ 按序搬移与重建。 |
 | `merge` | O(objects + free_blocks + moved_bytes) | 两池只读审计（live-slot 表 / 描述符 / 统计 / bins）+ 合并区间规划 + 不可失败执行；规划失败两池逐字节不变（R22）。 |
-| `validate` | O(live_objects × free_blocks) | live 块与 binned 空闲块两两重叠检查与 gap 归账；所有遍历有步数上限。 |
+| `validate` | O((live_objects + free_objects)²) | live 块与 binned 空闲块两两重叠检查与 gap 归账；所有遍历有步数上限。 |
 | `get_stats` | O(free_blocks) | 步数上限；损坏链表有限返回，`valid = 0` 与"真的没有空闲块"可区分（R18/R29）。 |
 | `borrow_begin` / `resolve` / `borrow_end` | O(1) | 描述符校验（含池范围证明，R23）+ 一次描述符读取。`borrow_end` 的 token 校验与递减在同一临界区（R25）；失败输出指针必为空（R26）。 |
 | `analyze_compaction` | O(objects log objects + free_blocks) | 打包模拟精确估算搬迁对象数/字节数（R35）+ 计数器审计（损坏即 `INVALID_METADATA`）。 |
@@ -267,7 +274,7 @@ idf_component_register(SRCS "main.cpp" REQUIRES pondmerge)
 在工程 CMakeLists 里缩小元数据预算（数值见上一节的表）：
 
 ```cmake
-set(PM_MAX_OBJECTS 256)   # 约 105 KiB → 约 31 KiB 静态 RAM
+set(PM_MAX_OBJECTS 256)   # 约 105 KiB → 约 28 KiB 静态 RAM（ESP32-S3 实测）
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(your_app)
 ```
@@ -338,22 +345,26 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 | R29–R30（第四轮） | 扩展故障矩阵（互逆链接/跨 bin 重复/segment/运行时状态/alloc 防环）、alloc 失败清空输出 |
 | R31–R34（第六–八轮） | 整理建议（只读、判定矩阵、阈值、抑制）、INVALID_REQUEST、poll 变化键、owner 门控 |
 | R35（第九轮） | 建议估算精确性（池首空闲块场景）+ 计数器审计故障注入 |
+| R36–R53（第十四轮，R45 空缺） | 元数据筛查缺陷修复的红测：alloc 的 order_head 界（R38）、check_ref 链接界（R39）、create_pool 段窗口证明（R43）、池几何 zone 上限（R44）、mid-gap slack、post-deinit 拒绝、重复 live 地址、split/free 故障注入、耗尽矩阵、validate 第三段、advice 负路径、Paused 恢复、零长尾访问、generation 回绕、16 B gap 边界、溢出带 |
 | 参考模型 | 固定 seed 随机 alloc/free/compact/merge/split，独立预言机校验 live 数、payload、池归属、字节账目与可分配性 |
 | 双核并发（设备） | 借用/暂停/整理的 SMP 锁边界（`tests/concurrency_esp32.cpp`） |
 | 协议/HTTP 冒烟 | `examples/protocol_smoke.py`（95 项）、`examples/http_smoke.py`（15 项） |
 
-### 当前验收状态（提交 `4b412de`）
+### 当前验收状态
+
+> host 三行由 `scripts/gates.sh` 每轮收口复验，最新数字见
+> [docs/HANDOVER_v16.md](docs/HANDOVER_v16.md)；下表是当前轮的记录。
 
 | 档位 | 结果 |
 |---|---|
-| Host Debug（10000 op） | 5,409,619 checks, 0 failures |
-| Host Release（10000 op） | 5,409,626 checks, 0 failures |
-| ASan/UBSan（10000 op） | 1,508,630 checks, 0 failures |
+| Host Debug（10000 op） | 5,428,675 checks, 0 failures |
+| Host Release（10000 op） | 5,428,682 checks, 0 failures |
+| ASan/UBSan（3000 op） | 1,527,686 checks, 0 failures |
 | 参考模型对拍 | 466,859 checks, 0 failures |
 | cppcheck（warning/style/performance） | exit 0，三类计数 0/0/0 |
 | 配置矩阵 | PASSED |
 | 协议回归 / HTTP 回归 | 95 / 15 checks, 0 failures |
-| `src/core.cpp` 覆盖率 | 96.47% 行 / 98.75% 分支执行（下限强制） |
+| `src/core.cpp` 覆盖率 | 97.59% 行 / 98.80% 分支执行（Debug 档；Release 档 97.77% 行 / 83.30% 分支选取；下限强制） |
 | libFuzzer（有界运行） | 无崩溃、无 sanitizer 发现 |
 | ESP32-S3 (n16r8) 实机，App version `v1.0.0-4-ga5e68b6` | 套件 **1,120,457** + 双核并发 28 + 模型 466,859 checks，全部 0 failures；两次复位重跑计数一致 |
 | 经典 ESP32 (D0WDQ6 v1.1) 实机，App version `v1.0.0-6-g2324312` | 双核并发 28 + 模型 466,859 checks，0 failures；两次复位重跑计数一致。**套件未运行**（见下） |
@@ -493,4 +504,4 @@ advice 即断言诊断）；`PM_DEBUG=0` 时断言编译为空，但 generation�
 | docs/架构说明.md | 目标架构契约 |
 | docs/PondMerge_v1_代码指导书.md | 接口与内存布局的原始设计 |
 | docs/PondMerge_v1_repair_task.md / v2 | 第一/二轮修复任务书 |
-| docs/HANDOVER_v2–v14.md | 各轮收口报告（v14 为最新：整理窗口百分位轮） |
+| docs/HANDOVER_v2–v16.md | 各轮收口报告（v16 为最新：多代理审查与元数据筛查修复轮） |

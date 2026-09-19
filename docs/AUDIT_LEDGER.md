@@ -22,9 +22,13 @@
 | borrow | begin/end 一一对应；token（index+generation+pool）在锁内校验；任何失配不动计数 | `borrow_begin()`/`borrow_end()` | 全部校验与递减在同一 PM_LOCK 内；active_borrows/borrow_count 双计数下溢不可能 | R10、R16、R25、设备并发测试（S3 LX7 + 经典 ESP32 LX6 两颗芯片） | ✅ |
 | object lifetime | 构造（placement-new）、析构（destroy thunk）恰好一次；movable 不带析构 | `pm_make`/`pm_make_pinned`/`detail::destroy_thunk`/`set_destroy_fn()` | movable 拒绝 destroy_fn（NotRelocatable）；pinned 析构在 free 验证后恰好跑一次 | R6、R19、R24 | ✅ |
 | object lifetime | 可搬移类型显式 opt-in 且经审计（不含 Auto Zone 自指针/DMA/同步原语） | `pm_is_relocatable` 特化（tests/suite.cpp 顶部） | 测试中注册的 5 个类型均为 POD；含裸指针的 RawHolder 特化被 static_assert 拒绝 | R5 | ✅ |
-| 统计 | used/free/fragment/live 与物理布局精确互锁 | `validate()` 第三段覆盖审计 | live+free+slack==capacity 且 free_total==free_bytes-fragment_bytes | R21、模型对拍 | ✅ |
+| 统计 | used/free/fragment/live 与物理布局精确互锁 | `validate()` 第三段覆盖审计 | live+free+slack==capacity 且 free_total==free_bytes-fragment_bytes | R21(1-4)、validate | ✅ |
 | 失败输出 | 任何公共入口失败时输出引用/指针必为无效（generation 0 / nullptr），旧值绝不残留 | `alloc()` 首语句清空（第五轮）、`resolve()` 入口、`borrow_begin()` 失败分支 | 失败在 `out` 赋值前返回或显式清空；槽位 generation 不动（R1 语义保持） | R26、R29(5)、R30 | ✅（第五轮补齐 alloc） |
 | 整理建议 | analyze/poll 严格只读：Pool/ObjectDesc/Auto Zone 逐字节不变；verdict 五值；估算不伪造 | `analyze_compaction()`/`poll_compaction_advice()`（建议缓存为独立建议态，非分配器元数据） | 快照比对 + walk_order/get_stats 有界审计 | R31 | ✅（第六轮新增） |
+| pool geometry | 池的段窗口 [segment_first, segment_first+segment_count) 必须整体落在 zone 内（段和与字节量双界，uint64 计算，不回绕不溢出） | `pool_geometry_ok()`（O(1)；check_ref / alloc / precheck_pool / create_pool 共用） | 段和与字节体积都在 uint64 中计算，损坏的 segment_count 既不能回绕也不能溢出成看似合法的窗口；字节界独立于段数对 `G.zone_size` 成立 | R44、R23 | ✅（第十四轮） |
+| create_pool | 现存池的段窗口**先证明后使用**：used[] 标记不越界，新池不与存活池物理重叠 | `create_pool()` 对每个非 Empty 池的 `pool_geometry_ok()` 前置 | 未证明的窗口意味着 `bool[PM_MAX_SEGMENTS]` 越界写，或新池建在存活池的块上；现先过同一 O(1) 几何检查再标记 | R43 | ✅（第十四轮） |
+| live-slot list | Live 描述符的 addr_prev/addr_next 指向描述符表内（NO_ORDER 除外）——`order_unlink()` O(1) 解引用的前提 | `check_ref()` 链接界筛查段 | free/borrow/resolve/set_destroy_fn 共用同一次 O(1) 检查，先于任何调用方到达变更路径；维护侧由 `collect_live_sorted()` 的更强链核对覆盖，不重复 | R39、R38 | ✅（第十四轮） |
+| 失败输出 | alloc 在任何物理字节变更**之前**的 O(1) 筛查（order_head 界、池几何）失败同样清空输出引用 | `alloc()` 首语句清空 + 筛查段 | 两项筛查位于所有写入之前，`out` 已被首语句清空——失败输出不变式对新筛查路径天然成立，回滚路径不变 | R38、R44 | ✅（第十四轮） |
 
 ## 2. 遍历有限性清单（第四轮任务书 §7 全量搜索结论）
 
@@ -38,7 +42,7 @@
 | get_stats | capacity 上限 + 越界判界，拒绝时 valid=0 | core.cpp | ✅ |
 | free_block_binned | capacity 上限 + 越界判界 | core.cpp | ✅ |
 | ~~order_insert_sorted（alloc 路径）~~ | **本轮删除** —— alloc 不再遍历任何链表，改为 O(1) `order_append` | core.cpp | 该遍历及其防环上限需求随之消失；同类损坏的保护由 `collect_live_sorted` 承接（见 §6.8） |
-| order_unlink | O(1)，无遍历 | core.cpp | ✅ |
+| order_unlink | O(1)，无遍历 | core.cpp | 输入界由 `check_ref` 保证（第十四轮：Live 描述符的 addr_prev/next 表内筛查，R39；alloc 侧另有 order_head 界筛查，R38） | ✅ |
 | finalize_layout | **不再遍历链表**：迭代已审计的地址序槽位数组，超出 [start,end) 的条目按范围跳过 | core.cpp | ✅ 本轮简化（split 因此不再依赖"边界以下即前缀"的未验证假设） |
 | 模型/测试侧遍历 | 不触及库内部（模型仅用公共 API） | tests/model.cpp | ✅ |
 
@@ -48,12 +52,12 @@
 |---|---|---|---|---|---|---|---|
 | descriptor index/generation | R18✝/R26 | R25 | — | — | — | — | R9 |
 | descriptor pool/address/size/block_size | R17(size=0) | R23(e) | R17/R20 | R23(a-d) | — | — | R9/R17 |
-| addr_prev/next/order_head | R21(5) | R22(8) | — | — | R8、R22(7)、R29(5) | R21(5) | R22(8) |
+| addr_prev/next/order_head | R21(5) | R22(8) | — | R38、R39 | R8、R22(7)、R29(5) | R21(5) | R22(8) |
 | bin head/prev/next/位图 | R21(6)(7) | R18(b) | — | R18(b)、R21(9) | R8(2)、R18(a) | R29(2) | — |
 | 互逆链接 | — | — | — | R29(1) | — | — | — |
 | block header/prev_size | R8(3) | R21(8) | R20 | R7 | — | — | R24(3)(7) |
 | used/free/fragment/live | — | R21(1-4) | — | — | — | — | — |
-| segment_first/count | — | R29(3) | — | R29(3) | — | — | — |
+| segment_first/count | — | R29(3) | — | R29(3)、R43 | — | — | R44 |
 | state/borrow_count/active_borrows | R29(4)（安全拒绝语义） | — | — | — | — | — | — |
 
 ✝ R18 的零值 generation 注入在 R12（generation=0 保留值）。
@@ -68,21 +72,24 @@
 | borrow_begin/end | 内部锁 + token | 同一 PM_LOCK 内校验并递减；设备双核测试（两颗芯片：LX7 + LX6） |
 | pause/resume | 内部锁 | 状态翻转在 PM_LOCK 内 |
 | compact/merge/split | 单 owner 串行（scratch 共享，跨池并发亦禁止）；入口与最终提交持锁；搬移在锁外，安全性由单 owner + 外部静默契约承担 | pondmerge.hpp 并发契约（含 PM_LOCK 范围声明）；README 并发表；设备并发测试 |
+| init/deinit/create_pool/destroy_pool | **lifecycle 串行**：不得与任何其他 API 并发（它们直接改写池表/全局状态，不持 borrow 锁） | pondmerge.hpp 并发契约（第十四轮补明）；USAGE_GUIDE §7 |
+| set_destroy_fn | 单 owner（与 alloc/free 同级） | pondmerge.hpp 并发契约 |
+| global_stats | 只读高水位**宽松读**：字段为高水位计数，无逐字段一致性承诺 | pondmerge.hpp 并发契约（第十四轮补明） |
 | 重复 end / 错误 token | 任何失配不动计数 | host Release R25；设备固件为 Debug 构建，重复 end 属调用方 bug 会断言——**已接受边界**（见 §6） |
 
 ## 5. 复杂度账本（第四轮任务书 §12，与真实循环一一对应）
 
 | 操作 | 声明 | 依据循环 | 变化 |
 |---|---|---|---|
-| alloc | **O(SL bin 链长)**，上界 O(zone/PM_MIN_BLOCK) | `bins_find`（链内 first-fit）+ `order_append`（O(1) 追加，无遍历） | **本轮**：地址序插入移出热路径后 O(live) 项消失（实测 799→38 ns @1024，232→38 ns @256；`bench/RESULTS.md`） |
-| free | O(1 + 邻块空闲 bin 链长)，上界 O(zone/PM_MIN_BLOCK) | `free_block_binned` 有界遍历 × 2 邻块 | 第三轮已更正 |
-| compact | O(objects log objects + moved bytes) | precheck→collect（有界遍历 + heapsort）+ 计划 + 搬移 + finalize | **本轮**：审计由 O(objects) 变为 O(objects log objects)，换来 alloc 与 live 数解耦 |
-| merge | O(objects log objects + free_blocks + moved bytes) | 两池 collect（各含一次排序）+ audit_pool_bins + 计划 + 搬移 + finalize | **本轮**同上 |
-| split | O(objects log objects + moved bytes) | 同上 | **本轮**同上 |
+| alloc | **O(SL bin 链长)**，上界 O(zone/PM_MIN_BLOCK)；`PM_ZERO_INIT` 另加 O(size) 清零 | `bins_find`（链内 first-fit）+ 两项 O(1) 筛查（order_head 界、`pool_geometry_ok`，先于任何变更）+ `order_append`（O(1) 追加，无遍历） | **第十轮**：地址序插入移出热路径后 O(live) 项消失（实测 799→38 ns @1024，232→38 ns @256；`bench/RESULTS.md`）；**第十四轮**：O(1) 筛查不改变声明（R38/R44） |
+| free | O(1 + 邻块空闲 bin 链长)，上界 O(zone/PM_MIN_BLOCK) | `free_block_binned` 有界遍历 × 2 邻块 | 第三轮已更正；**第十四轮**：第二次邻块验证仅在 `destroy_fn` 存在时执行——无回调时两次验证之间不可能有代码运行（单 owner 契约），第二次证明是第一次的确定性重放；R24 的"回调后重验"契约对带回调对象逐字保留。callgrind 指令数 **756.7 → 728.5 /pair（−3.7%）**（host x86-64，callgrind 确定性计数、两运行长度差分，方法见 `bench/README.md` §2 的 `host_insn`） |
+| compact | O(objects log objects + moved bytes) | precheck（含 O(1) 池几何证明）→ collect（有界遍历 + heapsort）+ 计划 + 搬移 + finalize | **第十轮**：审计由 O(objects) 变为 O(objects log objects)，换来 alloc 与 live 数解耦；**第十四轮**：登记 precheck 的 O(1) 几何证明项 |
+| merge | O(objects log objects + free_blocks + moved bytes) | 两池 precheck（各含 O(1) 几何证明）+ collect（各含一次排序）+ audit_pool_bins + 计划 + 搬移 + finalize | **第十轮**同上；**第十四轮**同 compact |
+| split | O(objects log objects + moved bytes) | 同上（precheck + 排序 + finalize × 2 池） | **第十轮**同上；**第十四轮**同 compact |
 | validate | O((live + free)²) | gap_before 嵌套（collect 的排序项被二次项支配） | 如实保留 |
-| analyze_compaction | O(objects log objects + free_blocks) | collect（含排序）+ 打包模拟 + get_stats | **本轮**补登记（此前未列入本表） |
+| analyze_compaction | O(objects log objects + free_blocks) | collect（含排序）+ 打包模拟 + get_stats | **第十轮**补登记（此前未列入本表）；**第十四轮**：fragmented 判定为交叉相乘恒等式（`stranded*1000 >= permille*capacity`，无除法；`fragment_ratio_permille` 报告字段保留一次 64÷64，已记档） |
 | get_stats | O(free_blocks)，步数上限 | bins 全遍历 | + valid 字段 |
-| 固定 scratch | O(PM_MAX_OBJECTS)：s_plan/s_upper/s_barriers/s_slots(uint16) | — | 设备侧 512 B×4 级别；本轮**未**新增 scratch（排序原地进行） |
+| 固定 scratch | O(PM_MAX_OBJECTS)：s_plan/s_upper/s_barriers/s_slots(uint16) | — | 设备侧 30 B × PM_MAX_OBJECTS（1024→30,720 B；权威逐配置数值 = `global_stats().metadata_bytes`）；第十轮**未**新增 scratch（排序原地进行），第十四轮亦然 |
 | 栈使用 | 维护路径无递归；heapsort 的 sift 为尾递归式循环（O(1) 栈）；最大局部为 snapshot lambda 与 verify_neighbours（均 O(1) 栈） | — | — |
 
 ## 6. 已接受的边界（明确决策，非遗漏）
@@ -119,6 +126,11 @@
    `bench/RESULTS.md` §1）以及地址序维护成本的冷路径化（每次维护一次
    O(n log n)，在 memmove 面前可忽略）。
    若将来需要"alloc 也拒绝损坏结构"，须先恢复一次遍历，届时会重新引入 O(live)。
+   **第十四轮补充**：alloc 现在在追加之前做两项 O(1) 筛查（`order_head` 界、
+   `pool_geometry_ok` 池几何），恢复"不加重"前提的可证明性——追加写入只发生在
+   通过筛查的结构上（头在描述符表内、窗口在 zone 内）；筛查失败零写入、输出
+   引用已被首语句清空（R38/R44）；free 侧对既有链接的解引用前提由 check_ref
+   的链接界筛查保证（R39）。
 9. **`validate` 保持二次复杂度（O((live+free)²)），不做线性化**（本轮决策，
    非遗漏）。已实测：96 块 11.0 µs → 1536 块 1744.6 µs（拟合指数 1.83，见
    `bench/RESULTS.md` §2）。线性化的自然做法是"把 live ∪ free 按地址归并成一次
@@ -144,8 +156,75 @@
     重点要取的三项（主机做不到的）：alloc/free 的**绝对**值；compact 窗口的
     **百分位**（设备 mcycle 免费，主机上一次时钟读取可达 2.7 ms）；以及用
     `heap_caps_add_region` 给 FreeRTOS `heap_4` 划独立区域的**第三方基线**。
+11. **池几何的 zone 内平移不由 `create_pool` 检测**（第十四轮）。`pool_geometry_ok`
+    只证明一个池的窗口整体落在 zone 内（O(1)、防回绕/防溢出），不证明窗口之间
+    不重叠——被损坏平移进 zone 内部的窗口会通过 `create_pool` 的前置检查（该检查
+    的职责是证明 used[] 标记不越界，R43）。窗口重叠/平移由 `validate()` 与每个
+    维护入口 precheck 的**字节账目核对**拒绝（used+free+slack==capacity、每块落
+    自己池的窗内等），R29(3) 已钉住 segment_first/count 的池外/最大值注入。这是
+    "O(1) 前置筛查只证明 O(1) 可证的事"的边界，非遗漏。
+12. **任务书 §8.3 的"校验失败恢复 Paused"被事务式实现取代**（第十四轮，A1-5）。
+    维护计划失败恢复**入口状态**（Running 进入恢复 Running、Paused 进入恢复
+    Paused），不是一律 Paused：计划失败零写入，不存在需要 Paused 来保护的中间
+    态；compact 的借用拒绝仍按文档 §8 进入 Paused（唯一例外，调用方显式 resume）。
+    `CorruptMetadata` 由调用方处置，库不替调用方决定继续与否。R29(5)、R49 钉住。
+13. **8 B slack 后继的 prev_size 写入**（第十四轮，A2-L1）。free/alloc 的合并与
+    切分把后继块的 prev_size 写在后继块地址 +4 处；当后继是 8 B 的 sub-minimal
+    slack 时，该写入落在 [slack+4, slack+8)——slack 的 poison 头不受影响（写偏移
+    在头部之后），且 slack 不是块，它的 prev_size 没有任何读者（只有真块合并才读
+    prev_size，而 slack 永不参与合并）。探针 676 检查证实无误读。有意边界。
+14. **FreeBlock `reinterpret_cast` 与 C++17 对象生命周期**（第十四轮，A2-L2）。
+    块头按 [size|free | prev_size] 的原始 8 字节格式解释：header 经
+    `load32`/`store32`（memcpy 语义）访问，链接字段经 FreeBlock 类型化成员访问。
+    严格按 C++17 的对象生命周期模型，这是块格式边界上的**设计边界**
+    （`internal.h` 既有注释"the block-format boundary"的账本面）；gcc/clang
+    -O3 实测无失优、无 sanitizer 发现。不在 v1 引入生命周期显式化方案（C++23
+    `std::start_lifetime_as` 一类）。
+15. **`bins_find` 的游标筛查是 zone 级，其余遍历是池级**（第十四轮，A2-L3）。
+    `bins_find` 用 `zone_off_readable`（偏移可读即可解引用），而
+    `audit_pool_bins`/`free_block_binned` 用 `in_pool`（必须落在被遍历池内）——
+    两种 doctrine 不一致。后果被三层限制：zone 界保证不解引用越区指针、fl/sl
+    尺寸类核对拒绝外来块、失败一律 `CorruptMetadata` 且零副作用。列为**将来加固
+    候选**（统一为池级筛查），不在本轮改行为。
+16. **advice 打包模拟对描述符地址做原始指针算术，且先于 counters 审计**
+    （第十四轮，A2-L4）。模拟按地址序读描述符并解引用 payload 地址做
+    memmove 形状的估算；若描述符地址字段可被外部损坏，这可能解引用越界指针。
+    当前**无 API 途径**使描述符地址失效（地址只由库写入，位于库私有静态数据
+    之后的 zone 内），故列为**纵深防御缺口**而非缺陷；加固候选：模拟前先跑
+    counters 审计或对地址做池界筛查。
+17. **lifecycle 并发边界**（第十四轮，A2-L5/A3-4）。init/deinit/create_pool/
+    destroy_pool 是 lifecycle 串行操作，不得与任何 API 并发（它们直接改写池表
+    与全局状态，不持 borrow 锁）；`set_destroy_fn` 单 owner（与 alloc/free 同
+    级）；`global_stats` 是只读高水位宽松读，无逐字段一致性承诺。已同步写入
+    §4 并发表与 `pondmerge.hpp` 并发契约注释。
 
-## 7. 账本维护记录
+## 7. 死分支登记（第十四轮，A4-16）
+
+覆盖率门（Debug 档 97.59% 行 / 81.15% 分支选取）里**从未被执行的分支**中，有一批
+是守卫或被前序检查支配的分支——它们不是缺口，也不该被当作缺口。本清单登记其中
+结构性最重要的条目与一句支配论证，**目的是防止未来轮次把它们误当未测缺口或误加
+"覆盖"**。行号按 `fdbe5d4` 版 `core.cpp`（第十四轮改动后行号有漂移，函数名不变）：
+
+| 位置（fdbe5d4） | 内容 | 支配论证（一句话） |
+|---|---|---|
+| L61 | `fl_index` 的 `size < (1u << MIN_FL)` 钳制 | 每个入 bin 的块 ≥ PM_MIN_BLOCK = 2^MIN_FL（alloc 把 need 钳到 PM_MIN_BLOCK，free 只合并 ≥ PM_MIN_BLOCK 的块），分支不可达；保留为函数自身的完备性守卫 |
+| L35 | `log2_floor_u` 的 `v <= 1` 分支 | 唯一调用方是 `fl_index`，size ≥ PM_MIN_BLOCK > 1，恒假；totality 守卫 |
+| L256 | `collect_live_sorted` 的步数上限 | 任何环都在重复访问节点时先被同一次遍历中的 addr_prev 链核对拒绝（重复访问的 prev 必与记录不符），步数上限是防御纵深 |
+| L345 | `check_ref` 的 `aoff + d.size > pend` | 由 `desc_block_consistent` 的 `size ≤ block_size − HEADER` 与同一证明段的块界项共同支配（payload ≤ block ≤ 池尾），结构上不可假 |
+| L836 | `init` 的 `seg_count == 0` | 前一句已拒绝 `zone_size < segment_size`，走到此处 seg_count ≥ 1 |
+| L838 | `init` 的 `seg_count > UINT32_MAX / segment_size` | seg_count = zone_size/segment_size（uint32 除法）≤ UINT32_MAX/segment_size，数学上不可达；任务书要求的溢出守卫，防御前序检查被改动 |
+| L943 | `destroy_pool` 的 `live_objects != 0 ‖ borrow_count != 0` | 可达的调用方错误路径（非空/被借用的池不可销毁），验收负载总先清空池；API 契约保留该拒绝 |
+| L1059 / L1445 | alloc 与 advice 请求路径的 `need < PM_MIN_BLOCK` 钳制 | 默认 PM_MIN_BLOCK=16 下 need ≥ 16 恒成立（header + 对齐后的最小负载已达 16），分支死；**PM_MIN_BLOCK=32 变体下活**——config_matrix 已有 32 变体真实执行它 |
+| L1079-1081 | alloc 对 bins_find 返回值的 `blk_size_of(blk) < need` 拒绝 | `bins_find` 只返回 `blk_size_of(cand) >= need` 的候选（其内层 first-fit 检查），该重查被支配；保留为与 bins_find 内部契约解耦的独立守卫 |
+| L1466 | `fragment_ratio_permille` 报告字段的 `a.capacity ? … : 0` 三元 | capacity==0 仅在 Empty/未创建池上可能，验收负载未对这类池查询建议；除零防御，非不可达代码 |
+| L1519 | `counters_ok` 合取的 `frag <= free_b`、`largest <= free_b - frag` 假分支 | 合法布局中 fragment ⊆ free、largest ≤ free−fragment 由 finalize/审计维持；计数器注入（R21(1-4)、R35）总被更早的合取项短路 |
+| L1544 | fragmented 判定的 `a.capacity != 0` 项 | capacity==0 ⇒ stranded=0 < fragment_min_bytes，`&&` 链在该项之前短路；病态阈值（min_bytes=0）不在验收配置内 |
+| L1573 | `moved_bytes <= 0xFFFFFFFE` 的 UNKNOWN 桥接 | moved_bytes ≤ 池容量 < 2^PM_FL_MAX（init 的 FL 上限拒绝），恒在界内；保留为估算诚实性契约的形状 |
+| L1643 | compact arming 的 `state != Paused → Busy` | 锁内先经 `pool_maintainable` 拒绝维护态，Running 已被上一句翻转为 Paused，到达此处 state 必为 Paused |
+| L2152 | validate 阶段 1 `audit_block` 的 `!in_pool(aoff, d.size)` 假分支 | 同 L345：payload 尾越出池尾被 `size ≤ block_size` 与同条件的块界项支配 |
+| L2234 | validate 阶段 3 的 `same_start != 1` 重复起点拒绝 | 阶段 2 的 fl/sl 尺寸类匹配与互逆链接已拒绝任何重复登记（同一偏移不能同时匹配两个尺寸类）；保留为零长度 gap 的最后防线 |
+
+## 8. 账本维护记录
 
 - 2026-09-12（第四轮）：建立本账本；登记第四轮发现并修复的两项缺陷
   （order_insert 防环、alloc 损坏可区分）与两项口径更正（alloc 复杂度、
@@ -233,3 +312,19 @@
   probe 重试全部失败——屏障把整合空间切成 ~1 KiB 口袋），印证 COMPACTION_POLICY
   §7 的定性预告。不变式本体无增改：本条登记的是**证据升级**（R31/R35 行的
   设备端佐证）与一处叙述修正。
+
+- 2026-09-19（第十四轮，多代理深度审查与元数据筛查修复轮，HANDOVER_v16）：
+  **四项 High 元数据筛查缺陷修复**（A1-1 alloc 的 O(1) order_head 界筛查、
+  A1-2 check_ref 的链接界筛查、A1-3 create_pool 的窗口证明、A1-4 池几何
+  zone 上限——全部 O(1)，见 §1 新增四行），**C-1** free 的第二次邻块验证按
+  `destroy_fn` 门控（§5 free 行，callgrind −3.7%），**C-2** advice 阈值判定改
+  交叉相乘、去 64 位除法（§5 analyze_compaction 行），**A1-6** generation 回绕
+  的 Debug 报告；§5 alloc 行补 O(1) 筛查与 PM_ZERO_INIT O(size)，compact/
+  merge/split 行补 O(1) 几何证明项，固定 scratch 注脚量纲更正（30 B ×
+  PM_MAX_OBJECTS）；§2 order_unlink 行补输入界来源；§3 注入矩阵补 R38/R39/
+  R43/R44；§4 并发表补 lifecycle 串行 / set_destroy_fn 单 owner /
+  global_stats 宽松读三行；§6 新增 §6.11（zone 内平移）与第 12–17 项
+  （A1-5、A2-L1…A2-L5/A3-4）；新增 §7 死分支登记（A4-16）。新增红测
+  R36–R44、R46–R53（R45 空缺）与 config_matrix 的 PM_MIN_BLOCK=32 变体。
+  全部为筛查与账面修正，**库的合法路径行为不变**（门禁计数增量全部来自
+  新增测试组）。

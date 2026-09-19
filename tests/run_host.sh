@@ -5,7 +5,8 @@
 #   tests/run_host.sh --san [ops]     ASan+UBSan build (-O1, 3000 ops by default)
 #   tests/run_host.sh --cppcheck      static analysis of the core + test sources
 #   tests/run_host.sh --configs       TLSF configuration matrix (config_matrix.sh)
-#   tests/run_host.sh --coverage      line/branch coverage of the core under the suite
+#   tests/run_host.sh --coverage      line/branch coverage of the core under
+#                                     the suite, Debug AND Release passes
 #   tests/run_host.sh --fuzz [secs]   build and run the libFuzzer target
 # Every mode except --cppcheck/--configs/--coverage/--fuzz runs tests/suite.cpp
 # AND the reference model in tests/model.cpp.
@@ -41,55 +42,66 @@ case "$1" in
     ;;
 --coverage)
     # Line and branch coverage of the core, measured over the acceptance suite
-    # (suite + reference model). gcov rather than llvm-cov because the project
-    # builds with g++. Objects go to a private directory so the .gcno/.gcda
-    # files do not litter build/.
+    # (suite + reference model), in TWO passes: Debug (PM_DEBUG=1) and Release
+    # (PM_DEBUG=0). The second pass exists because R25's negative paths are
+    # compiled only under Release -- a Debug-only coverage gate structurally
+    # cannot see them, so "the suite covers it" would be false comfort. gcov
+    # rather than llvm-cov because the project builds with g++. Each pass gets
+    # a private object directory (build/cov, build/cov_rel) so the .gcno/.gcda
+    # files neither litter build/ nor collide between passes.
     #
-    # A FLOOR is enforced: see COVERAGE_MIN_LINES below. It exists so that a
-    # change which silently stops exercising a branch cannot pass unnoticed;
-    # it is deliberately below the measured value rather than equal to it, so
-    # ordinary edits do not trip it.
+    # A FLOOR is enforced on BOTH passes: see COVERAGE_MIN_LINES below. It
+    # exists so that a change which silently stops exercising a branch cannot
+    # pass unnoticed; it is deliberately below the measured value rather than
+    # equal to it, so ordinary edits do not trip it.
     COVERAGE_MIN_LINES=${COVERAGE_MIN_LINES:-85}
-    rm -rf build/cov
-    mkdir -p build/cov
-    for src in src/core tests/suite tests/model tests/main; do
-        # Named after the SOURCE basename on purpose: gcov locates the notes
-        # file by the source file's basename, so build/cov/core.gcno is what
-        # `gcov -o build/cov src/core.cpp` looks for.
-        obj="build/cov/$(basename "$src").o"
-        case "$src" in
-            src/core) g++ $CXXFLAGS -O0 -g --coverage -DPM_DEBUG=1 -c "$src.cpp" -o "$obj" ;;
-            *)        g++ $CXXFLAGS -O0 -g -DPM_DEBUG=1 -c "$src.cpp" -o "$obj" ;;
-        esac
-    done
-    g++ --coverage -o build/cov/run build/cov/*.o
-    ./build/cov/run "${2:-3000}" > build/cov/run.log 2>&1
-    tail -4 build/cov/run.log
-    # Run gcov from INSIDE build/cov: it writes one .gcov file per source into
-    # its working directory, so invoking it from the repository root would leave
-    # untracked files there.
-    ( cd build/cov && gcov -b -c -o . ../../src/core.cpp > gcov.txt 2>&1 ) || true    echo "--- coverage of src/core.cpp (gcov) ---"
-    # Read core.cpp's OWN block. gcov prints one block per contributing file and
-    # happens to emit the named file first, but taking "the first Lines executed
-    # line" would silently report a header's coverage if that ordering ever
-    # changed, so the block is selected by its File header.
-    awk '/^File .*core\.cpp/{f=1} /^File /{if ($0 !~ /core\.cpp/) f=0}
-         f && /^(Lines executed|Branches executed|Taken at least once|Calls executed)/{print}
-        ' build/cov/gcov.txt || true
-    pct=$(awk '/^File .*core\.cpp/{f=1; next} /^File /{f=0}
-                f && /^Lines executed/ {sub(/.*:/,""); sub(/%.*/,""); print; exit}
-               ' build/cov/gcov.txt)
-    brt=$(awk '/^File .*core\.cpp/{f=1; next} /^File /{f=0}
-                f && /^Taken at least once/ {sub(/.*:/,""); sub(/%.*/,""); print; exit}
-               ' build/cov/gcov.txt)
-    if [ -z "$pct" ]; then
-        echo "FAIL: gcov produced no line-coverage line for core.cpp; raw output follows"
-        cat build/cov/gcov.txt
-        exit 1
-    fi
-    echo "core.cpp: ${pct}% lines, ${brt}% branches taken  (line floor ${COVERAGE_MIN_LINES}%)"
-    awk -v p="$pct" -v f="$COVERAGE_MIN_LINES" 'BEGIN { exit (p+0 >= f+0) ? 0 : 1 }' || {
-        echo "FAIL: core.cpp line coverage below the floor"; exit 1; }
+    coverage_pass() {
+        pm_debug=$1; covdir=$2; label=$3; ops=$4
+        rm -rf "build/$covdir"
+        mkdir -p "build/$covdir"
+        for src in src/core tests/suite tests/model tests/main; do
+            # Named after the SOURCE basename on purpose: gcov locates the notes
+            # file by the source file's basename, so build/cov/core.gcno is what
+            # `gcov -o build/cov src/core.cpp` looks for.
+            obj="build/$covdir/$(basename "$src").o"
+            case "$src" in
+                src/core) g++ $CXXFLAGS -O0 -g --coverage -DPM_DEBUG="$pm_debug" -c "$src.cpp" -o "$obj" ;;
+                *)        g++ $CXXFLAGS -O0 -g -DPM_DEBUG="$pm_debug" -c "$src.cpp" -o "$obj" ;;
+            esac
+        done
+        g++ --coverage -o "build/$covdir/run" build/"$covdir"/*.o
+        ./build/"$covdir"/run "$ops" > "build/$covdir"/run.log 2>&1
+        tail -4 "build/$covdir"/run.log
+        # Run gcov from INSIDE the pass directory: it writes one .gcov file per
+        # source into its working directory, so invoking it from the repository
+        # root would leave untracked files there -- and running both passes in
+        # one directory would overwrite the first pass's files.
+        ( cd "build/$covdir" && gcov -b -c -o . ../../src/core.cpp > gcov.txt 2>&1 ) || true
+        # Read core.cpp's OWN block. gcov prints one block per contributing
+        # file and happens to emit the named file first, but taking "the first
+        # Lines executed line" would silently report a header's coverage if
+        # that ordering ever changed, so the block is selected by its File
+        # header.
+        awk '/^File .*core\.cpp/{f=1} /^File /{if ($0 !~ /core\.cpp/) f=0}
+             f && /^(Lines executed|Branches executed|Taken at least once|Calls executed)/{print}
+            ' "build/$covdir/gcov.txt" || true
+        pct=$(awk '/^File .*core\.cpp/{f=1; next} /^File /{f=0}
+                    f && /^Lines executed/ {sub(/.*:/,""); sub(/%.*/,""); print; exit}
+                   ' "build/$covdir/gcov.txt")
+        brt=$(awk '/^File .*core\.cpp/{f=1; next} /^File /{f=0}
+                    f && /^Taken at least once/ {sub(/.*:/,""); sub(/%.*/,""); print; exit}
+                   ' "build/$covdir/gcov.txt")
+        if [ -z "$pct" ]; then
+            echo "FAIL: gcov produced no line-coverage line for core.cpp ($label); raw output follows"
+            cat "build/$covdir/gcov.txt"
+            exit 1
+        fi
+        echo "core.cpp [$label]: ${pct}% lines, ${brt}% branches taken  (line floor ${COVERAGE_MIN_LINES}%)"
+        awk -v p="$pct" -v f="$COVERAGE_MIN_LINES" 'BEGIN { exit (p+0 >= f+0) ? 0 : 1 }' || {
+            echo "FAIL: core.cpp line coverage below the floor ($label)"; exit 1; }
+    }
+    coverage_pass 1   cov      "Debug, PM_DEBUG=1"   "${2:-3000}"
+    coverage_pass 0   cov_rel  "Release, PM_DEBUG=0" "${2:-3000}"
     echo "coverage PASSED"
     ;;
 --fuzz)
