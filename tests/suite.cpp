@@ -4724,6 +4724,202 @@ static void test_overflow_band() {
 }
 
 // ---------------------------------------------------------------------------
+// (R54) alloc's refusal DIAGNOSIS. The refusal path no longer walks every free
+// chain -- on the target that cost ~160 us per refused alloc in a fragmented
+// pool, about 20x a successful one, and it is paid exactly on the path a
+// fragmentation workload hammers. It now checks that the bitmaps agree with
+// their heads. Both halves of that trade are pinned here so neither can drift:
+//   (a) damage BEYOND a head (a broken successor link) is no longer diagnosed
+//       as CorruptMetadata by alloc -- but the request is still refused, and
+//       validate() still reports the damage. Nothing is followed and nothing
+//       is silently accepted: the refusal is just less specific.
+//   (b) damage the cheaper check DOES see -- a bitmap bit that disagrees with
+//       its head -- is still CorruptMetadata.
+// The pool is filled to exactly zero free bytes so that the only free blocks
+// are the freed 16 B ones, which makes a 24 B request unsatisfiable and
+// therefore drives bins_find to fail (the refusal path) without the damage
+// having to be the reason.
+// ---------------------------------------------------------------------------
+static void test_alloc_refusal_diagnosis() {
+    printf("  [R54] alloc refusal: NoSpace for deep damage, CorruptMetadata for "
+           "bitmap/head disagreement\n");
+    using namespace pm::internal;
+
+    // Fills `o` with 512 objects that fill a 2-segment pool to the last byte
+    // (payload 8 -> 16 B blocks), then frees o[0]/o[2]/o[4] so the 16 B bin
+    // holds a chain of three blocks kept apart by live neighbours. Reports that
+    // bin and the second node of its chain.
+    struct Bin {
+        uint32_t f, s;
+        pm::internal::FreeBlock* head;
+        pm::internal::FreeBlock* second;
+    };
+    auto setup = [&](pm::PoolId& pool, pm::RawRef (&o)[512], Bin& bin) {
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        for (uint32_t i = 0; i < 512; ++i)
+            CHECK_ST(pm::alloc(pool, 8, 8, 0, i, o[i]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[4]), pm::Status::Ok);
+        VALIDATE(pool);
+        Pool const& P = g().pools[pool];
+        bin.f = 0;
+        bin.s = 0;
+        bin.head = nullptr;
+        bin.second = nullptr;
+        for (uint32_t f = 0; f < FL_COUNT && !bin.head; ++f) {
+            for (uint32_t sl = 0; sl < SL_COUNT; ++sl) {
+                if (P.bins.head[f][sl] == NULL_OFF) continue;
+                bin.f = f;
+                bin.s = sl;
+                bin.head = ptr_of(P.bins.head[f][sl]);
+                bin.second = (bin.head->next == NULL_OFF)
+                                 ? nullptr
+                                 : ptr_of(bin.head->next);
+                break;
+            }
+        }
+        CHECK(bin.head != nullptr);
+        CHECK(bin.second != nullptr); // three frees, so the chain has >= 2 nodes
+        CHECK((bin.head->header & BLOCK_FREE_BIT) != 0);
+    };
+    // The pool is filled to the last byte, so every object must be released
+    // again (o[0]/o[2]/o[4] are already free) before it can be destroyed.
+    auto release_all = [&](pm::PoolId pool, pm::RawRef (&o)[512]) {
+        for (uint32_t i = 0; i < 512; ++i) {
+            if (i == 0 || i == 2 || i == 4) continue;
+            CHECK_ST(pm::free(o[i]), pm::Status::Ok);
+        }
+        CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+    };
+
+    // (a) a successor link pushed outside the pool, behind the head.
+    {
+        fresh();
+        pm::PoolId pool{};
+        pm::RawRef o[512];
+        Bin bin{};
+        setup(pool, o, bin);
+        uint32_t const saved = bin.head->next;
+        bin.head->next = 0xFFFFFFF0u; // only a chain walk can see this
+        pm::RawRef r{};
+        CHECK_ST(pm::alloc(pool, 16, 8, 0, 0, r), pm::Status::NoSpace);
+        CHECK(r.generation == 0);
+        CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata); // not lost
+        bin.head->next = saved;                                    // repair
+        CHECK_ST(pm::validate(pool), pm::Status::Ok);
+        release_all(pool, o);
+        done();
+    }
+
+    // (b) a bitmap bit that disagrees with its head.
+    {
+        fresh();
+        pm::PoolId pool{};
+        pm::RawRef o[512];
+        Bin bin{};
+        setup(pool, o, bin);
+        Pool& P = g().pools[pool];
+        uint16_t const saved = P.bins.sl_bitmap[bin.f];
+        P.bins.sl_bitmap[bin.f] = (uint16_t)(saved & ~(uint16_t)(1u << bin.s));
+        pm::RawRef r{};
+        CHECK_ST(pm::alloc(pool, 16, 8, 0, 0, r), pm::Status::CorruptMetadata);
+        CHECK(r.generation == 0);
+        P.bins.sl_bitmap[bin.f] = saved; // repair
+        VALIDATE(pool);
+        release_all(pool, o);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (R55) the bitmap/head consistency check, rule by rule. R54 pins what the
+// cheaper diagnosis GIVES UP; this pins what it still CATCHES, so the check
+// cannot be weakened without a red test. Both cases damage a non-empty bin's
+// head (or the level bits above it) and expect a refused alloc to name the
+// damage. A third rule of that check -- a head whose own size does not select
+// the bin it heads -- cannot be reached through the public API: raising the
+// head's size makes it a FIT for the request (so bins_find succeeds and the
+// diagnosis never runs), and lowering it below the request leaves the rest of
+// the chain to satisfy the walk. It is therefore registered as a dead branch in
+// docs/AUDIT_LEDGER.md rather than pretended to be covered.
+// ---------------------------------------------------------------------------
+static void test_refusal_bitmap_rules() {
+    printf("  [R55] refused alloc: bitmap/head consistency rules\n");
+    using namespace pm::internal;
+
+    auto build = [&](pm::PoolId& pool, pm::RawRef (&o)[512], uint32_t& f,
+                     uint32_t& s) {
+        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
+        for (uint32_t i = 0; i < 512; ++i)
+            CHECK_ST(pm::alloc(pool, 8, 8, 0, i, o[i]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+        CHECK_ST(pm::free(o[4]), pm::Status::Ok);
+        VALIDATE(pool);
+        Pool const& P = g().pools[pool];
+        f = 0;
+        s = 0;
+        for (uint32_t ff = 0; ff < FL_COUNT; ++ff) {
+            bool found = false;
+            for (uint32_t ss = 0; ss < SL_COUNT; ++ss) {
+                if (P.bins.head[ff][ss] != NULL_OFF) {
+                    f = ff;
+                    s = ss;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        CHECK(P.bins.head[f][s] != NULL_OFF);
+    };
+    auto release_all = [&](pm::PoolId pool, pm::RawRef (&o)[512]) {
+        for (uint32_t i = 0; i < 512; ++i) {
+            if (i == 0 || i == 2 || i == 4) continue;
+            CHECK_ST(pm::free(o[i]), pm::Status::Ok);
+        }
+        CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
+    };
+
+    // (a) the head cursor lies outside the pool.
+    {
+        fresh();
+        pm::PoolId pool{};
+        pm::RawRef o[512];
+        uint32_t f = 0, s = 0;
+        build(pool, o, f, s);
+        Pool& P = g().pools[pool];
+        uint32_t const saved = P.bins.head[f][s];
+        P.bins.head[f][s] = 0xFFFFFFF0u;
+        pm::RawRef r{};
+        CHECK_ST(pm::alloc(pool, 16, 8, 0, 0, r), pm::Status::CorruptMetadata);
+        P.bins.head[f][s] = saved; // repair
+        VALIDATE(pool);
+        release_all(pool, o);
+        done();
+    }
+
+    // (b) a level bit cleared while a sub-bit at that level is still set.
+    {
+        fresh();
+        pm::PoolId pool{};
+        pm::RawRef o[512];
+        uint32_t f = 0, s = 0;
+        build(pool, o, f, s);
+        Pool& P = g().pools[pool];
+        uint32_t const saved = P.bins.fl_bitmap;
+        P.bins.fl_bitmap = saved & ~(1u << f);
+        pm::RawRef r{};
+        CHECK_ST(pm::alloc(pool, 16, 8, 0, 0, r), pm::Status::CorruptMetadata);
+        P.bins.fl_bitmap = saved; // repair
+        VALIDATE(pool);
+        release_all(pool, o);
+        done();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // (R46) A4-07: exhaustion matrix. (a) all PM_MAX_OBJECTS descriptor slots go
 // live; a further alloc is NoSpace while old refs stay freeable and the slot
 // chain recycles LIFO. (b) pool-table exhaustion (16 pools with segments
@@ -4908,6 +5104,8 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R51_generation_wrap", test_generation_wrap);
     run("R52_gap16_boundary", test_gap16_boundary);
     run("R53_overflow_band", test_overflow_band);
+    run("R54_alloc_refusal_diagnosis", test_alloc_refusal_diagnosis);
+    run("R55_refusal_bitmap_rules", test_refusal_bitmap_rules);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

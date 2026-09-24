@@ -166,6 +166,9 @@ Status validate(PoolId pool);
 // --- objects ----------------------------------------------------------------
 // alloc: first-fit inside the bin the TLSF bitmap selects, so it is
 // O(bin chain length) -- see the complexity note in the maintenance section.
+// A refusal reports NoSpace after an O(bins) bitmap/head consistency check, so
+// a damaged chain deeper than a head is still refused but no longer NAMED as
+// CorruptMetadata on this path (validate() names it).
 // PM_ZERO_INIT adds O(size) zeroing on top. Requests at or above 2^PM_FL_MAX
 // are refused with NoSpace rather than being clamped into the top bin.
 Status alloc(PoolId pool, uint32_t size, uint32_t alignment, uint16_t flags,
@@ -230,18 +233,36 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align,
 // bench/RESULTS.md), so the ordering is now established once per maintenance
 // call, on the cold path, instead of on every allocation. The upper bound is
 // still O(zone_size / PM_MIN_BLOCK), for a corrupted (cyclic) bin chain.
-//   free            O(1 + the bin chain lengths of its free neighbours), upper
-//                   bound O(zone_size / PM_MIN_BLOCK) -- free proves the
-//                   neighbours' free-list membership before merging instead of
-//                   trusting their headers (round-3 guide 6.2)
+//   free            O(1). Proving a free neighbour's membership is an anchored
+//                   link check -- the neighbour's own links must reciprocate
+//                   the list position -- not a walk, so the bin-chain term is
+//                   gone. The list is still refused rather than followed when
+//                   damaged (round-3 guide 6.2)
 //   pause/resume    O(1)
 //   compact/split   O(objects + moved bytes), plus O(objects log objects) to
 //                   re-establish address order, plus the read-only audits
 //   merge           O(objects + free blocks + moved bytes) -- audits both
 //                   pools' live slots, descriptors, statistics and bins
-//   validate        O((live + free)^2)
+//   validate        O((live + free) log(live + free)): the coverage audit is
+//                   one merge over address-ordered live and free blocks
+//                   instead of a prefix scan per block. This needs
+//                   O(PM_MAX_OBJECTS) free-block scratch; the quadratic
+//                   fallback kept behind it is unreachable for a pool that
+//                   passes the earlier checks (a free block is bounded by live
+//                   blocks, so there are at most live+1 of them), and is
+//                   registered as a dead branch in docs/AUDIT_LEDGER.md
 //   get_stats       O(free_blocks) with a step cap (a refused walk on a
-//                   corrupted list is reported via PoolStats::valid == 0)
+//                   corrupted list is reported via PoolStats::valid == 0). Its
+//                   cursor bounds are evaluated in 32-bit: both bounds are
+//                   in-zone offsets, so the high half is always zero and the
+//                   comparison is exact as well as cheaper
+//   alloc refusal   O(FL_COUNT x SL_COUNT). A refused alloc checks that the
+//                   bitmaps agree with their bin heads instead of auditing
+//                   every free chain (~160 us per refusal on a fragmented
+//                   pool before this). It therefore no longer NAMES a chain
+//                   damaged BEYOND its head as CorruptMetadata on this one
+//                   path: the request is still refused, and validate() still
+//                   reports the damage (R54, docs/AUDIT_LEDGER.md)
 //   analyze_compaction O(objects log objects + free blocks)
 Status compact(PoolId pool);
 Status merge(PoolId source, PoolId target);

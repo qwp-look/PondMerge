@@ -36,7 +36,7 @@ src/
     internal.h      内部结构（Pool / ObjectDesc / TlsfBins / FreeBlock）
     core.cpp        核心实现（单一翻译单元）
 tests/
-    suite.cpp       验收测试套件（基础 1–13 + R1–R53，host 与 ESP32 共用）
+    suite.cpp       验收测试套件（基础 1–13 + R1–R55，host 与 ESP32 共用）
     model.cpp       参考模型对拍（固定 seed，独立预言机；host）
     concurrency_esp32.cpp  双核借用/暂停/整理锁边界测试（仅 ESP32 构建）
     main.cpp        主机 runner（套件 + 模型）
@@ -92,8 +92,8 @@ docs/               架构说明、代码指导书、各轮任务书与交接文
 `global_stats().metadata_bytes` 精确等于（实测 6 组配置全部吻合）：
 
 ```
-metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 构建）
-                 ↑ 其中 98 = 64（ObjectDesc）+ 34（维护计划 scratch）
+metadata_bytes = 72 + 476 × PM_MAX_POOLS + 106 × PM_MAX_OBJECTS + 4（Release 构建）
+                 ↑ 其中 106 = 64（ObjectDesc）+ 34（维护计划 scratch）+ 8（地址序打包键与空闲块表）
                  Debug 构建再加 9 字节（advice owner 门控：上下文 id + 标志）
 ```
 
@@ -103,7 +103,7 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 
 
 | 平台 | `PM_MAX_OBJECTS` | `PM_MAX_POOLS` | `metadata_bytes` |
 |---|---|---|---|
-| x86-64 | 256 | 16 | 32,776（闭式） |
+| x86-64 | 256 | 16 | 34,837（实测） |
 | **ESP32-S3（32 位）** | **256** | **16** | **28,672（实测）** |
 | x86-64 | 1024 | 16 | 108,040（实测） |
 
@@ -116,9 +116,9 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 
 | 64 | 2 | 7,296 | 7,296 | 极小目标 |
 | 128 | 4 | 14,520 | 14,528 | 小型 MCU |
 | 256 | 4 | 27,064 | 27,072 | 小型 MCU（推荐起点） |
-| **256** | **16** | **32,776** | **32,768** | **ESP32-S3 验收固件所用配置** |
+| **256** | **16** | **34,837** | **34,832** | **ESP32-S3 验收固件所用配置** |
 | 512 | 8 | 54,056 | 54,048 | 中型 |
-| 1024 | 16 | 108,040 | 108,032 | 默认（Host / 大内存目标） |
+| 1024 | 16 | 116,236 | 116,228 | 默认（Host / 大内存目标） |
 
 读法：
 
@@ -169,11 +169,11 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 98 × PM_MAX_OBJECTS     （Release 
 | 操作 | 最坏复杂度 | 说明 |
 |---|---|---|
 | `alloc` | **O(SL bin 链长)**，上界 O(zone_size / PM_MIN_BLOCK) | TLSF 位图定位到 bin 后链内 first-fit（R2），再加 O(1) 追加到 live-slot 表与 O(1) 损坏筛查（R38/R44）。`PM_ZERO_INIT` 另加 O(size) 清零。**不是严格 O(1)**，但**已与 live 对象数无关** —— 见下方说明。 |
-| `free` | O(1 + 邻块空闲 bin 链长)，上界 O(zone_size / PM_MIN_BLOCK) | 合并前只读证明：自身块头、prev_size 链、后继块、邻块 bin 成员资格与互逆链接（R24）。损坏时 `CorruptMetadata` 且零副作用。 |
+| `free` | **O(1)** | 合并前只读证明：自身块头、prev_size 链、后继块、邻块 bin 成员资格与互逆链接（R24）。损坏时 `CorruptMetadata` 且零副作用。 |
 | `pause` / `resume` | O(1) | 单次状态翻转。 |
 | `compact` / `split` | O(objects + moved_bytes)，另加 O(objects log objects) 恢复地址序 | 只读规划（有界收集 + heapsort）+ 按序搬移与重建。 |
 | `merge` | O(objects + free_blocks + moved_bytes) | 两池只读审计（live-slot 表 / 描述符 / 统计 / bins）+ 合并区间规划 + 不可失败执行；规划失败两池逐字节不变（R22）。 |
-| `validate` | O((live_objects + free_objects)²) | live 块与 binned 空闲块两两重叠检查与 gap 归账；所有遍历有步数上限。 |
+| `validate` | O((live_objects + free_objects) log(live_objects + free_objects)) | live 块与 binned 空闲块按地址序各扫一次（归并）：前缀最大 end、gap 归账、同起点重复都在同一趟里完成；所有遍历有步数上限。改前是二次（**全库唯一剩余的超线性路径**，设备实测指数 1.70），改后指数 **0.98**、快 **13.1×**。二次扫描保留为回退，且由「空闲块数 ≤ live+1」支配而不可达。 |
 | `get_stats` | O(free_blocks) | 步数上限；损坏链表有限返回，`valid = 0` 与"真的没有空闲块"可区分（R18/R29）。 |
 | `borrow_begin` / `resolve` / `borrow_end` | O(1) | 描述符校验（含池范围证明，R23）+ 一次描述符读取。`borrow_end` 的 token 校验与递减在同一临界区（R25）；失败输出指针必为空（R26）。 |
 | `analyze_compaction` | O(objects log objects + free_blocks) | 打包模拟精确估算搬迁对象数/字节数（R35）+ 计数器审计（损坏即 `INVALID_METADATA`）。 |
@@ -345,6 +345,7 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 | R29–R30（第四轮） | 扩展故障矩阵（互逆链接/跨 bin 重复/segment/运行时状态/alloc 防环）、alloc 失败清空输出 |
 | R31–R34（第六–八轮） | 整理建议（只读、判定矩阵、阈值、抑制）、INVALID_REQUEST、poll 变化键、owner 门控 |
 | R35（第九轮） | 建议估算精确性（池首空闲块场景）+ 计数器审计故障注入 |
+| R54–R55（第十五轮） | alloc 拒绝诊断的两半：R54 = 深层链损坏仍被拒绝但改报 `NoSpace`（且 `validate()` 仍报损坏）+ 位图/头不一致仍为 `CorruptMetadata`；R55 = 位图/头一致性检查的其余两条规则（头部游标出池、层级位与子级位不一致） |
 | R36–R53（第十四轮，R45 空缺） | 元数据筛查缺陷修复的红测：alloc 的 order_head 界（R38）、check_ref 链接界（R39）、create_pool 段窗口证明（R43）、池几何 zone 上限（R44）、mid-gap slack、post-deinit 拒绝、重复 live 地址、split/free 故障注入、耗尽矩阵、validate 第三段、advice 负路径、Paused 恢复、零长尾访问、generation 回绕、16 B gap 边界、溢出带 |
 | 参考模型 | 固定 seed 随机 alloc/free/compact/merge/split，独立预言机校验 live 数、payload、池归属、字节账目与可分配性 |
 | 双核并发（设备） | 借用/暂停/整理的 SMP 锁边界（`tests/concurrency_esp32.cpp`） |
@@ -357,8 +358,8 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 
 | 档位 | 结果 |
 |---|---|
-| Host Debug（10000 op） | 5,428,675 checks, 0 failures |
-| Host Release（10000 op） | 5,428,682 checks, 0 failures |
+| Host Debug（10000 op） | 5,432,806 checks, 0 failures |
+| Host Release（10000 op） | 5,432,813 checks, 0 failures |
 | ASan/UBSan（3000 op） | 1,527,686 checks, 0 failures |
 | 参考模型对拍 | 466,859 checks, 0 failures |
 | cppcheck（warning/style/performance） | exit 0，三类计数 0/0/0 |

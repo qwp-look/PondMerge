@@ -5,8 +5,50 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- **The maintenance path got the algorithm review's accepted set of changes**
+  (see `docs/HANDOVER_v17.md`). Every one is behaviour-preserving or
+  complexity-reducing; the acceptance suite's model differential (466,859
+  checks) is untouched and both reference platforms keep identical counts.
+  - `free()`: proving a free neighbour's bin membership is now an **O(1)
+    anchored link check** instead of an O(bin-chain) walk, so the documented
+    bound drops from `O(1 + neighbour bin chains)` to **O(1)**. Worst case on
+    the target: a tail-placed neighbour at chain length 64 went 12,975 -> 5,617
+    ns (2.31x), while chain length 1 is unchanged, so the common case pays
+    nothing.
+  - `validate()`: the coverage audit became a **single address-ordered merge**
+    instead of a prefix scan per block. This was the library's only remaining
+    superlinear path (measured exponent 1.70 on device); it is now 0.98, with
+    per-block cost flat. 384 blocks: 20.1 ms -> 0.74 ms (13.1x).
+  - `alloc()`'s refusal diagnosis: a **bitmap/head consistency check** replaces
+    the full free-chain audit (O(FL x SL) instead of O(free blocks)). On a
+    fragmented pool a refused alloc went 160,074 -> 8,041 ns, i.e. from 20.3x a
+    successful allocation to 1.01x. The trade is documented in
+    `docs/AUDIT_LEDGER.md` section 6 and pinned by R54/R55.
+  - Relocation: the copy primitive is now chosen from the two addresses -- a
+    provably disjoint move uses `memcpy`, an overlapping one is copied
+    word-wise in the direction that cannot clobber. On the target this is 4x to
+    16x on maintenance windows; on x86-64 `memmove` already wins, so the choice
+    is per platform, not a universal win.
+  - Address-order sorting: packed (zone_offset << 8 | slot) keys plus adaptive
+    direction detection, in place -- the sort used to be 39% of the maintenance
+    window on a sequentially filled pool.
+  - `precheck_pool`'s per-object audit evaluates the same predicates in native
+    pointer width instead of 64-bit zone offsets (-29% to -43% on that pass).
+  - `get_stats()`'s cursor bounds are evaluated in 32-bit (exact: both bounds
+    are in-zone offsets).
+  - Static metadata grows by `8 x PM_MAX_OBJECTS + 4` bytes (2,052 B at the
+    device's 256) for the two new scratch arrays; the README budget table and
+    closed form are updated.
+
 ### Added
 
+- **Two red-test groups for the alloc refusal diagnosis (R54-R55).** R54 pins
+  both halves of the trade: a chain damaged beyond its head is still refused
+  (now `NoSpace`) and is still reported by `validate()`, while a bitmap bit
+  disagreeing with its head is still `CorruptMetadata`. R55 pins the remaining
+  consistency rules of the cheaper check.
 - **Seventeen new red-test groups for the metadata-screening fixes (R36-R44,
   R46-R53; R45 deliberately unused), plus a `PM_MIN_BLOCK=32` variant in
   `tests/config_matrix.sh`.** Every fix below is pinned by at least one of

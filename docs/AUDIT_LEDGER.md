@@ -81,15 +81,15 @@
 
 | 操作 | 声明 | 依据循环 | 变化 |
 |---|---|---|---|
-| alloc | **O(SL bin 链长)**，上界 O(zone/PM_MIN_BLOCK)；`PM_ZERO_INIT` 另加 O(size) 清零 | `bins_find`（链内 first-fit）+ 两项 O(1) 筛查（order_head 界、`pool_geometry_ok`，先于任何变更）+ `order_append`（O(1) 追加，无遍历） | **第十轮**：地址序插入移出热路径后 O(live) 项消失（实测 799→38 ns @1024，232→38 ns @256；`bench/RESULTS.md`）；**第十四轮**：O(1) 筛查不改变声明（R38/R44） |
-| free | O(1 + 邻块空闲 bin 链长)，上界 O(zone/PM_MIN_BLOCK) | `free_block_binned` 有界遍历 × 2 邻块 | 第三轮已更正；**第十四轮**：第二次邻块验证仅在 `destroy_fn` 存在时执行——无回调时两次验证之间不可能有代码运行（单 owner 契约），第二次证明是第一次的确定性重放；R24 的"回调后重验"契约对带回调对象逐字保留。callgrind 指令数 **756.7 → 728.5 /pair（−3.7%）**（host x86-64，callgrind 确定性计数、两运行长度差分，方法见 `bench/README.md` §2 的 `host_insn`） |
+| alloc | **O(SL bin 链长)**，上界 O(zone/PM_MIN_BLOCK)；**拒绝路径 O(FL×SL)**；`PM_ZERO_INIT` 另加 O(size) 清零 | `bins_find`（链内 first-fit）+ 两项 O(1) 筛查（order_head 界、`pool_geometry_ok`，先于任何变更）+ `order_append`（O(1) 追加，无遍历） | **第十轮**：地址序插入移出热路径后 O(live) 项消失（实测 799→38 ns @1024，232→38 ns @256；`bench/RESULTS.md`）；**第十四轮**：O(1) 筛查不改变声明（R38/R44）；**第十五轮**：`bins_find` 仍为链内 first-fit，但**拒绝诊断**由「审计全部空闲链 O(free_blocks)」改为「位图/头一致性 O(FL×SL)」——设备实测碎片池上一次被拒绝的分配 **160,074 → 8,041 ns**（比值 20.30× → **1.01×** 一次正常分配）。代价见 §6 第 9 项（R54/R55 钉住） |
+| free | **O(1)** | `free_block_binned` 的锚定链接证明（证明邻块自身的 prev/next 与该位置互逆，而非遍历 bin 找它） | 第三轮已更正；**第十四轮**：第二次邻块验证仅在 `destroy_fn` 存在时执行——无回调时两次验证之间不可能有代码运行（单 owner 契约），第二次证明是第一次的确定性重放；R24 的"回调后重验"契约对带回调对象逐字保留。callgrind 指令数 **756.7 → 728.5 /pair（−3.7%）**（host x86-64，callgrind 确定性计数、两运行长度差分，方法见 `bench/README.md` §2 的 `host_insn`）；**第十五轮**：邻块成员性证明由 O(bin 链长) 遍历改为 O(1) 锚定链接证明，设备实测链尾邻居 K=1/16/64 → 5,613/7,375/12,975 ns（原）vs 5,608/5,617/5,617 ns（新）：**斜率 131 ns/跳 → 0，且 K=1 时两者相同**（常见情形零成本），K=64 快 2.31× |
 | compact | O(objects log objects + moved bytes) | precheck（含 O(1) 池几何证明）→ collect（有界遍历 + heapsort）+ 计划 + 搬移 + finalize | **第十轮**：审计由 O(objects) 变为 O(objects log objects)，换来 alloc 与 live 数解耦；**第十四轮**：登记 precheck 的 O(1) 几何证明项 |
 | merge | O(objects log objects + free_blocks + moved bytes) | 两池 precheck（各含 O(1) 几何证明）+ collect（各含一次排序）+ audit_pool_bins + 计划 + 搬移 + finalize | **第十轮**同上；**第十四轮**同 compact |
 | split | O(objects log objects + moved bytes) | 同上（precheck + 排序 + finalize × 2 池） | **第十轮**同上；**第十四轮**同 compact |
-| validate | O((live + free)²) | gap_before 嵌套（collect 的排序项被二次项支配） | 如实保留 |
+| validate | **O((live+free) log(live+free))** | 覆盖审计改为「一次地址序归并」：`gap_before` 的前缀最大 end 改为随归并推进的 `run_max_end`，空闲块以 `s_free_off[]` 排序后并入同一趟 | **第十五轮**：此前是全库唯一剩余的超线性路径（设备实测指数 **1.70**）；改后指数 **0.98**，384 块 20.1 ms → 0.74 ms（**13.1×**），每块成本由 17,354–50,383 ns 变为 3,692–3,843 ns（**平坦**）。判据逐条等价（`AUDIT_LEDGER` §6 第 10 项 + `tests/suite.cpp` R54/R55 与 validate 全组）；二次扫描保留为回退，由「空闲块数 ≤ live+1」支配而不可达（§7） |
 | analyze_compaction | O(objects log objects + free_blocks) | collect（含排序）+ 打包模拟 + get_stats | **第十轮**补登记（此前未列入本表）；**第十四轮**：fragmented 判定为交叉相乘恒等式（`stranded*1000 >= permille*capacity`，无除法；`fragment_ratio_permille` 报告字段保留一次 64÷64，已记档） |
 | get_stats | O(free_blocks)，步数上限 | bins 全遍历 | + valid 字段 |
-| 固定 scratch | O(PM_MAX_OBJECTS)：s_plan/s_upper/s_barriers/s_slots(uint16) | — | 设备侧 30 B × PM_MAX_OBJECTS（1024→30,720 B；权威逐配置数值 = `global_stats().metadata_bytes`）；第十轮**未**新增 scratch（排序原地进行），第十四轮亦然 |
+| 固定 scratch | O(PM_MAX_OBJECTS)：s_plan/s_upper/s_barriers/s_slots(uint16) **+ s_ord_key(uint32) + s_free_off(uint32, N+1)** | — | 设备侧 30 B × PM_MAX_OBJECTS（1024→30,720 B；权威逐配置数值 = `global_stats().metadata_bytes`）；第十轮**未**新增 scratch（排序原地进行），第十四轮亦然；**第十五轮新增 8·PM_MAX_OBJECTS + 4 字节**（s_ord_key 4N + s_free_off 4(N+1)；排序已用原地堆排，故**没有**第二块排序缓冲）：256 时为 **+2,052 B**，1024 时为 **+8,196 B**。实测 256/16：`metadata_bytes` 32,776 → **34,837** |
 | 栈使用 | 维护路径无递归；heapsort 的 sift 为尾递归式循环（O(1) 栈）；最大局部为 snapshot lambda 与 verify_neighbours（均 O(1) 栈） | — | — |
 
 ## 6. 已接受的边界（明确决策，非遗漏）
@@ -126,6 +126,15 @@
    `bench/RESULTS.md` §1）以及地址序维护成本的冷路径化（每次维护一次
    O(n log n)，在 memmove 面前可忽略）。
    若将来需要"alloc 也拒绝损坏结构"，须先恢复一次遍历，届时会重新引入 O(live)。
+   **第十五轮补充（本项的第二处同族收窄）**：alloc 的**拒绝诊断**同样不再遍历空闲链
+   —— 它由「审计全部空闲链」改为「位图与链头一致性」检查（O(FL×SL)）。因此
+   **链头之后**的损坏（后继游标出池、环链、互逆链接、prev_size 链）不再由 alloc 在
+   这一条路径上**具名**为 `CorruptMetadata`：请求仍被拒绝（`NoSpace`），
+   `validate()` 仍报出损坏，每个维护入口也仍拒绝。**丢掉的是诊断的具体性，不是拒绝本身。**
+   收益：碎片池上一次被拒绝的分配 **160,074 → 8,041 ns**（设备；比值 20.30× → **1.01×**），
+   而这条路径正是碎片化负载反复撞上的那条。
+   两条半都被测试钉住：**R54**（深层损坏 → `NoSpace` 且 `validate()` 仍报损坏；
+   位图/位级不一致 → `CorruptMetadata`）、**R55**（位图/头一致性规则的其余两条）。
    **第十四轮补充**：alloc 现在在追加之前做两项 O(1) 筛查（`order_head` 界、
    `pool_geometry_ok` 池几何），恢复"不加重"前提的可证明性——追加写入只发生在
    通过筛查的结构上（头在描述符表内、窗口在 zone 内）；筛查失败零写入、输出
@@ -222,10 +231,19 @@
 | L1573 | `moved_bytes <= 0xFFFFFFFE` 的 UNKNOWN 桥接 | moved_bytes ≤ 池容量 < 2^PM_FL_MAX（init 的 FL 上限拒绝），恒在界内；保留为估算诚实性契约的形状 |
 | L1643 | compact arming 的 `state != Paused → Busy` | 锁内先经 `pool_maintainable` 拒绝维护态，Running 已被上一句翻转为 Paused，到达此处 state 必为 Paused |
 | L2152 | validate 阶段 1 `audit_block` 的 `!in_pool(aoff, d.size)` 假分支 | 同 L345：payload 尾越出池尾被 `size ≤ block_size` 与同条件的块界项支配 |
+| 第十五轮：`collect_live_sorted` 的 `sort_slots_by_address` 回退 | 打包键排序的宽度前置条件（`G.zone_size <= 2^24` 且 `PM_MAX_OBJECTS <= 256`）在全部验收配置与设备构建下恒真（zone 上限由 init 拒绝；对象表上限由编译期常量给出）；保留为宽度契约的完备性守卫 |
+| 第十五轮：`linear_sweep` 的 `nfree > kFreeOffCap` 拒绝 | 空闲块是「两侧被 live 块或池端界住」的极大段，L 个 live 块至多产生 L+1 段，而 L ≤ PM_MAX_OBJECTS（每个 live 对象占一个描述符槽）⇒ `free_blocks ≤ PM_MAX_OBJECTS + 1 = kFreeOffCap`，恒不可达；保留为回退而非假设（衰退只会更慢，不会更错） |
+| 第十五轮：`move_block` 的对齐回退 `memmove` | 块起址与块尺寸都是 PM_ALIGNMENT 的倍数（块格式与分配器不变量），且搬迁目标由规划器按同一对齐产生；保留为「宁可慢也不猜」的正确性守卫 |
+| 第十五轮：`bins_bitmap_consistent` 的「头部尺寸不选它所在 bin」规则 | 公开 API 下构造不出会走到它的形状：抬高头部尺寸会让它成为本次请求的**适配目标**（bins_find 成功，诊断路径根本不运行），压低到请求以下则由链上其余节点满足遍历；保留为「头与位图必须自洽」这一族规则的完备性守卫（R55 覆盖同族的另两条） |
 | L2234 | validate 阶段 3 的 `same_start != 1` 重复起点拒绝 | 阶段 2 的 fl/sl 尺寸类匹配与互逆链接已拒绝任何重复登记（同一偏移不能同时匹配两个尺寸类）；保留为零长度 gap 的最后防线 |
 
 ## 8. 账本维护记录
 
+- 2026-09-24（第十五轮）：同步维护路径算法重构的落地（free 的 O(1) 锚定证明、
+  validate 的线性化、alloc 拒绝诊断的 O(bins) 化、搬运原语的可证不重叠选择、
+  地址序排序的打包键 + 自适应方向、precheck 审计的原生指针宽度）；新增 §6 第 9 项
+  （alloc 拒绝诊断的第二处同族收窄）与 §7 的四行死分支登记；复杂度表与 scratch 计量同步。
+  性能证据与仪器见 `bench/RESULTS.md` §9。
 - 2026-09-12（第四轮）：建立本账本；登记第四轮发现并修复的两项缺陷
   （order_insert 防环、alloc 损坏可区分）与两项口径更正（alloc 复杂度、
   get_stats valid 字段）；红测探针证据见 HANDOVER_v6 §3。

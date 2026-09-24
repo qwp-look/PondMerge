@@ -77,7 +77,7 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra \
 真实场景集成参考是 `examples/sensor_pipeline.cpp`（host/设备同一份源码，
 设备工程在 `examples/sensor_pipeline_esp32/`）——写新集成时先读它。
 
-全部通过应看到 **5,428,675 (Debug) / 5,428,682 (Release) / 1,527,686 (San，
+全部通过应看到 **5,432,806 (Debug) / 5,432,813 (Release) / 1,531,817 (San，
 3000 ops) checks, 0 failures**，模型对拍 **466,859**。CI（`.github/workflows/ci.yml`）
 在每次 push 上跑这十一项 + 消费路径冒烟 + 基准构建。
 
@@ -119,17 +119,19 @@ idf.py -p /dev/ttyUSB0 flash          # UART0 经 CH340 桥接
 
 先读 `bench/README.md` §0（计时仪器规则：**按批计时、绝不逐次**；每次运行自报
 仪器；主机上禁止逐次计时）与 `bench/RESULTS.md`（全部实测数字与它们的边界）。
-已有的两个"实测否定"结论不要回头再猜：`get_stats` 不值得优化、
-`PM_SL_COUNT` 调大无收益。设备侧那个 ~20×/周期的差距**已实测定性为指令数与
+已有的"实测否定"结论不要回头再猜：`get_stats` **走全部空闲链是契约的一部分**
+（只走最高非空 bin 的版本被 R54/R55 同族的具名用例挡下，见 HANDOVER_v17 §6）、
+`PM_SL_COUNT` 调大在**时间与空间两个轴**上都没有收益、`bins_find` 的 bin 内
+best-fit **两轴都更差**。设备侧那个 ~20×/周期的差距**已实测定性为指令数与
 流水线依赖，与 cache 无关**（§5.7）。
 
 ## 6. 文档地图
 
 | 要知道什么 | 去哪 |
 |---|---|
-| 最新一轮的完整交接（多代理审查与元数据筛查修复轮） | `docs/HANDOVER_v16.md` |
+| 最新一轮的完整交接（维护路径算法重构轮） | `docs/HANDOVER_v17.md` |
 | 全部实测数字、仪器限制、负结果 | `bench/RESULTS.md` |
 | 基准方法、公平性规则、引用数字的必备条件 | `bench/README.md` |
 | 不变式与证据（代码位置 + 证明 + 测试） | `docs/AUDIT_LEDGER.md` |
 | 用户侧集成（4 种方式）与元数据预算 | `README.md` |
-| 各轮收口报告 | `docs/HANDOVER_v2–v16.md` |
+| 各轮收口报告 | `docs/HANDOVER_v2–v17.md` |

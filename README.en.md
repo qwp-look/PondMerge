@@ -121,7 +121,7 @@ matches the linker's `.bss` to within ±8 bytes; leave a little margin anyway.
 | `pause` / `resume` | O(1) | |
 | `compact` / `split` | O(objects + moved bytes), plus O(objects log objects) to restore address order | |
 | `merge` | O(objects + free_blocks + moved bytes) | Audits both pools read-only; plan failure leaves both byte-identical. |
-| `validate` | O((live_objects + free_objects)^2) | Diagnostic. Quadratic; see below. |
+| `validate` | O((live_objects + free_objects) log(live_objects + free_objects)) | Diagnostic. One address-ordered merge pass over live and binned free blocks; the quadratic sweep it replaces is kept as a fallback that the live-block bound makes unreachable. |
 | `get_stats` | O(free_blocks) | Measured at 2.7 µs with 1536 blocks — **not worth optimising**. |
 | `borrow_begin` / `resolve` / `borrow_end` | O(1) | |
 | `analyze_compaction` | O(objects log objects + free_blocks) | |
@@ -290,8 +290,8 @@ test `tests/concurrency_esp32.cpp`, which is never compiled on the host.
 
 | gate | result |
 |---|---|
-| Host Debug, 10000 ops | 5,428,675 checks, 0 failures |
-| Host Release, 10000 ops | 5,428,682 checks, 0 failures |
+| Host Debug, 10000 ops | 5,432,806 checks, 0 failures |
+| Host Release, 10000 ops | 5,432,813 checks, 0 failures |
 | ASan + UBSan, 3000 ops | 1,527,686 checks, 0 failures |
 | Reference-model differential (independent oracle, fixed seed) | 466,859 checks, 0 failures |
 | cppcheck (warning/style/performance) | exit 0 |

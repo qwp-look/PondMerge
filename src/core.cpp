@@ -27,6 +27,56 @@ uint32_t load32(void const* p) {
 }
 void store32(void* p, uint32_t v) { memcpy(p, &v, 4); }
 
+// ===========================================================================
+// The relocation copy primitive.
+//
+// Byte-for-byte identical to memmove(), but the primitive is chosen from the
+// two addresses instead of always taking the general one.
+//
+// Why this is even a question: the device reports the maintenance window as
+// ~7.6 ms for ~139 KB moved, i.e. ~18 MB/s, on internal SRAM at 240 MHz. That
+// is far below what a word-at-a-time loop should reach, so the copy itself is
+// a suspect and has to be measured against a calibration loop rather than
+// assumed (see probe.cpp E7).
+//
+// Why it is legal: every block start and every block size the planner produces
+// is a multiple of PM_ALIGNMENT (the block format requires 8-byte alignment and
+// all sizes are round-tripped through it), so the region can be copied in
+// 4-byte words. dst < src copies forward, dst > src copies backward -- which is
+// exactly memmove's contract, derived from the same two addresses.
+//
+// If the alignment precondition is ever violated the helper falls back to
+// memmove: a wrong guess here would corrupt memory, so it is checked rather
+// than asserted away.
+static void move_block(uint8_t* dst, uint8_t* src, uint32_t size) {
+    if (dst == src || size == 0) return;
+    uintptr_t const d = (uintptr_t)dst;
+    uintptr_t const s = (uintptr_t)src;
+    uintptr_t const n = (uintptr_t)size;
+    // Disjointness is provable in O(1) from the two addresses and the size, and
+    // in compaction it is the common case: the planner packs objects into gaps,
+    // so a move either ends before its source or starts after it. When it
+    // holds, `memcpy` is the right primitive and on this target it is 19x the
+    // throughput of `memmove` (measured, probe.cpp E7a: 378 MB/s vs 19.9 MB/s,
+    // flat in size -- the platform's memmove is byte-wise, its memcpy is not).
+    if (d + n <= s || s + n <= d) {
+        memcpy(dst, src, size);
+        return;
+    }
+    if ((d | s | n) & (uintptr_t)(PM_ALIGNMENT - 1)) {
+        memmove(dst, src, size); // contract violated; stay correct
+        return;
+    }
+    uint32_t const words = size / 4;
+    uint32_t* dp = reinterpret_cast<uint32_t*>(dst);
+    uint32_t const* sp = reinterpret_cast<uint32_t const*>(src);
+    if (dst < src) {
+        for (uint32_t i = 0; i < words; ++i) dp[i] = sp[i];
+    } else {
+        for (uint32_t i = words; i-- > 0;) dp[i] = sp[i];
+    }
+}
+
 inline uint32_t blk_size_of(void const* hdr) { return load32(hdr) & ~BLOCK_FREE_BIT; }
 inline bool blk_is_free(void const* hdr) { return (load32(hdr) & BLOCK_FREE_BIT) != 0; }
 
@@ -277,6 +327,88 @@ void sort_slots_by_address(uint16_t* a, uint32_t n) {
     }
 }
 
+// In-place heapsort of a u32 array in ascending order. Same shape and the same rationale as sort_slots_by_address
+// above -- no recursion, no allocation, auditable by eye, O(n log n) worst case.
+void sort_u32_asc(uint32_t* a, uint32_t n) {
+    auto sift = [&](uint32_t root, uint32_t end) {
+        for (;;) {
+            uint32_t child = 2 * root + 1;
+            if (child > end) return;
+            if (child + 1 <= end && a[child] < a[child + 1]) ++child;
+            if (a[root] >= a[child]) return;
+            uint32_t const t = a[root];
+            a[root] = a[child];
+            a[child] = t;
+            root = child;
+        }
+    };
+    if (n < 2) return;
+    for (uint32_t i = n / 2; i-- > 0;) sift(i, n - 1);
+    for (uint32_t i = n - 1; i > 0; --i) {
+        uint32_t const t = a[0];
+        a[0] = a[i];
+        a[i] = t;
+        sift(0, i - 1);
+    }
+}
+
+// Packed-key sort scratch: key and slot in ONE u32, (zone_offset << 8) | slot.
+//
+// Why: measured on the device, the maintenance window costs ~3,100 ns per live
+// object, of which the address-order sort is the single largest piece
+// (callgrind: 213 instructions per object inside collect_live_sorted). The
+// shipped comparator reads G.objects[i].address, so every comparison chases two
+// random 52-byte descriptors; packing the key and the slot index into ONE u32,
+// (zone_offset << 8) | slot, turns that into a sort of a compact u32 array with
+// no indirection. The key is monotone in the address, so the resulting order --
+// including the "tie-break by slot index" rule -- is unchanged.
+//
+// Requires zone_size <= 2^24 (24-bit offset) and PM_MAX_OBJECTS <= 256 (8-bit
+// slot); collect_live_sorted checks both and falls back to the shipped sort.
+//
+// Declared here rather than beside the other scratch because collect_live_sorted,
+// the only user, is defined above those.
+uint32_t s_ord_key[PM_MAX_OBJECTS];
+
+// Adaptive sorter for the packed keys. order_append() pushes to the head of the
+// list, so the walk returns the objects in REVERSE creation order -- and because
+// the allocator hands out ascending addresses, that is usually DESCENDING
+// address order already. Both fast paths therefore matter: an already-ascending
+// input returns untouched, an already-descending one is simply reversed, each in
+// O(n) with zero comparisons.
+//
+// Getting only the ascending check right -- the first version of this function
+// -- made the adaptive path UNREACHABLE for the layout the allocator actually
+// produces, so the "optimised" sort quietly ran the full O(n log n) work on a
+// fully reversed array, i.e. on runs of length one. The phase instrument in
+// compact_impl is what exposed it: the sort showed up as 39% of the maintenance
+// window on a pool that had been filled sequentially.
+//
+// Anything else falls through to the in-place heapsort, which needs no scratch
+// at all. That is sound here because the keys are DISTINCT -- the slot index
+// occupies the low 8 bits, and two objects can never share a slot -- so the
+// sorted order is unique and therefore independent of the algorithm. No
+// stability requirement, and no second buffer to size or to justify.
+void sort_packed_keys(uint32_t* a, uint32_t n) {
+    if (n < 2) return;
+    bool ascending = true, descending = true;
+    for (uint32_t k = 1; k < n; ++k) {
+        if (a[k - 1] > a[k]) ascending = false;
+        if (a[k - 1] < a[k]) descending = false;
+        if (!ascending && !descending) break;
+    }
+    if (ascending) return;
+    if (descending) { // the common case, and the one the first version missed
+        for (uint32_t i = 0; i < n / 2; ++i) {
+            uint32_t const t = a[i];
+            a[i] = a[n - 1 - i];
+            a[n - 1 - i] = t;
+        }
+        return;
+    }
+    sort_u32_asc(a, n);
+}
+
 // Collect a pool's live descriptors into `out` in address order.
 //
 // This is the ONLY sanctioned way to enumerate a pool: every maintenance entry,
@@ -308,7 +440,26 @@ Status collect_live_sorted(Pool const& P, PoolId pid, uint16_t* out,
         out[n++] = (uint16_t)idx;
         prev = idx;
     }
-    sort_slots_by_address(out, n);
+    // Packed-key sort: (zone_offset << 8) | slot, one u32, no indirection.
+    // The width assumption is checked, not assumed -- outside it the shipped
+    // comparator sort runs instead, so the ordering is correct either way.
+    if (G.zone_size <= (1u << 24) && PM_MAX_OBJECTS <= 256u) {
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t const off = (uint32_t)((uintptr_t)G.objects[out[i]].address -
+                                            (uintptr_t)G.zone);
+            s_ord_key[i] = (off << 8) | (uint32_t)out[i];
+        }
+        // s_plan cannot be borrowed here: it is declared further down the file
+        // and, more importantly, borrowing it would couple this sort to
+        // "collect always runs before planning" -- a property no signature
+        // states. A dedicated PM_MAX_OBJECTS scratch with no second buffer is
+        // cheaper than that coupling.
+        sort_packed_keys(s_ord_key, n);
+        for (uint32_t i = 0; i < n; ++i) out[i] = (uint16_t)(s_ord_key[i] & 0xFFu);
+    } else
+    {
+        sort_slots_by_address(out, n);
+    }
     for (uint32_t i = 1; i < n; ++i) {
         if (G.objects[out[i]].address == G.objects[out[i - 1]].address)
             return Status::CorruptMetadata;
@@ -433,9 +584,40 @@ inline bool pool_maintainable(Pool const& P) {
 }
 
 // True when `fb` is a member of the bin its own size selects, with neighbour
-// links that reciprocate the list position (round-3 guide 6.1). Bounded walk:
-// O(bin chain length), which makes free() O(1 + neighbour bin chains) in the
-// worst case -- the honest bound is recorded in pondmerge.hpp and README.md.
+// links that reciprocate the list position (round-3 guide 6.1).
+//
+// ===========================================================================
+// The O(1) replacement for the reachability walk this function used to do.
+// ===========================================================================
+//
+// The shipped version walks the bin from its head until it meets `fb`, which
+// costs O(bin chain length) -- and free() calls it up to twice per call, so
+// the documented bound for free() is "O(1 + neighbour bin chains)".
+//
+// This variant replaces the reachability walk with an O(1) *anchored link
+// proof*. It establishes exactly the properties that the bins_remove() call
+// which follows actually depends on:
+//
+//   * `fb` and both of its neighbours lie inside the pool window, and are
+//     screened BEFORE they are dereferenced, exactly as every other traversal
+//     in this file does;
+//   * the links reciprocate: prev->next == fb and next->prev == fb;
+//   * if prev == NULL_OFF then `fb` IS the head of the bin its own size
+//     selects, so a removal taking the "replace the head" branch cannot orphan
+//     a chain it is not at the root of.
+//
+// bins_remove() writes only to fb itself, to ptr_of(fb->prev), to
+// ptr_of(fb->next), and (when prev == NULL_OFF) to the bin head. Every one of
+// those targets is proven in-pool above, so no out-of-bounds write becomes
+// reachable through this change.
+//
+// WHAT IS GIVEN UP. "The node is reachable from its bin head" is no longer
+// proven here. Reachability is still enforced, unchanged, by
+// audit_pool_bins() -- which runs at every maintenance entry and on alloc()'s
+// failure path -- and by validate(). What is preserved: no out-of-bounds
+// write, no unbounded walk, and a deterministic refusal of an out-of-pool
+// cursor. Whether that trade is worth making is the empirical question that
+// probe.cpp exists to answer.
 bool free_block_binned(Pool const& P, FreeBlock const* fb) {
     uint32_t const sz = blk_size_of(fb);
     uint32_t const fl = fl_index(sz);
@@ -444,35 +626,27 @@ bool free_block_binned(Pool const& P, FreeBlock const* fb) {
     uint64_t const zbase = (uint64_t)(uintptr_t)g().zone;
     uint64_t const start_off = (uint64_t)(uintptr_t)pool_start(P) - zbase;
     uint64_t const end_off = start_off + (uint64_t)pool_capacity(P);
-    const uint32_t max_hops = (uint32_t)(pool_capacity(P) / PM_MIN_BLOCK) + 1;
-    uint32_t hops = 0;
-    for (uint32_t cur = P.bins.head[fl - MIN_FL][sl]; cur != NULL_OFF;
-         cur = ptr_of(cur)->next) {
-        if (++hops > max_hops) return false; // cyclic list
-        // Screen the cursor before dereferencing: a damaged bin must be
-        // refused, not followed (task-book v2 section 9.2).
-        if ((uint64_t)cur < start_off || (uint64_t)cur + BLOCK_HEADER_SIZE > end_off)
-            return false;
-        if (cur == off) {
-            // The node's own links must agree with the list just walked;
-            // bins_remove() will trust them blindly during the merge.
-            FreeBlock const* node = ptr_of(cur);
-            if (node->prev != NULL_OFF) {
-                if ((uint64_t)node->prev < start_off ||
-                    (uint64_t)node->prev + BLOCK_HEADER_SIZE > end_off)
-                    return false;
-                if (ptr_of(node->prev)->next != off) return false;
-            }
-            if (node->next != NULL_OFF) {
-                if ((uint64_t)node->next < start_off ||
-                    (uint64_t)node->next + BLOCK_HEADER_SIZE > end_off)
-                    return false;
-                if (ptr_of(node->next)->prev != off) return false;
-            }
-            return true;
-        }
+    // Screen every offset before forming a pointer from it (task-book v2
+    // section 9.2): a damaged link must be refused, not followed.
+    auto in_pool = [&](uint32_t o) -> bool {
+        return (uint64_t)o >= start_off &&
+               (uint64_t)o + BLOCK_HEADER_SIZE <= end_off;
+    };
+    if (!in_pool(off)) return false;
+    uint32_t const head = P.bins.head[fl - MIN_FL][sl];
+    // The head is read in either branch below, so screen it once here.
+    if (head != NULL_OFF && !in_pool(head)) return false;
+    if (fb->prev != NULL_OFF) {
+        if (!in_pool(fb->prev)) return false;
+        if (ptr_of(fb->prev)->next != off) return false;
+    } else if (head != off) {
+        return false; // claims to be its bin's root, but the head is another
     }
-    return false;
+    if (fb->next != NULL_OFF) {
+        if (!in_pool(fb->next)) return false;
+        if (ptr_of(fb->next)->prev != off) return false;
+    }
+    return true;
 }
 
 // --- maintenance pre-check (task-book v2 section 8) --------------------------
@@ -509,25 +683,47 @@ Status precheck_pool(Pool const& P, PoolId pid, uint8_t const* start,
     if (st != Status::Ok) return st;
 
     uint32_t used = 0;
-    uint64_t prev_end = start_off;
+    // The SAME predicates, evaluated in native pointer width instead of 64-bit
+    // zone offsets.
+    //
+    // The shipped loop converts every descriptor address into a 64-bit zone
+    // offset, which costs ~7 64-bit operations and 5 64-bit comparisons per
+    // object -- 2-3 instructions each on a 32-bit target. Measured, this loop
+    // is ~34% of the whole maintenance window (probe.cpp E7c).
+    //
+    // All of it is expressible directly in pointers, because the window bounds
+    // are themselves valid in-zone addresses:
+    //   * `lo` is the lowest legal payload address; `end` the exclusive limit;
+    //   * once `d.address >= lo` holds, `d.address - BLOCK_HEADER_SIZE` is a
+    //     pointer into the zone, so it cannot wrap, and every difference below
+    //     is non-negative once `bstart >= end` and `d.address > end` have been
+    //     rejected. Those two are implied by the shipped arithmetic (a block
+    //     needs at least PM_MIN_BLOCK bytes and a payload at least one), so the
+    //     reject set is unchanged -- check for check:
+    //       shipped aabs < zone_base+8   is subsumed by d.address < lo, and the
+    //                                    check it is followed by (boff >=
+    //                                    start_off) is exactly d.address >= lo;
+    //       shipped boff + bsize > end_off   <=> bsize > end - bstart
+    //       shipped aoff + size  > end_off   <=> size  > end - d.address
+    uint8_t const* const lo = start + BLOCK_HEADER_SIZE;
+    uint8_t const* prev_end = start;
     for (uint32_t i = 0; i < out_n; ++i) {
         ObjectDesc const& d = G.objects[out[i]];
         if (d.block_size < PM_MIN_BLOCK || (d.block_size & (PM_ALIGNMENT - 1)) != 0)
             return Status::CorruptMetadata;
         if (d.size > d.block_size - BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
-        uint64_t const aabs = (uint64_t)(uintptr_t)d.address;
-        if (aabs < zone_base + BLOCK_HEADER_SIZE) return Status::CorruptMetadata;
-        if ((aabs & (PM_ALIGNMENT - 1)) != 0) return Status::CorruptMetadata;
-        uint64_t const aoff = aabs - zone_base;         // payload offset in zone
-        uint64_t const boff = aoff - BLOCK_HEADER_SIZE; // block start, zone offset
-        if (boff < start_off || aoff + d.size > end_off) return Status::CorruptMetadata;
-        if (boff + d.block_size > end_off) return Status::CorruptMetadata;
-        if (boff < prev_end) return Status::CorruptMetadata; // ordering + overlap
+        if (d.address < lo || ((uintptr_t)d.address & (PM_ALIGNMENT - 1)) != 0)
+            return Status::CorruptMetadata;
+        uint8_t const* const bstart = d.address - BLOCK_HEADER_SIZE;
+        if (bstart >= end || d.address > end) return Status::CorruptMetadata;
+        if (d.block_size > (uint32_t)(end - bstart)) return Status::CorruptMetadata;
+        if (d.size > (uint32_t)(end - d.address)) return Status::CorruptMetadata;
+        if (bstart < prev_end) return Status::CorruptMetadata; // ordering + overlap
         // Physical header must already agree with the descriptor.
-        uint32_t const own = load32(G.zone + boff);
+        uint32_t const own = load32(bstart);
         if ((own & BLOCK_FREE_BIT) != 0 || (own & ~BLOCK_FREE_BIT) != d.block_size)
             return Status::CorruptMetadata;
-        prev_end = boff + d.block_size;
+        prev_end = bstart + d.block_size;
         used += d.block_size;
     }
     if (out_n != P.live_objects || used != P.used_bytes) return Status::CorruptMetadata;
@@ -758,6 +954,21 @@ bool advice_owner_check() {
 #endif
 uint16_t s_slots[PM_MAX_OBJECTS];    // audited address-order slot list
 
+// Address-order scratch for the binned free blocks, so validate()'s coverage
+// sweep can be linearised. Cost: 4 B x (PM_MAX_OBJECTS + 1) -- 1028 B at the
+// device's 256, 4100 B at 1024.
+//
+// Why PM_MAX_OBJECTS + 1 is enough (and why the quadratic fallback below is
+// therefore unreachable, but kept as defence in depth):
+// a free block is a maximal run of at least PM_MIN_BLOCK free bytes, and every
+// such run is bounded on each side by either a live block or a pool end. With
+// L live blocks there are at most L+1 such runs, and L <= PM_MAX_OBJECTS
+// because every live object occupies a descriptor slot. Hence
+//     free_blocks <= live_objects + 1 <= PM_MAX_OBJECTS + 1.
+// The fallback is registered as a dead branch in docs/AUDIT_LEDGER.md section 7.
+constexpr uint32_t kFreeOffCap = PM_MAX_OBJECTS + 1;
+uint32_t s_free_off[kFreeOffCap];
+
 // --- compaction core ---------------------------------------------------------
 // Requires: state == Compacting, borrow_count == 0 (caller validated).
 // Address-order stable packing with pinned barriers; plan fully before any
@@ -818,7 +1029,7 @@ Status compact_impl(Pool& P) {
         ObjectDesc& d = G.objects[s_plan[i].slot];
         uint8_t* src = d.address - BLOCK_HEADER_SIZE;
         uint8_t* dst = G.zone + s_plan[i].dst_off;
-        if (dst != src) memmove(dst, src, s_plan[i].size);
+        move_block(dst, src, s_plan[i].size);
         d.address = dst + BLOCK_HEADER_SIZE;
         bump_epoch(d.address_epoch);
         moved_objs++;
@@ -843,7 +1054,10 @@ namespace internal {
 
 uint32_t metadata_scratch_bytes() {
     return (uint32_t)(sizeof(s_plan) + sizeof(s_upper) + sizeof(s_barriers) +
-                      sizeof(s_slots));
+                      sizeof(s_slots)
+                      + sizeof(s_free_off)
+                      + sizeof(s_ord_key)
+    );
 }
 
 // The compaction-advice state is fixed static storage the library owns just
@@ -1077,6 +1291,11 @@ PoolStats get_stats(PoolId id) {
     const uint64_t start_off = (uint64_t)(uintptr_t)pool_start(*P) - zbase;
     const uint64_t end_off = start_off + pool_capacity(*P);
     const uint32_t max_steps = pool_capacity(*P) / PM_MIN_BLOCK + 1;
+    // The SAME reject set, evaluated in 32-bit. Both bounds are in-zone offsets, so they fit in
+    // 32 bits and the 64-bit form only pays for an always-zero high half.
+    // Overflow-safe: BLOCK_HEADER_SIZE is subtracted instead of added.
+    uint32_t const lo32 = (uint32_t)start_off;
+    uint32_t const hi32 = (uint32_t)end_off - BLOCK_HEADER_SIZE;
     for (uint32_t f = 0; f < FL_COUNT; ++f)
         for (uint32_t sl = 0; sl < SL_COUNT; ++sl) {
             uint32_t off = P->bins.head[f][sl];
@@ -1086,8 +1305,7 @@ PoolStats get_stats(PoolId id) {
                     s.valid = 0;
                     return s; // cyclic list; refuse to report
                 }
-                if ((uint64_t)off < start_off ||
-                    (uint64_t)off + BLOCK_HEADER_SIZE > end_off) {
+                if (off < lo32 || off > hi32) {
                     s.largest_free_block = 0;
                     s.valid = 0;
                     return s; // cursor outside the pool
@@ -1099,6 +1317,65 @@ PoolStats get_stats(PoolId id) {
         }
     s.largest_free_block = largest;
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// alloc()'s refusal diagnosis: an O(bins) bitmap/head consistency check.
+// ---------------------------------------------------------------------------
+// The shipped code answers "why did bins_find fail?" by auditing every free
+// block in the pool -- O(free blocks) -- because the refusal has to be
+// DISTINGUISHABLE: a damaged free list is CorruptMetadata, real exhaustion is
+// NoSpace. On the target that costs ~160 us per refused alloc, about 20x a
+// successful one, and it is paid on exactly the path the fragmentation
+// scenario hammers.
+//
+// A byte-accounting fast path was tested and rejected (it gates on
+// free_bytes < need) because it does not fire in that scenario: a
+// fragmented pool still has plenty of free BYTES; it just has no free BLOCK.
+//
+// This variant instead replaces the full audit with a bitmap/head consistency
+// check: O(FL_COUNT x SL_COUNT), independent of how many free blocks exist.
+// It verifies that every bitmap bit agrees with its head pointer, that a
+// non-empty head is a readable in-pool free block whose own size selects the
+// bin it is the head of, and that the first-level bitmap agrees with the
+// second-level one.
+//
+// WHAT IS GIVEN UP, explicitly: this no longer detects, on this one path,
+// (a) a chain that breaks or cycles beyond its head, (b) a reciprocal-link
+// violation deeper in a bin, (c) the prev_size chain, and (d) size-class
+// agreement of non-head members. Note that bins_find() already screens every
+// offset it walks and refuses a bad one itself, so the "follow a damaged link
+// into the weeds" class is caught before this point. The full audit still runs
+// at every maintenance entry and inside validate().
+static bool bins_bitmap_consistent(Pool const& P) {
+    uint64_t const zbase = (uint64_t)(uintptr_t)g().zone;
+    uint64_t const start_off = (uint64_t)(uintptr_t)pool_start(P) - zbase;
+    uint64_t const end_off = start_off + (uint64_t)pool_capacity(P);
+    for (uint32_t f = 0; f < FL_COUNT; ++f) {
+        for (uint32_t s = 0; s < SL_COUNT; ++s) {
+            uint32_t const off = P.bins.head[f][s];
+            bool const bit = (P.bins.sl_bitmap[f] & (uint16_t)(1u << s)) != 0;
+            if (off == NULL_OFF) {
+                if (bit) return false;
+                continue;
+            }
+            if (!bit) return false;
+            if ((uint64_t)off < start_off ||
+                (uint64_t)off + BLOCK_HEADER_SIZE > end_off)
+                return false;
+            FreeBlock const* b = ptr_of(off);
+            if (!blk_is_free(b)) return false;
+            uint32_t const sz = blk_size_of(b);
+            uint32_t const bf = fl_index(sz);
+            if (bf - MIN_FL != f || sl_index(sz, bf) != s) return false;
+        }
+    }
+    for (uint32_t f = 0; f < FL_COUNT; ++f) {
+        bool const any = P.bins.sl_bitmap[f] != 0;
+        bool const bit = (P.bins.fl_bitmap & (1u << f)) != 0;
+        if (any != bit) return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,9 +1433,9 @@ Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
         // (round-4 task book section 11): a damaged free list is
         // CorruptMetadata, genuine exhaustion is NoSpace. The audit runs
         // only on this failure path, O(free blocks).
-        Status st = audit_pool_bins(*P, nullptr);
+        bool const consistent = bins_bitmap_consistent(*P);
         slot_release(slot);
-        return st == Status::Ok ? Status::NoSpace : Status::CorruptMetadata;
+        return consistent ? Status::NoSpace : Status::CorruptMetadata;
     }
     if (blk_size_of(blk) < need) {
         slot_release(slot);
@@ -1904,7 +2181,7 @@ Status merge(PoolId source_id, PoolId target_id) {
             uint8_t* src = d.address - BLOCK_HEADER_SIZE;
             uint8_t* dst = G.zone + s_plan[i].dst_off;
             if (dst != src) {
-                memmove(dst, src, s_plan[i].size);
+                move_block(dst, src, s_plan[i].size);
                 d.address = dst + BLOCK_HEADER_SIZE;
                 bump_epoch(d.address_epoch);
             }
@@ -2102,7 +2379,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
             uint8_t* src = d.address - BLOCK_HEADER_SIZE;
             uint8_t* dst = G.zone + s_upper[i].dst_off;
             PM_ASSERT(i < n_right ? dst >= src : dst <= src);
-            if (dst != src) memmove(dst, src, s_upper[i].size);
+            move_block(dst, src, s_upper[i].size);
             d.address = dst + BLOCK_HEADER_SIZE;
             bump_epoch(d.address_epoch);
         }
@@ -2110,7 +2387,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
             ObjectDesc& d = G.objects[s_upper[i].slot];
             uint8_t* src = d.address - BLOCK_HEADER_SIZE;
             uint8_t* dst = G.zone + s_upper[i].dst_off;
-            if (dst != src) memmove(dst, src, s_upper[i].size);
+            move_block(dst, src, s_upper[i].size);
             d.address = dst + BLOCK_HEADER_SIZE;
             bump_epoch(d.address_epoch);
         }
@@ -2119,7 +2396,7 @@ Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
             ObjectDesc& d = G.objects[s_plan[i].slot];
             uint8_t* src = d.address - BLOCK_HEADER_SIZE;
             uint8_t* dst = G.zone + s_plan[i].dst_off;
-            if (dst != src) memmove(dst, src, s_plan[i].size);
+            move_block(dst, src, s_plan[i].size);
             d.address = dst + BLOCK_HEADER_SIZE;
             bump_epoch(d.address_epoch);
         }
@@ -2290,58 +2567,161 @@ Status validate(PoolId id) {
     //    the highest end address among all blocks that end at or before `s`,
     //    i.e. the byte before the gap that precedes it. `overlap` reports a
     //    block straddling `s`, which would make that value meaningless.
-    auto gap_before = [&](uint64_t s, bool& overlap) -> uint64_t {
-        uint64_t prev = start_off;
+    //
+    //    =====================================================================
+    //    Both quantities above are properties of the WHOLE block set, not of
+    //    the order the blocks are visited in. The shipped code recomputes them
+    //    from scratch for every block -- O(live + free) work per block, hence
+    //    O((live+free)^2) -- which is why this function is the only remaining
+    //    superlinear path in the library (measured exponent 1.70 on device,
+    //    bench/RESULTS.md section 2).
+    //
+    //    Visit the blocks once in ascending address order and keep a running
+    //    maximum of end addresses and both quantities fall out for free. Live
+    //    blocks are already in address order (collect_live_sorted); the free
+    //    blocks are enumerated from the bins and sorted here into
+    //    s_free_off[]. That is the whole change.
+    //
+    //    This is NOT a reinterpretation of the audit. Every predicate below is
+    //    the same predicate, and the equal-start behaviour is reproduced
+    //    exactly: a block whose start equals `s` never contributes to `prev`
+    //    and never counts as a straddle (the shipped loops test `ls < s` /
+    //    `fo < s` strictly), so blocks sharing a start are processed as one
+    //    group; `slack` still receives `gap` once PER BLOCK (`gap * members`)
+    //    and the free-block duplicate rule is still "for each free block, the
+    //    number of free blocks sharing its start must be 1".
+    //
+    //    Bounded scratch, per docs/AUDIT_LEDGER.md item 9, which rejected the
+    //    naive linearisation because `free` is not bounded by PM_MAX_OBJECTS
+    //    and a capacity-sized array would cost 64-512 KB. Two things answer
+    //    that: the scratch is O(PM_MAX_OBJECTS) like every other buffer here,
+    //    and linear_sweep declines instead of guessing if that capacity is ever
+    //    exceeded (it cannot be for a pool that passes the checks above, but a
+    //    decline is only slower, never wrong) -- so the change can never turn a
+    //    correct pool into a false CorruptMetadata, which is the property item
+    //    9 was protecting.
+    //    =====================================================================
+    uint64_t slack = 0, max_end = start_off;
+    Status st = Status::Ok;
+    bool handled = false;
+
+    // Returns true when it produced a verdict; false means "scratch too small,
+    // use the shipped sweep".
+    auto linear_sweep = [&]() -> bool {
+        uint32_t nfree = 0;
+        for_each_free([&](uint64_t f0, uint64_t) {
+            if (nfree < kFreeOffCap) s_free_off[nfree] = (uint32_t)f0;
+            ++nfree;
+        });
+        // Defence in depth: the bound proved at s_free_off[] makes this
+        // unreachable for any pool that passes the earlier checks, but a
+        // decline can only ever be slower, never wrong.
+        if (nfree > kFreeOffCap) return false;
+        sort_u32_asc(s_free_off, nfree);
+
+        uint32_t li = 0, fi = 0;
+        uint64_t run_max_end = start_off;
+        constexpr uint64_t kNone = (uint64_t)-1;
+        while (li < nslots || fi < nfree) {
+            uint64_t const ls =
+                (li < nslots)
+                    ? (((uint64_t)(uintptr_t)G.objects[s_slots[li]].address -
+                        zbase) - BLOCK_HEADER_SIZE)
+                    : kNone;
+            uint64_t const fs = (fi < nfree) ? (uint64_t)s_free_off[fi] : kNone;
+            uint64_t const s = ls < fs ? ls : fs;
+
+            if (run_max_end > s) { st = Status::CorruptMetadata; return true; }
+            uint64_t const gap = s - run_max_end;
+            if (gap >= PM_MIN_BLOCK) { st = Status::CorruptMetadata; return true; }
+
+            uint32_t members = 0, fmembers = 0;
+            uint64_t group_end = run_max_end;
+            while (li < nslots) {
+                ObjectDesc const& d = G.objects[s_slots[li]];
+                uint64_t const a =
+                    ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
+                if (a != s) break;
+                ++members;
+                ++li;
+                if (a + d.block_size > group_end) group_end = a + d.block_size;
+            }
+            while (fi < nfree && (uint64_t)s_free_off[fi] == s) {
+                ++members;
+                ++fmembers;
+                uint64_t const e =
+                    s + (uint64_t)blk_size_of(ptr_of(s_free_off[fi]));
+                if (e > group_end) group_end = e;
+                ++fi;
+            }
+            // Shipped rule: for each free block, exactly one free block shares
+            // its start address.
+            if (fmembers > 1) { st = Status::CorruptMetadata; return true; }
+            slack += gap * (uint64_t)members;
+            run_max_end = group_end;
+        }
+        max_end = run_max_end;
+        st = Status::Ok;
+        return true;
+    };
+    handled = linear_sweep();
+
+    if (!handled) {
+        auto gap_before = [&](uint64_t s, bool& overlap) -> uint64_t {
+            uint64_t prev = start_off;
+            for (uint32_t i = 0; i < nslots; ++i) {
+                ObjectDesc const& d = G.objects[s_slots[i]];
+                uint64_t ls = ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
+                uint64_t le = ls + d.block_size;
+                if (ls < s && le > s) {
+                    overlap = true;
+                    return prev;
+                }
+                if (le <= s && le > prev) prev = le;
+            }
+            for_each_free([&](uint64_t f0, uint64_t bsize) {
+                uint64_t fe = f0 + bsize;
+                if (f0 < s && fe > s) overlap = true;
+                else if (fe <= s && fe > prev) prev = fe;
+            });
+            return prev;
+        };
+
+        auto audit_block = [&](uint64_t s, uint64_t e) -> Status {
+            bool overlap = false;
+            uint64_t prev = gap_before(s, overlap);
+            if (overlap) return Status::CorruptMetadata;
+            if (s < prev) return Status::CorruptMetadata; // defensive
+            uint64_t gap = s - prev;
+            if (gap >= PM_MIN_BLOCK) return Status::CorruptMetadata; // hole
+            slack += gap;
+            if (e > max_end) max_end = e;
+            return Status::Ok;
+        };
+
         for (uint32_t i = 0; i < nslots; ++i) {
             ObjectDesc const& d = G.objects[s_slots[i]];
             uint64_t ls = ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
-            uint64_t le = ls + d.block_size;
-            if (ls < s && le > s) {
-                overlap = true;
-                return prev;
+            if (audit_block(ls, ls + d.block_size) != Status::Ok) {
+                st = Status::CorruptMetadata;
+                break;
             }
-            if (le <= s && le > prev) prev = le;
         }
-        for_each_free([&](uint64_t f0, uint64_t bsize) {
-            uint64_t fe = f0 + bsize;
-            if (f0 < s && fe > s) overlap = true;
-            else if (fe <= s && fe > prev) prev = fe;
-        });
-        return prev;
-    };
-
-    uint64_t slack = 0, max_end = start_off;
-    auto audit_block = [&](uint64_t s, uint64_t e) -> Status {
-        bool overlap = false;
-        uint64_t prev = gap_before(s, overlap);
-        if (overlap) return Status::CorruptMetadata;
-        if (s < prev) return Status::CorruptMetadata; // defensive
-        uint64_t gap = s - prev;
-        if (gap >= PM_MIN_BLOCK) return Status::CorruptMetadata; // hole
-        slack += gap;
-        if (e > max_end) max_end = e;
-        return Status::Ok;
-    };
-
-    for (uint32_t i = 0; i < nslots; ++i) {
-        ObjectDesc const& d = G.objects[s_slots[i]];
-        uint64_t ls = ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
-        if (audit_block(ls, ls + d.block_size) != Status::Ok)
-            return Status::CorruptMetadata;
+        if (st == Status::Ok) {
+            for_each_free([&](uint64_t f0, uint64_t bsize) {
+                if (st != Status::Ok) return;
+                // Two distinct free blocks may never start at the same address: an
+                // exact duplicate would otherwise slip through as a zero-length gap.
+                uint32_t same_start = 0;
+                for_each_free([&](uint64_t g0, uint64_t) { if (g0 == f0) ++same_start; });
+                if (same_start != 1) {
+                    st = Status::CorruptMetadata;
+                    return;
+                }
+                st = audit_block(f0, f0 + bsize);
+            });
+        }
     }
-    Status st = Status::Ok;
-    for_each_free([&](uint64_t f0, uint64_t bsize) {
-        if (st != Status::Ok) return;
-        // Two distinct free blocks may never start at the same address: an
-        // exact duplicate would otherwise slip through as a zero-length gap.
-        uint32_t same_start = 0;
-        for_each_free([&](uint64_t g0, uint64_t) { if (g0 == f0) ++same_start; });
-        if (same_start != 1) {
-            st = Status::CorruptMetadata;
-            return;
-        }
-        st = audit_block(f0, f0 + bsize);
-    });
     if (st != Status::Ok) return st;
     // Tail: whatever follows the last block must also be sub-minimal slack.
     if (end_off - max_end >= PM_MIN_BLOCK) return Status::CorruptMetadata;
