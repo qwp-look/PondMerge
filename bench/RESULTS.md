@@ -812,3 +812,52 @@ transfers unchanged.
   rest on counts and on the pair metric rather than on per-event host times.
   Check the timer's self-report line at the top of a host run before quoting
   anything per-event from it.
+
+
+## 8. The maintenance-path review (round 15): what changed, and where the numbers come from
+
+The accepted set of an out-of-tree algorithm review was landed in `src/core.cpp`
+(see `docs/HANDOVER_v17.md`). The landed file is behaviourally identical to the
+review's build: the review harness's probe output matches byte for byte in every
+behavioural section, and the suite's three expected counts were identical before
+the new tests were added. That is why the numbers below -- measured on the
+review's own fixtures -- apply to the landed code.
+
+**Where they were measured.** Host x86-64 and ESP32-S3 (n16r8), using the
+review's own probe and its own IDF project (`~/pm_algo`), *not* this
+repository's `bench/` or the acceptance firmware. Instrumentation and its cost
+are stated per row. The acceptance firmware could not be used this round: it
+does not link (see HANDOVER_v17 section 7).
+
+| what | before | after | where |
+|---|---|---|---|
+| `free()` with a tail-placed free neighbour, chain length 1 / 16 / 64 | 5,613 / 7,375 / 12,975 ns | **5,608 / 5,617 / 5,617 ns** | S3, `esp_cpu_get_cycle_count`, 55 ns/read. Slope 131 ns/hop -> 0; length 1 unchanged, so the common case pays nothing |
+| a **refused** `alloc` in a fragmented pool (96 free blocks) | 160,074 ns (20.30x a successful alloc) | **8,041 ns (1.01x)** | S3, batched |
+| `validate()`, 384 blocks | 20.1 ms, exponent 1.70 | **0.74 ms, exponent 0.98** | S3. Per-block cost 17,354-50,383 ns -> 3,692-3,843 ns (flat) |
+| relocation bandwidth | 19.6 MB/s | **293 MB/s** | S3. The platform's `memmove` is byte-wise and flat in size; on x86-64 the choice is a **regression** (its memmove is SIMD), so it is per platform |
+| `compact()` window, 47 x 4 KiB objects (94,392 B moved) | 4,816,546 ns | **321,762 ns (14.97x)** | S3, min of trials |
+| `compact()` window, zero bytes moved (pure bookkeeping) | 337,555 ns | ... **1.85x on the whole window** | S3. Three per-object rings account for it; after this round none of them dominates |
+| `merge()` / `split()` | 1,358,592 ns / 2,023,809 ns | **501,121 ns / 372,729 ns (2.71x / 5.43x)** | S3 |
+| `analyze_compaction()` on a fragmented pool | 192,673 ns | **87,920 ns (2.19x)** | S3 |
+| a scripted end-to-end scenario needing one compaction | 7,559,109 ns | **756,695 ns (9.99x)** | S3. The control row (no maintenance needed) is unchanged at 1.00x, so the gain comes from the window and not from elsewhere |
+| `get_stats()` marginal cost | 293.1 ns per free block | **259.7 ns** | S3, 8-point linear fit, reproduced bit-identically across two builds |
+| instruction count of a free+alloc pair | 769.53 | **778.54 (+1.17%)** | host x86-64, callgrind, differential of two run lengths |
+
+**Two negative results to keep** (both were measured, not argued):
+
+- `bins_find` with **best-fit inside the bin** is worse on **both** axes: the
+  largest free block drops from 3,472 to 1,448 B and total free space by 22%,
+  while the walk gets longer. Best-fit consumes the tightest block, which chops
+  the remaining space harder.
+- **`PM_SL_COUNT` 4 -> 8 -> 16** was, until this round, only tested on *time*
+  (4/8/16 = 148/137/145 ns, no difference). On **space** it is worse too: the
+  absorbed waste does fall (120 -> 120 -> 56 B) but the largest-free/free ratio
+  drops from 16% to 9-10% and the 4,096 B probe failure rate rises from 3/7 to
+  4/7. The shipped 4 is the right value on both axes.
+
+**And one that is a contract, not a tuning knob**: `get_stats()` walks every
+free chain because that walk **is** part of the metadata-damage detection that
+`analyze_compaction()` promises (it must report `INVALID_METADATA`). A version
+that walks only the top non-empty bin is 14x faster on `get_stats` and would
+make the advice engine 1.4x faster, and it fails two named suite checks
+(`tests/suite.cpp:3622`, `:3872`). Do not retry it.
