@@ -1179,6 +1179,15 @@ Status create_pool(PoolId& out, uint32_t segment_count) {
     GlobalState& G = g();
     if (!G.initialized) return Status::CorruptMetadata;
     if (segment_count == 0) return Status::NoSpace;
+    // A count above the zone's segment count can never name a window here, so
+    // refuse it before any geometry math (R56). Without this bound the run
+    // search's (int32_t) cast sign-wrapped huge counts into a "found" run and
+    // the truncated uint16_t fields built a pool far outside the zone: tested
+    // 0x8000000C wrote through a wild pointer, 0xFFFFFFFF returned Ok with
+    // free_bytes ~1024x the zone. One zone-side bound suffices: the
+    // PM_MAX_SEGMENTS <= 0xFFFF static_assert keeps it below the uint16_t
+    // descriptor fields as well.
+    if (segment_count > G.segment_count) return Status::NoSpace;
 
     bool used[PM_MAX_SEGMENTS] = {};
     for (uint32_t i = 0; i < PM_MAX_POOLS; ++i) {

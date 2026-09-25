@@ -5,6 +5,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Security
+
+- **`create_pool` no longer wraps huge segment counts into out-of-zone pools,
+  pinned by red test R56.** A count above the zone's segment count can never
+  name a window, but the run search's `(int32_t)` comparison sign-wrapped it
+  into a false "found": on host, `create_pool(0x8000000C)` wrote through a
+  wild pointer (SIGSEGV) and `create_pool(0xFFFFFFFF)` returned `Ok` with a
+  pool claiming ~1024x the zone's free bytes. The entry now refuses such
+  counts with `NoSpace`; one zone-side bound suffices because
+  `PM_MAX_SEGMENTS <= 0xFFFF` already keeps legal counts inside the uint16_t
+  descriptor fields, and `split()` already had the equivalent guard. O(1),
+  no new complexity class.
+
 ### Changed
 
 - **The maintenance path got the algorithm review's accepted set of changes**

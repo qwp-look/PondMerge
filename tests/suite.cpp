@@ -4956,6 +4956,38 @@ static void test_refusal_bitmap_rules() {
 }
 
 // ---------------------------------------------------------------------------
+// (R56) A4-08: create_pool segment-count bounds. A count above the zone's
+// segment count can never name a window, and above 0xFFFF it cannot even be
+// represented in Pool::segment_count (uint16_t) -- PM_MAX_SEGMENTS <= 0xFFFF
+// makes one zone-side bound sufficient. Before the entry bound, the run
+// search's (int32_t) cast sign-wrapped huge counts into a "found" run:
+// 0x8000000C wrote through a wild pointer (SIGSEGV on host) and 0xFFFFFFFF
+// returned Ok with a pool claiming free_bytes ~1024x the zone.
+// ---------------------------------------------------------------------------
+static void test_create_pool_bounds() {
+    printf("  [R56] create_pool segment-count bounds (no sign wrap)\n");
+    fresh();
+    pm::PoolId pool{};
+    // The suite fixture's zone is 64 segments; everything above is refused
+    // without touching geometry, including the sign-wrap band.
+    CHECK_ST(pm::create_pool(pool, 65), pm::Status::NoSpace);
+    CHECK_ST(pm::create_pool(pool, 0xFFFFu), pm::Status::NoSpace);
+    CHECK_ST(pm::create_pool(pool, 0x10000u), pm::Status::NoSpace);
+    CHECK_ST(pm::create_pool(pool, 0x7FFFFFFFu), pm::Status::NoSpace);
+    CHECK_ST(pm::create_pool(pool, 0x80000000u), pm::Status::NoSpace);
+    CHECK_ST(pm::create_pool(pool, 0x8000000Cu), pm::Status::NoSpace);
+    CHECK_ST(pm::create_pool(pool, 0xFFFFFFFFu), pm::Status::NoSpace);
+    // The refusals must leave the system intact: a normal pool still works
+    // and every structure proves clean afterwards.
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef probe{};
+    CHECK_ST(pm::alloc(pool, 100, 8, 0, 1, probe), pm::Status::Ok);
+    CHECK_ST(pm::free(probe), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
 // (R46) A4-07: exhaustion matrix. (a) all PM_MAX_OBJECTS descriptor slots go
 // live; a further alloc is NoSpace while old refs stay freeable and the slot
 // chain recycles LIFO. (b) pool-table exhaustion (16 pools with segments
@@ -5143,6 +5175,7 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R53_overflow_band", test_overflow_band);
     run("R54_alloc_refusal_diagnosis", test_alloc_refusal_diagnosis);
     run("R55_refusal_bitmap_rules", test_refusal_bitmap_rules);
+    run("R56_create_pool_bounds", test_create_pool_bounds);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;
