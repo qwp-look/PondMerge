@@ -382,12 +382,12 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 | `src/core.cpp` 覆盖率 | 92.51% 行 / 75.58% 分支执行（Debug 档；Release 档 92.58% 行 / 77.30% 分支选取；下限 85% 强制。下降原因见 HANDOVER_v17 §5） |
 | libFuzzer（有界运行） | 无崩溃、无 sanitizer 发现 |
 | ESP32-S3 (n16r8) 实机，App version `v1.0.0-28-g60b079c` | 套件 **1,140,849**（R1–R57 全量，zone 在 PSRAM）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures；与 host 256 对象档逐位一致 |
-| 经典 ESP32 (D0WDQ6 v1.1) 实机，App version `v1.0.0-6-g2324312` | 双核并发 28 + 模型 466,859 checks，0 failures；两次复位重跑计数一致。**套件未运行**（见下） |
+| 经典 ESP32 (D0WDQ6 v1.1) 实机，App version `v1.0.0-31-g6d83194` | 双核并发 28 + 模型 466,859 checks，0 failures；两次复位重跑计数一致。**套件未运行**（见下；该目标无 PSRAM，DRAM 装不下 256 KiB zone） |
 
-> **经典 ESP32 的记录仍停在旧提交上**：该板本轮未接（v17 §9），其 App version
-> `v1.0.0-6` 早于 v17 的算法重构。它的并发与 model 结论不受那轮"行为保持"改动的
-> 影响是**推断**而非实测——这是当前账本里唯一一条靠推断维持的行，接上板子重烧
-> 即可消除。
+> 经典 ESP32 的记录已于 2026-09-25 在当前提交（`6d83194`）上重取（v19 收口）：
+> 此前它停在 `v1.0.0-6`，晚于 v17 算法重构的适用性只能靠推断；现在这条推断已由
+> 实测取代。三个平台（host / S3 / 经典 ESP32）的 model 对拍再次同为 466,859
+> checks。
 >
 > S3 的套件记录在 v1.0.0-4（`a5e68b6`）之后曾长期断档：v16/v17 期间套件变大且
 > 静态 DRAM 放不下 256 KiB zone，固件链接失败（v17 §7），v18 把 zone 移入 PSRAM

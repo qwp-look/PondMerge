@@ -95,7 +95,7 @@ README 却声称两条路径都被验证）；README 写明两条纯 CMake 路�
 |---|---|
 | seg_base UB 纯化 / NotInitialized 状态码 / operator-> 诊断 / segment_size 契约 | **完成**（`dce28e5`，见 §8 CHANGELOG 摘要） |
 | validate 整理窗口百分位重取（v17 §9 遗留） | **完成**：`v1.0.0-30-gdce28e5` 上 512 事件重测，p50 8,977.65 → **825.6 µs（10.9×）**，moved bytes 逐字节一致；`bench/RESULTS.md` §5.8 已更新，旧记录保留对照 |
-| 经典 ESP32 重烧（v18 §6 遗留） | **硬件阻塞**：本轮该板未连接（仅 `/dev/ttyACM0` 的 S3 在线）。README 验收表已注明该行为推断非实测；板子接上后 `rm -f sdkconfig` + `set-target esp32` + 双 defaults 文件重烧即可 |
+| 经典 ESP32 重烧（v18 §6 遗留） | **完成**（2026-09-25 晚，板子重新接入后）：`v1.0.0-31-g6d83194`，`rm -f sdkconfig` + 双 defaults + `set-target esp32` 重烧；suite 按设计响亮 SKIPPED，双核并发 28 + model 466,859 checks 0 failures，复位重跑一致。README 验收表的"推断"行已由实测取代 |
 
 ## 8. 观察与监控
 
