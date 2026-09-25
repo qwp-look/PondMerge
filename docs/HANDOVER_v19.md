@@ -104,6 +104,12 @@ README 却声称两条路径都被验证）；README 写明两条纯 CMake 路�
   两次完整重跑全绿（含同二进制）。已尝试 openocd USJ 复位 + 只读抓取的观察闭环，
   未能捕获现场。候选原因：PSRAM/USB 硬件抖动、或低概率的未定义行为——**列入
   监控**：再次出现时用 openocd `halt` 抓 PC 现场（复位前）。
+  **2026-09-25 深夜更新（诊断到手）**：同类"ROM 横幅后挂死"再次出现，本次用
+  openocd `halt` 抓到现场——**PC=0x40041A76（ROM 区），双核均停在 ROM**，即芯片
+  挂在 ROM 启动早期（flash 引导前，尚未执行任何库代码，排除 PondMerge 路径）。
+  openocd 软复位无法解除；**esptool 刷写（强制下载模式复位）一次恢复**。与该板
+  BOYA flash 的控制器/ROM 交互状态有关。恢复手段与判定工具已固化进
+  `scripts/device_run.sh`（v20 轮）。
 - 设备刷写今日成功率约 50%（`Packet content transfer stopped`/串口噪声），
   重试即可恢复；先起只读抓取再刷写的流程可把刷后状态一并捕获。
 
