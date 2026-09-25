@@ -193,6 +193,13 @@ def main():
         '{"cmd":"alloc","pool":-1,"size":10}',            # negative
         '{"cmd":"' + "x" * 200 + '"}',                    # overlong value
         '{"' + "k" * 40 + '":1,"cmd":"advice"}',          # overlong key
+        '{"cmd":"a\\"b"}',                # escaped quote in the command name:
+                                          # the rejection record must never
+                                          # echo user text (it would break
+                                          # the JSON and the framing)
+        '{"cmd":"a\nb"}',                 # a RAW newline splits this into two
+                                          # physical frames; both must be
+                                          # rejected and the scene survive
     ]
 
     def scene_signature(snap):
@@ -219,6 +226,12 @@ def main():
               f"scene unchanged after {text[:32]!r}")
     snap = snapshot_of(d.op("advice", pool=0))
     check(snap["seq"] > seq_before, "seq monotonic after rejections")
+
+    # (a2) unknown commands report a FIXED op string, never the user text
+    recs = d.line('{"cmd":"nosuchcommand"}', until_snapshot=False)
+    result = next((r for r in recs if r.get("t") == "result"), None)
+    check(result is not None and result.get("op") == "unknown",
+          "unknown command echoes a fixed op, never the user text")
 
     # (b) duplicate keys: FIRST occurrence wins (DEMO_REQUIREMENTS §2.1) --
     #     size 0 (first) means generic advice, not a request error

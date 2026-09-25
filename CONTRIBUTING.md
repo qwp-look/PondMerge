@@ -62,8 +62,8 @@ tests/run_host.sh --coverage # 覆盖率（Debug + Release 两档，行覆盖下
 tests/run_host.sh --fuzz     # libFuzzer 有界运行
 g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc \
     examples/host_demo.cpp src/core.cpp -o build/host_demo
-python3 examples/protocol_smoke.py build/host_demo   # 95 checks
-python3 examples/http_smoke.py build/host_demo       # 15 checks
+python3 examples/protocol_smoke.py build/host_demo   # 104 checks
+python3 examples/http_smoke.py build/host_demo       # 27 checks
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude -Isrc \
     examples/sensor_pipeline.cpp src/core.cpp -o build/sensor_pipeline
 ./build/sensor_pipeline                              # 末行必须 ALL AUDITS PASSED，

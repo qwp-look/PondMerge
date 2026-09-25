@@ -351,6 +351,11 @@ void emit_result(char const* op, pm::Status st) {
 
 // ---------- scenario helpers -------------------------------------------------
 void do_reset() {
+    // An explicit ready opens a NEW session (DEMO_REQUIREMENTS section 4),
+    // which is the only legal way for the snapshot seq to restart below.
+    // Without it the server counts every post-reset snapshot as
+    // stale_snapshot.
+    emit_info("ready", "scene reset");
     for (auto& e : g_entries)
         if (e.live) { pm::free(e.ref); e.live = false; }
     memset(g_entries, 0, sizeof(g_entries));
@@ -632,7 +637,9 @@ int main() {
             continue;
         }
         if (strcmp(op, "quit") == 0) break;
-        reject(op, "unknown command");
+        // NOT the raw op string: it is user text and would break the JSON
+        // record (quotes/newlines) and the one-line-per-record framing
+        reject("unknown", "unknown command");
     }
     emit_info("bye", "");
     return 0;

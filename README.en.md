@@ -296,7 +296,7 @@ test `tests/concurrency_esp32.cpp`, which is never compiled on the host.
 | Reference-model differential (independent oracle, fixed seed) | 466,859 checks, 0 failures |
 | cppcheck (warning/style/performance) | exit 0 |
 | TLSF configuration matrix | PASSED |
-| Demo protocol / HTTP smoke | 95 / 15 checks, 0 failures |
+| Demo protocol / HTTP smoke | 104 / 27 checks, 0 failures |
 | Coverage of `src/core.cpp` | 97.59% of lines, 98.80% of branches executed, 81.15% taken (Debug pass); the same gate also runs a Release pass (97.77% lines, 83.30% taken) — floor enforced on both |
 | libFuzzer, bounded run | no crash, no sanitizer finding |
 | **ESP32-S3 (n16r8) on hardware** | suite **1,120,457** + dual-core concurrency 28 + model 466,859 checks, **all 0 failures**; two runs from reset, identical counts |

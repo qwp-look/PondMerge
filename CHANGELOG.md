@@ -17,6 +17,41 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `PM_MAX_SEGMENTS <= 0xFFFF` already keeps legal counts inside the uint16_t
   descriptor fields, and `split()` already had the equivalent guard. O(1),
   no new complexity class.
+- **The demo HTTP server hardened, with regressions in the smoke suites.**
+  `POST /api/op` now requires `Content-Type: application/json` (browsers
+  send `text/plain` cross-site without a preflight, so a forged POST used to
+  execute commands, including `quit`); a `Host` header naming another origin
+  is refused with 403 (DNS rebinding used to get full read/write);
+  malformed, negative and oversized `Content-Length` values answer 400
+  instead of raising inside the handler and leaking empty responses.
+
+### Fixed
+
+- **Clicking "reset scene" no longer permanently deadlocks the demo server.**
+  `push()` called `log_protocol_error()` while holding the non-reentrant
+  `STATE_LOCK`, which re-entered the same lock on the
+  `stale_snapshot`/`moved_invariant_violation` paths: one reset froze every
+  request forever (verified end to end before the fix; the HTTP smoke never
+  pressed reset, which is why it stayed green). The logging is now split
+  into a lock-held helper, and `http_smoke.py` presses reset through the
+  HTTP layer.
+- **`host_demo` reset/quit now complete in the UI instead of surfacing a
+  3-second fake TIMEOUT.** `reset` emits an explicit `ready` record (the
+  documented way to open a new session, so the snapshot seq may legally
+  restart) before zeroing it, and the server recognizes command completion
+  by any observed progress of that command — snapshot arrival for reset,
+  process exit for quit.
+- **User text is never echoed into rejection records.** An unknown command's
+  rejection used to interpolate the raw `cmd` string into the JSON record;
+  input containing a quote produced invalid JSON and broke the
+  one-line-per-record framing (`{"cmd":"a\"b"}` was demonstrably bad). The
+  rejection now uses the fixed op `"unknown"`, and `protocol_smoke.py`
+  gained escaped-quote and raw-newline inputs (104 checks) plus an explicit
+  fixed-op assertion; `http_smoke.py` grew from 15 to 27 checks.
+- **Demo child processes are reaped** (zombie after "quit process", orphan
+  risk on Ctrl-C), and the ESP32 display-only mode disables the mutation
+  buttons with a visible banner per `DEMO_REQUIREMENTS` section 6 — they
+  used to stay clickable and fail silently.
 
 ### Changed
 

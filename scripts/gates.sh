@@ -9,7 +9,7 @@
 #   scripts/gates.sh -v         # same, without collapsing each gate's output
 #
 # The expected pass counts (5,432,806 / 5,432,813 / 1,531,817 checks; model
-# 466,859; protocol 95; HTTP 15) are stated in CONTRIBUTING.md section 3 -- a
+# 466,859; protocol 104; HTTP 27) are stated in CONTRIBUTING.md section 3 -- a
 # gate that "passes" with different numbers is itself worth investigating.
 # (The San figure is the 3000-op default of run_host.sh --san; Debug and
 # Release run 10000 ops.)

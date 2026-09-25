@@ -50,13 +50,18 @@ SERIAL = None
 PROC = None
 
 
+def _log_protocol_error_locked(what):
+    """Caller holds STATE_LOCK (push() and snapshot_diff() run under it)."""
+    STATE["protocol_errors"] += 1
+    STATE["last_protocol_error"] = what
+    STATE["log"].append({"t": "info", "event": "protocol-error",
+                         "detail": what})
+    del STATE["log"][:-200]
+
+
 def log_protocol_error(what):
     with STATE_LOCK:
-        STATE["protocol_errors"] += 1
-        STATE["last_protocol_error"] = what
-        STATE["log"].append({"t": "info", "event": "protocol-error",
-                             "detail": what})
-        del STATE["log"][:-200]
+        _log_protocol_error_locked(what)
 
 
 def push(rec, expected_source):
@@ -86,7 +91,7 @@ def push(rec, expected_source):
         seq = rec.get("seq")
         with STATE_LOCK:
             if STATE["last_seq"] is not None and seq <= STATE["last_seq"]:
-                log_protocol_error("stale_snapshot")
+                _log_protocol_error_locked("stale_snapshot")
                 return False
             STATE["last_seq"] = seq
             prev = STATE["prev_snapshot"]
@@ -143,7 +148,7 @@ def snapshot_diff(prev, nxt, op):
                                   "new_offset": a["address_offset"],
                                   "invariants_ok": moved_ok})
             if not moved_ok:
-                log_protocol_error("moved_invariant_violation")
+                _log_protocol_error_locked("moved_invariant_violation")
     return diff
 
 
@@ -161,6 +166,14 @@ def pump_host(proc):
             STATE["connected"] = False
             STATE["degraded"] = True
             STATE["log"].append({"t": "info", "event": "process-exited"})
+        try:  # reap the child so no zombie lingers while the UI keeps running
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=1)
+            except Exception:
+                pass
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -226,6 +239,10 @@ advice is not a compaction guarantee &middot; the quiescence button only
 simulates what real drivers must do themselves.</div>
 <div>source: <b id="src">-</b> build: <b id="build">-</b>
      connected: <b id="conn">-</b></div>
+<div id="ro-banner" class="warn" style="display:none"><b>Display-only:</b>
+the ESP32 demo firmware drives its own scripted scene -- commands from the
+browser are not forwarded to the device, so the mutation controls here are
+disabled.</div>
 <div>
  <button data-mutating onclick="op('reset')">reset scene</button>
  alloc pool <input id="apool" value="0" size="2"> size <input id="asize" value="300">
@@ -259,15 +276,30 @@ function el(tag, cls, text){
   if (text !== undefined) n.textContent = text;
   return n;
 }
-function op(cmd, params){ fetch('/api/op',{method:'POST',
+function op(cmd, params){ return fetch('/api/op',{method:'POST',
   headers:{'Content-Type':'application/json'},
-  body:JSON.stringify(Object.assign({cmd:cmd}, params||{}))}).then(refresh); }
+  body:JSON.stringify(Object.assign({cmd:cmd}, params||{}))})
+  .then(r=>r.json()).then(j=>{
+    // surface refusals the user would otherwise never see (display-only
+    // refusals, oversized commands, server-side validation)
+    if (j.status && j.status !== 'OK'){
+      document.getElementById('res').textContent =
+        j.status + (j.why ? (': ' + j.why) : '');
+    }
+    return j;
+  }).then(refresh); }
 function sendQuit(){ op('quit'); }
 function refresh(){
   fetch('/api/state').then(r=>r.json()).then(s=>{
     document.getElementById('src').textContent = s.source;
     document.getElementById('build').textContent = s.build_id || '-';
     document.getElementById('conn').textContent = s.connected ? 'yes' : 'NO';
+    // display-only (ESP32 serial): mutating controls disabled + visible
+    // banner (DEMO_REQUIREMENTS section 6)
+    const ro = s.source === 'ESP32';
+    document.querySelectorAll('button[data-mutating]').forEach(b=>{b.disabled = ro;});
+    const banner = document.getElementById('ro-banner');
+    banner.style.display = ro ? 'block' : 'none';
     const sn = s.snapshot;
     if (!sn) return;
     const lanes = document.getElementById('lanes');
@@ -349,7 +381,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _host_ok(self):
+        # DNS-rebinding guard: the server is loopback-only, so a Host header
+        # naming anything else is not this server's page's origin.
+        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        return host in ("127.0.0.1", "localhost")
+
     def do_GET(self):
+        if not self._host_ok():
+            self._json({"error": "forbidden"}, 403)
+            return
         if self.path == "/":
             body = PAGE.encode()
             self.send_response(200)
@@ -376,13 +417,31 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
+        if not self._host_ok():
+            self._json({"error": "forbidden"}, 403)
+            return
         if self.path != "/api/op":
             self._json({"error": "not found"}, 404)
             return
-        n = int(self.headers.get("Content-Length", 0))
-        if n > MAX_COMMAND_BYTES:
+        # CSRF guard: browsers send text/plain (and friends) cross-site
+        # WITHOUT a preflight; application/json is not CORS-safelisted, so
+        # requiring it here makes every forged cross-site POST fail its
+        # preflight. The UI and the smokes always send this header.
+        ctype = (self.headers.get("Content-Type") or
+                 "").split(";")[0].strip().lower()
+        if ctype != "application/json":
             self._json({"sent": False, "status": "INVALID_REQUEST",
-                        "why": "command too large"}, 400)
+                        "why": "content-type must be application/json"}, 415)
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._json({"sent": False, "status": "INVALID_REQUEST",
+                        "why": "bad content-length"}, 400)
+            return
+        if n <= 0 or n > MAX_COMMAND_BYTES:
+            self._json({"sent": False, "status": "INVALID_REQUEST",
+                        "why": "bad content-length"}, 400)
             return
         try:
             cmd = json.loads(self.rfile.read(n) or b"{}")
@@ -406,17 +465,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"sent": False, "status": "DISCONNECTED"})
             return
         # one command in flight: send + correlate under the COMMAND lock;
-        # the STATE lock is only taken for short copies (never during I/O)
+        # the STATE lock is only taken for short copies (never during I/O).
+        # Completion is ANY observed progress belonging to this command --
+        # result_seq for answering commands, last_seq for reset (which
+        # produces a new session's snapshot, not a result record) and
+        # connected=False for quit (process exit). Without that, reset/quit
+        # always surfaced as a 3 s TIMEOUT although they had succeeded.
         with COMMAND_LOCK:
             with STATE_LOCK:
-                before = STATE["result_seq"]
+                before = (STATE["result_seq"], STATE["last_seq"])
             if not send(cmd):
                 self._json({"sent": False, "status": "DISCONNECTED"})
                 return
+            is_quit = cmd["cmd"] == "quit"
             deadline = time.time() + RESPONSE_TIMEOUT
             while time.time() < deadline:
                 with STATE_LOCK:
-                    if STATE["result_seq"] != before:
+                    progressed = (STATE["result_seq"],
+                                  STATE["last_seq"]) != before
+                    if is_quit and not STATE["connected"]:
+                        out = {"sent": True, "status": "OK",
+                               "result": None,
+                               "snapshot": STATE["snapshot"]}
+                        break
+                    if progressed:
                         out = {"sent": True, "status": "OK",
                                "result": dict(STATE["last_result"]),
                                "snapshot": STATE["snapshot"]}
@@ -464,6 +536,14 @@ def main():
                 PROC.stdin.flush()
             except Exception:
                 pass
+            try:  # do not leave an orphan behind on Ctrl-C
+                PROC.wait(timeout=2)
+            except Exception:
+                PROC.kill()
+                try:
+                    PROC.wait(timeout=1)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

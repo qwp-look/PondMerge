@@ -9,6 +9,11 @@ Starts examples/demo_server.py --host on a loopback port and verifies:
   * the maintenance diff (last_diff) appears after compact/merge/split with
     the epoch/generation/digest invariants intact;
   * a slow /api/state reader never blocks the pumps (state stays fresh);
+  * HTTP hardening: a reset completes without deadlocking the server or
+    surfacing a fake TIMEOUT; cross-site text/plain POSTs are refused (415);
+    a foreign Host header gets 403 (DNS rebinding); malformed/negative/
+    oversized Content-Length gets 400; a quit completes via process-exit
+    detection and leaves no zombie;
   * killing the demo process puts the server into a visible degraded state;
   * ESP32 display-only: with --serial, POST /api/op answers
     UNSUPPORTED_DISPLAY_ONLY (verified via a local pty -- no real device).
@@ -16,6 +21,7 @@ Starts examples/demo_server.py --host on a loopback port and verifies:
 Usage: python3 examples/http_smoke.py [path-to-host_demo]
 """
 import faulthandler
+import http.client
 import json
 import os
 import pty
@@ -23,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 DEMO = sys.argv[1] if len(sys.argv) > 1 else "build/host_demo"
@@ -145,12 +152,82 @@ def main():
         check(state["snapshot"]["seq"] >= seq_after,
               "pumps keep running while state is polled")
 
+        # ---- 4b) HTTP hardening regressions (demo must be alive here) ----
+        # reset used to deadlock the whole server (STATE_LOCK re-entry in
+        # push() -> log_protocol_error): the server must keep answering and
+        # the reset must complete instead of surfacing as a 3 s TIMEOUT
+        r = post("/api/op", {"cmd": "reset"})
+        check(r["sent"] is True and r["status"] == "OK",
+              "reset completes without TIMEOUT")
+        state = get("/api/state")
+        check(state["snapshot"] is not None and state["connected"] is True,
+              "server answers after reset (no deadlock)")
+        check(state["snapshot"]["seq"] <= 1,
+              "post-reset snapshot opens a new session (seq restarted)")
+
+        # cross-site forgery: browsers send text/plain cross-site WITHOUT a
+        # preflight -- the command must be refused, not executed
+        try:
+            req = urllib.request.Request(
+                BASE + "/api/op", method="POST",
+                data=b'{"cmd":"alloc","pool":0,"size":5}',
+                headers={"Content-Type": "text/plain"})
+            urllib.request.urlopen(req, timeout=5)
+            check(False, "text/plain POST refused")
+        except urllib.error.HTTPError as e:
+            check(e.code == 415, "text/plain POST refused with 415")
+
+        # DNS rebinding: a Host header naming another origin gets 403
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=5)
+        conn.request("GET", "/api/state", headers={"Host": "evil.example"})
+        resp = conn.getresponse()
+        resp.read()
+        check(resp.status == 403, "foreign Host header refused with 403")
+        conn.close()
+
+        # malformed / negative / oversized Content-Length -> 400, no crash
+        for cl in ("abc", "-3", str(2000)):
+            conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=5)
+            conn.request("POST", "/api/op",
+                         body=b'{"cmd":"alloc","pool":0,"size":5}',
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": cl})
+            resp = conn.getresponse()
+            resp.read()
+            check(resp.status == 400, f"bad content-length {cl!r} -> 400")
+            conn.close()
+        state = get("/api/state")
+        check(state["connected"] is True,
+              "server alive after hardening probes")
+
         # ---- 5) demo process death -> visible degraded state ----
         subprocess.run(["pkill", "-x", "host_demo"], check=False)
         time.sleep(0.8)
         state = get("/api/state")
         check(state["connected"] is False or state["degraded"] is True,
               "demo death is visible as disconnected/degraded")
+        # the dead child must be reaped, not left as a zombie
+        time.sleep(0.5)
+        z = subprocess.run(["ps", "-eo", "stat,comm"],
+                           capture_output=True, text=True).stdout
+        check(not any(l.split()[0].startswith("Z") and "host_demo" in l
+                      for l in z.splitlines()),
+              "no host_demo zombie remains")
+
+        # ---- 5c) quit completes via process-exit detection, not a 3 s
+        # TIMEOUT -- needs a fresh server with a live demo, so a second
+        # instance runs it last
+        srv_q = start_server(port=PORT + 2)
+        try:
+            check(wait_listening(PORT + 2), "quit-test server listens")
+            time.sleep(0.8)
+            qb = f"http://127.0.0.1:{PORT + 2}"
+            r = post("/api/op", {"cmd": "quit"}, base=qb)
+            check(r["sent"] is True and r["status"] == "OK",
+                  "quit completes without TIMEOUT")
+        finally:
+            srv_q.terminate()
+            srv_q.wait(timeout=5)
 
         srv.terminate()
         srv.wait(timeout=5)

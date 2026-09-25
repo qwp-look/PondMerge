@@ -365,7 +365,7 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 | 参考模型对拍 | 466,859 checks, 0 failures |
 | cppcheck（warning/style/performance） | exit 0，三类计数 0/0/0 |
 | 配置矩阵 | PASSED |
-| 协议回归 / HTTP 回归 | 95 / 15 checks, 0 failures |
+| 协议回归 / HTTP 回归 | 104 / 27 checks, 0 failures |
 | `src/core.cpp` 覆盖率 | 92.51% 行 / 75.58% 分支执行（Debug 档；Release 档 92.58% 行 / 77.30% 分支选取；下限 85% 强制。下降原因见 HANDOVER_v17 §5） |
 | libFuzzer（有界运行） | 无崩溃、无 sanitizer 发现 |
 | ESP32-S3 (n16r8) 实机，App version `v1.0.0-22-g21f94da` | 套件 **1,140,828**（R1–R55 全量，zone 在 PSRAM）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures；复位重跑计数一致 |
