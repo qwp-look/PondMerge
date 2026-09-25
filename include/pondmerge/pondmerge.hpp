@@ -246,11 +246,12 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align,
 //   validate        O((live + free) log(live + free)): the coverage audit is
 //                   one merge over address-ordered live and free blocks
 //                   instead of a prefix scan per block. This needs
-//                   O(PM_MAX_OBJECTS) free-block scratch; the quadratic
-//                   fallback kept behind it is unreachable for a pool that
-//                   passes the earlier checks (a free block is bounded by live
-//                   blocks, so there are at most live+1 of them), and is
-//                   registered as a dead branch in docs/AUDIT_LEDGER.md
+//                   O(PM_MAX_OBJECTS) free-block scratch; a pool whose binned
+//                   free count exceeds the scratch (at most live+1 blocks are
+//                   reachable for a consistent layout -- free() coalesces its
+//                   neighbours, so every binned free block is a maximal run)
+//                   is corruption and is refused, never re-scanned
+//                   quadratically (R57)
 //   get_stats       O(free_blocks) with a step cap (a refused walk on a
 //                   corrupted list is reported via PoolStats::valid == 0). Its
 //                   cursor bounds are evaluated in 32-bit: both bounds are

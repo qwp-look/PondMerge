@@ -4988,6 +4988,80 @@ static void test_create_pool_bounds() {
 }
 
 // ---------------------------------------------------------------------------
+// (R57) A4-09: the coverage sweep must refuse hostile free-block layouts.
+// The structural checks above it (live list, bins) enforce bin STRUCTURE but
+// not maximality, so a tampered pool can present layouts the library could
+// never produce, and validate() used to answer Ok for both:
+//   (a) physically adjacent binned free blocks -- free() always coalesces its
+//       neighbours, so distinct binned free blocks are separated by live
+//       blocks or by documented sub-minimal slack, never by gap 0. The sweep
+//       only rejected holes >= PM_MIN_BLOCK and waved these through.
+//   (b) more binned free blocks than PM_MAX_OBJECTS + 1 -- used to fall into
+//       the quadratic fallback (measured 11.3 s at 1 MiB on host, minutes to
+//       hours extrapolated to an MCU) and ALSO answered Ok. The count bound
+//       is a contract of the layout, so over-running it is corruption and is
+//       refused in O(n).
+// ---------------------------------------------------------------------------
+static void test_validate_refuses_uncoalesced_free() {
+    printf("  [R57] validate refuses uncoalesced / oversized free layouts\n");
+    using namespace pm::internal;
+
+    // Carve the pool into uniform 16 B blocks, chain them into the size-16
+    // bin and reconcile the counters: this layout passes every structural
+    // check above the coverage sweep, which is exactly why it needs its own
+    // rejection rule there.
+    auto carve = [&](pm::PoolId pid) {
+        Pool& P = g().pools[pid];
+        uint64_t const base =
+            (uint64_t)P.segment_first * g().segment_size;   // pool byte base
+        uint32_t const cap = P.segment_count * g().segment_size;
+        for (uint64_t off = 0; off < cap; off += PM_MIN_BLOCK) {
+            FreeBlock* fb =
+                reinterpret_cast<FreeBlock*>(g().zone + base + off);
+            fb->header = PM_MIN_BLOCK | BLOCK_FREE_BIT;
+            fb->prev_size = (off == 0) ? 0 : PM_MIN_BLOCK;
+            fb->prev = (off == 0) ? NULL_OFF
+                                  : (uint32_t)(base + off - PM_MIN_BLOCK);
+            fb->next = (off + PM_MIN_BLOCK < cap)
+                           ? (uint32_t)(base + off + PM_MIN_BLOCK)
+                           : NULL_OFF;
+        }
+        P.bins.reset();
+        P.bins.head[0][0] = (uint32_t)base; // every block is 16 B -> bin (0,0)
+        P.bins.sl_bitmap[0] = 1;
+        P.bins.fl_bitmap = 1;
+        P.free_bytes = cap;
+        P.fragment_bytes = 0;
+        // live_objects / used_bytes are 0: nothing was ever allocated.
+    };
+
+    // (a) adjacent binned free blocks, count within the sweep scratch:
+    // 256 blocks fit a 1-segment pool and stay under PM_MAX_OBJECTS + 1 on
+    // every accepted configuration.
+    fresh();
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 1), pm::Status::Ok);
+    carve(pool);
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    done(); // nothing was ever live: deinit accepts the corrupted bookkeeping
+
+    // (b) oversized layout: the whole 64-segment fixture zone as 16 B blocks
+    // exceeds PM_MAX_OBJECTS + 1 in every configuration. Refused in bounded
+    // time -- this is the path that used to pay the quadratic fallback.
+    fresh();
+    CHECK_ST(pm::create_pool(pool, 64), pm::Status::Ok);
+    carve(pool);
+    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    done();
+
+    // Both refusals are side-effect free: a fresh system behaves normally.
+    fresh();
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    VALIDATE(pool);
+    done();
+}
+
+// ---------------------------------------------------------------------------
 // (R46) A4-07: exhaustion matrix. (a) all PM_MAX_OBJECTS descriptor slots go
 // live; a further alloc is NoSpace while old refs stay freeable and the slot
 // chain recycles LIFO. (b) pool-table exhaustion (16 pools with segments
@@ -5176,6 +5250,7 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R54_alloc_refusal_diagnosis", test_alloc_refusal_diagnosis);
     run("R55_refusal_bitmap_rules", test_refusal_bitmap_rules);
     run("R56_create_pool_bounds", test_create_pool_bounds);
+    run("R57_validate_uncoalesced_free", test_validate_refuses_uncoalesced_free);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

@@ -86,7 +86,7 @@
 | compact | O(objects log objects + moved bytes) | precheck（含 O(1) 池几何证明）→ collect（有界遍历 + heapsort）+ 计划 + 搬移 + finalize | **第十轮**：审计由 O(objects) 变为 O(objects log objects)，换来 alloc 与 live 数解耦；**第十四轮**：登记 precheck 的 O(1) 几何证明项 |
 | merge | O(objects log objects + free_blocks + moved bytes) | 两池 precheck（各含 O(1) 几何证明）+ collect（各含一次排序）+ audit_pool_bins + 计划 + 搬移 + finalize | **第十轮**同上；**第十四轮**同 compact |
 | split | O(objects log objects + moved bytes) | 同上（precheck + 排序 + finalize × 2 池） | **第十轮**同上；**第十四轮**同 compact |
-| validate | **O((live+free) log(live+free))** | 覆盖审计改为「一次地址序归并」：`gap_before` 的前缀最大 end 改为随归并推进的 `run_max_end`，空闲块以 `s_free_off[]` 排序后并入同一趟 | **第十五轮**：此前是全库唯一剩余的超线性路径（设备实测指数 **1.70**）；改后指数 **0.98**，384 块 20.1 ms → 0.74 ms（**13.1×**），每块成本由 17,354–50,383 ns 变为 3,692–3,843 ns（**平坦**）。判据逐条等价（`AUDIT_LEDGER` §6 第 10 项 + `tests/suite.cpp` R54/R55 与 validate 全组）；二次扫描保留为回退，由「空闲块数 ≤ live+1」支配而不可达（§7） |
+| validate | **O((live+free) log(live+free))** | 覆盖审计改为「一次地址序归并」：`gap_before` 的前缀最大 end 改为随归并推进的 `run_max_end`，空闲块以 `s_free_off[]` 排序后并入同一趟 | **第十五轮**：此前是全库唯一剩余的超线性路径（设备实测指数 **1.70**）；改后指数 **0.98**，384 块 20.1 ms → 0.74 ms（**13.1×**），每块成本由 17,354–50,383 ns 变为 3,692–3,843 ns（**平坦**）。判据逐条等价（`AUDIT_LEDGER` §6 第 10 项 + `tests/suite.cpp` R54/R55 与 validate 全组）；v19 起二次扫描**已删除**：binned 空闲块数超过 live+1 是损坏（free() 合并物理相邻空闲块），在 O(n) 内拒绝（R57）；损坏布局曾借此把 validate 扣在二次回退里 11.3 s（host 1 MiB 实测）（§7） |
 | analyze_compaction | O(objects log objects + free_blocks) | collect（含排序）+ 打包模拟 + get_stats | **第十轮**补登记（此前未列入本表）；**第十四轮**：fragmented 判定为交叉相乘恒等式（`stranded*1000 >= permille*capacity`，无除法；`fragment_ratio_permille` 报告字段保留一次 64÷64，已记档） |
 | get_stats | O(free_blocks)，步数上限 | bins 全遍历 | + valid 字段 |
 | 固定 scratch | O(PM_MAX_OBJECTS)：s_plan/s_upper/s_barriers/s_slots(uint16) **+ s_ord_key(uint32) + s_free_off(uint32, N+1)** | — | 设备侧 30 B × PM_MAX_OBJECTS（1024→30,720 B；权威逐配置数值 = `global_stats().metadata_bytes`）；第十轮**未**新增 scratch（排序原地进行），第十四轮亦然；**第十五轮新增 8·PM_MAX_OBJECTS + 4 字节**（s_ord_key 4N + s_free_off 4(N+1)；排序已用原地堆排，故**没有**第二块排序缓冲）：256 时为 **+2,052 B**，1024 时为 **+8,196 B**。实测 256/16：`metadata_bytes` 32,776 → **34,837** |
@@ -232,7 +232,7 @@
 | L1643 | compact arming 的 `state != Paused → Busy` | 锁内先经 `pool_maintainable` 拒绝维护态，Running 已被上一句翻转为 Paused，到达此处 state 必为 Paused |
 | L2152 | validate 阶段 1 `audit_block` 的 `!in_pool(aoff, d.size)` 假分支 | 同 L345：payload 尾越出池尾被 `size ≤ block_size` 与同条件的块界项支配 |
 | 第十五轮：`collect_live_sorted` 的 `sort_slots_by_address` 回退 | 打包键排序的宽度前置条件（`G.zone_size <= 2^24` 且 `PM_MAX_OBJECTS <= 256`）在全部验收配置与设备构建下恒真（zone 上限由 init 拒绝；对象表上限由编译期常量给出）；保留为宽度契约的完备性守卫 |
-| 第十五轮：`linear_sweep` 的 `nfree > kFreeOffCap` 拒绝 | 空闲块是「两侧被 live 块或池端界住」的极大段，L 个 live 块至多产生 L+1 段，而 L ≤ PM_MAX_OBJECTS（每个 live 对象占一个描述符槽）⇒ `free_blocks ≤ PM_MAX_OBJECTS + 1 = kFreeOffCap`，恒不可达；保留为回退而非假设（衰退只会更慢，不会更错） |
+| 第十五轮：`linear_sweep` 的 `nfree > kFreeOffCap` 拒绝 | ~~恒不可达；保留为回退而非假设~~ **v19 更正并升级为拒绝**：结构性审计不约束极大性，损坏布局可以入箱超过 live+1 个空闲块（均匀 16 B 块实测穿过全部前置检查），因此该分支**可达**；`free_blocks ≤ live+1` 是库产布局的契约，超限即损坏 → O(n) 拒绝（R57），二次回退删除 |
 | 第十五轮：`move_block` 的对齐回退 `memmove` | 块起址与块尺寸都是 PM_ALIGNMENT 的倍数（块格式与分配器不变量），且搬迁目标由规划器按同一对齐产生；保留为「宁可慢也不猜」的正确性守卫 |
 | 第十五轮：`bins_bitmap_consistent` 的「头部尺寸不选它所在 bin」规则 | 公开 API 下构造不出会走到它的形状：抬高头部尺寸会让它成为本次请求的**适配目标**（bins_find 成功，诊断路径根本不运行），压低到请求以下则由链上其余节点满足遍历；保留为「头与位图必须自洽」这一族规则的完备性守卫（R55 覆盖同族的另两条） |
 | L2234 | validate 阶段 3 的 `same_start != 1` 重复起点拒绝 | 阶段 2 的 fl/sl 尺寸类匹配与互逆链接已拒绝任何重复登记（同一偏移不能同时匹配两个尺寸类）；保留为零长度 gap 的最后防线 |

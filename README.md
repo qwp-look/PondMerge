@@ -173,7 +173,7 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 106 × PM_MAX_OBJECTS + 4（Release 
 | `pause` / `resume` | O(1) | 单次状态翻转。 |
 | `compact` / `split` | O(objects + moved_bytes)，另加 O(objects log objects) 恢复地址序 | 只读规划（有界收集 + heapsort）+ 按序搬移与重建。 |
 | `merge` | O(objects + free_blocks + moved_bytes) | 两池只读审计（live-slot 表 / 描述符 / 统计 / bins）+ 合并区间规划 + 不可失败执行；规划失败两池逐字节不变（R22）。 |
-| `validate` | O((live_objects + free_objects) log(live_objects + free_objects)) | live 块与 binned 空闲块按地址序各扫一次（归并）：前缀最大 end、gap 归账、同起点重复都在同一趟里完成；所有遍历有步数上限。改前是二次（**全库唯一剩余的超线性路径**，设备实测指数 1.70），改后指数 **0.98**、快 **13.1×**。二次扫描保留为回退，且由「空闲块数 ≤ live+1」支配而不可达。 |
+| `validate` | O((live_objects + free_objects) log(live_objects + free_objects)) | live 块与 binned 空闲块按地址序各扫一次（归并）：前缀最大 end、gap 归账、同起点重复都在同一趟里完成；所有遍历有步数上限。改前是二次（**全库唯一剩余的超线性路径**，设备实测指数 1.70），改后指数 **0.98**、快 **13.1×**。**v19 起二次回退已删除**：binned 空闲块数超过 live+1 本身就是损坏（free() 会合并物理相邻空闲块），validate 直接在 O(n) 内拒绝（R57）——此前损坏可以把 validate 扣在二次回退里 11.3 秒（host 1 MiB 实测）。 |
 | `get_stats` | O(free_blocks) | 步数上限；损坏链表有限返回，`valid = 0` 与"真的没有空闲块"可区分（R18/R29）。 |
 | `borrow_begin` / `resolve` / `borrow_end` | O(1) | 描述符校验（含池范围证明，R23）+ 一次描述符读取。`borrow_end` 的 token 校验与递减在同一临界区（R25）；失败输出指针必为空（R26）。 |
 | `analyze_compaction` | O(objects log objects + free_blocks) | 打包模拟精确估算搬迁对象数/字节数（R35）+ 计数器审计（损坏即 `INVALID_METADATA`）。 |

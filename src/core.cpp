@@ -958,14 +958,18 @@ uint16_t s_slots[PM_MAX_OBJECTS];    // audited address-order slot list
 // sweep can be linearised. Cost: 4 B x (PM_MAX_OBJECTS + 1) -- 1028 B at the
 // device's 256, 4100 B at 1024.
 //
-// Why PM_MAX_OBJECTS + 1 is enough (and why the quadratic fallback below is
-// therefore unreachable, but kept as defence in depth):
-// a free block is a maximal run of at least PM_MIN_BLOCK free bytes, and every
-// such run is bounded on each side by either a live block or a pool end. With
-// L live blocks there are at most L+1 such runs, and L <= PM_MAX_OBJECTS
-// because every live object occupies a descriptor slot. Hence
+// Why PM_MAX_OBJECTS + 1 is enough: a free block is a maximal run of at least
+// PM_MIN_BLOCK free bytes, and every such run is bounded on each side by
+// either a live block or a pool end. With L live blocks there are at most L+1
+// such runs, and L <= PM_MAX_OBJECTS because every live object occupies a
+// descriptor slot. Hence
 //     free_blocks <= live_objects + 1 <= PM_MAX_OBJECTS + 1.
-// The fallback is registered as a dead branch in docs/AUDIT_LEDGER.md section 7.
+// A binned count above the cap is therefore corruption, not a capacity
+// problem: the earlier checks enforce bin structure, not maximality, so a
+// tampered pool can exceed it (uniform 16 B blocks pass audit_pool_bins) and
+// validate() refuses it in O(nfree) -- R57. The quadratic fallback that once
+// handled the decline is gone (it turned hostile metadata into a
+// multi-second walk; v17 registered it as a dead branch, v19 removes it).
 constexpr uint32_t kFreeOffCap = PM_MAX_OBJECTS + 1;
 uint32_t s_free_off[kFreeOffCap];
 
@@ -2602,34 +2606,35 @@ Status validate(PoolId id) {
     //
     //    Bounded scratch, per docs/AUDIT_LEDGER.md item 9, which rejected the
     //    naive linearisation because `free` is not bounded by PM_MAX_OBJECTS
-    //    and a capacity-sized array would cost 64-512 KB. Two things answer
-    //    that: the scratch is O(PM_MAX_OBJECTS) like every other buffer here,
-    //    and linear_sweep declines instead of guessing if that capacity is ever
-    //    exceeded (it cannot be for a pool that passes the checks above, but a
-    //    decline is only slower, never wrong) -- so the change can never turn a
-    //    correct pool into a false CorruptMetadata, which is the property item
-    //    9 was protecting.
+    //    and a capacity-sized array would cost 64-512 KB. The scratch is
+    //    O(PM_MAX_OBJECTS) like every other buffer here. A pool whose binned
+    //    free count exceeds the capacity is itself corruption -- the library
+    //    coalesces physically adjacent free blocks, so every binned free block
+    //    is a maximal run and there are at most live+1 of them -- and is
+    //    refused (R57); the quadratic fallback this once declined to is gone,
+    //    both because the refusal is exact and because a tampered pool could
+    //    otherwise hold validate() hostage for a superlinear walk (measured:
+    //    11.3 s at 1 MiB on host for a bin-consistent but uncoalesced layout).
     //    =====================================================================
     uint64_t slack = 0, max_end = start_off;
     Status st = Status::Ok;
-    bool handled = false;
 
-    // Returns true when it produced a verdict; false means "scratch too small,
-    // use the shipped sweep".
-    auto linear_sweep = [&]() -> bool {
+    auto linear_sweep = [&]() -> Status {
         uint32_t nfree = 0;
         for_each_free([&](uint64_t f0, uint64_t) {
             if (nfree < kFreeOffCap) s_free_off[nfree] = (uint32_t)f0;
             ++nfree;
         });
-        // Defence in depth: the bound proved at s_free_off[] makes this
-        // unreachable for any pool that passes the earlier checks, but a
-        // decline can only ever be slower, never wrong.
-        if (nfree > kFreeOffCap) return false;
+        // Reachable under corruption: the earlier checks enforce bin
+        // structure, not maximality, so a tampered pool can bin more free
+        // blocks than live+1 (uniform 16 B blocks pass audit_pool_bins).
+        // Refuse in O(nfree); never run a quadratic walk on hostile input.
+        if (nfree > kFreeOffCap) return Status::CorruptMetadata;
         sort_u32_asc(s_free_off, nfree);
 
         uint32_t li = 0, fi = 0;
         uint64_t run_max_end = start_off;
+        bool prev_group_free = false;
         constexpr uint64_t kNone = (uint64_t)-1;
         while (li < nslots || fi < nfree) {
             uint64_t const ls =
@@ -2640,9 +2645,9 @@ Status validate(PoolId id) {
             uint64_t const fs = (fi < nfree) ? (uint64_t)s_free_off[fi] : kNone;
             uint64_t const s = ls < fs ? ls : fs;
 
-            if (run_max_end > s) { st = Status::CorruptMetadata; return true; }
+            if (run_max_end > s) { st = Status::CorruptMetadata; return st; }
             uint64_t const gap = s - run_max_end;
-            if (gap >= PM_MIN_BLOCK) { st = Status::CorruptMetadata; return true; }
+            if (gap >= PM_MIN_BLOCK) { st = Status::CorruptMetadata; return st; }
 
             uint32_t members = 0, fmembers = 0;
             uint64_t group_end = run_max_end;
@@ -2665,73 +2670,28 @@ Status validate(PoolId id) {
             }
             // Shipped rule: for each free block, exactly one free block shares
             // its start address.
-            if (fmembers > 1) { st = Status::CorruptMetadata; return true; }
+            if (fmembers > 1) { st = Status::CorruptMetadata; return st; }
+            // R57: physically adjacent binned free blocks (gap == 0) can never
+            // occur -- free() coalesces its physical neighbours, so distinct
+            // binned free blocks are separated by live blocks or by the
+            // documented sub-minimal slack (gap < PM_MIN_BLOCK is legal here,
+            // see the gap-invariant note above; gap == 0 between two free
+            // groups is not).
+            if (fmembers >= 1 && prev_group_free && gap == 0) {
+                st = Status::CorruptMetadata;
+                return st;
+            }
             slack += gap * (uint64_t)members;
             run_max_end = group_end;
+            prev_group_free = fmembers >= 1;
         }
         max_end = run_max_end;
         st = Status::Ok;
-        return true;
+        return st;
     };
-    handled = linear_sweep();
-
-    if (!handled) {
-        auto gap_before = [&](uint64_t s, bool& overlap) -> uint64_t {
-            uint64_t prev = start_off;
-            for (uint32_t i = 0; i < nslots; ++i) {
-                ObjectDesc const& d = G.objects[s_slots[i]];
-                uint64_t ls = ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
-                uint64_t le = ls + d.block_size;
-                if (ls < s && le > s) {
-                    overlap = true;
-                    return prev;
-                }
-                if (le <= s && le > prev) prev = le;
-            }
-            for_each_free([&](uint64_t f0, uint64_t bsize) {
-                uint64_t fe = f0 + bsize;
-                if (f0 < s && fe > s) overlap = true;
-                else if (fe <= s && fe > prev) prev = fe;
-            });
-            return prev;
-        };
-
-        auto audit_block = [&](uint64_t s, uint64_t e) -> Status {
-            bool overlap = false;
-            uint64_t prev = gap_before(s, overlap);
-            if (overlap) return Status::CorruptMetadata;
-            if (s < prev) return Status::CorruptMetadata; // defensive
-            uint64_t gap = s - prev;
-            if (gap >= PM_MIN_BLOCK) return Status::CorruptMetadata; // hole
-            slack += gap;
-            if (e > max_end) max_end = e;
-            return Status::Ok;
-        };
-
-        for (uint32_t i = 0; i < nslots; ++i) {
-            ObjectDesc const& d = G.objects[s_slots[i]];
-            uint64_t ls = ((uint64_t)(uintptr_t)d.address - zbase) - BLOCK_HEADER_SIZE;
-            if (audit_block(ls, ls + d.block_size) != Status::Ok) {
-                st = Status::CorruptMetadata;
-                break;
-            }
-        }
-        if (st == Status::Ok) {
-            for_each_free([&](uint64_t f0, uint64_t bsize) {
-                if (st != Status::Ok) return;
-                // Two distinct free blocks may never start at the same address: an
-                // exact duplicate would otherwise slip through as a zero-length gap.
-                uint32_t same_start = 0;
-                for_each_free([&](uint64_t g0, uint64_t) { if (g0 == f0) ++same_start; });
-                if (same_start != 1) {
-                    st = Status::CorruptMetadata;
-                    return;
-                }
-                st = audit_block(f0, f0 + bsize);
-            });
-        }
-    }
+    st = linear_sweep();
     if (st != Status::Ok) return st;
+
     // Tail: whatever follows the last block must also be sub-minimal slack.
     if (end_off - max_end >= PM_MIN_BLOCK) return Status::CorruptMetadata;
     slack += end_off - max_end;
