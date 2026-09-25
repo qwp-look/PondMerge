@@ -31,3 +31,7 @@ CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 # knob, and the symptom will be a "***ERROR*** A stack overflow in task main_task"
 # panic rather than a wrong result.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# The classic-ESP32 board carries no PSRAM; keep the S3 defaults above from
+# leaking into this target's sdkconfig when both defaults files are combined.
+CONFIG_SPIRAM=n

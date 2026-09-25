@@ -58,7 +58,22 @@ static uint32_t g_fails = 0;
 #define PM_TEST_ZONE_BYTES (256u * 1024u)
 #endif
 
-uint8_t g_zone[PM_TEST_ZONE_BYTES] __attribute__((aligned(16))); // extern: the device concurrency test borrows the low segments
+// IDF builds with PSRAM may place the zone in external memory: on the S3 the
+// 256 KiB zone no longer fits in static DRAM beside the runtime (dram0_0_seg
+// overflowed by 4,896 B at HEAD). Whether the attribute applies is decided by
+// the build system, not the preprocessor: esp32/main/CMakeLists.txt passes
+// -DPM_ZONE_ATTR=EXT_RAM_BSS_ATTR when the sdkconfig allows external .bss, so
+// this file keeps a single configuration (a source-level #if on the sdkconfig
+// macro made cppcheck enumerate an EXT_RAM_BSS_ATTR-unknown configuration and
+// fail the gate). Host and non-PSRAM device builds get an empty attribute.
+#ifdef ESP_PLATFORM
+#include <esp_attr.h>
+#endif
+#ifndef PM_ZONE_ATTR
+#define PM_ZONE_ATTR
+#endif
+
+uint8_t g_zone[PM_TEST_ZONE_BYTES] PM_ZONE_ATTR __attribute__((aligned(16))); // extern: the device concurrency test borrows the low segments
 
 static void fresh() {
     pm::Config cfg{g_zone, sizeof(g_zone), 4096};
@@ -4744,8 +4759,20 @@ static void test_alloc_refusal_diagnosis() {
     printf("  [R54] alloc refusal: NoSpace for deep damage, CorruptMetadata for "
            "bitmap/head disagreement\n");
     using namespace pm::internal;
+    // The pool must be filled to its last byte with minimal 16 B blocks, so
+    // the object count times 16 must equal a whole number of segments:
+    // 512 x 16 B = 2 segments (host default), 256 x 16 B = 1 segment
+    // (device builds run PM_MAX_OBJECTS=256). Below 256 there is no exact
+    // fill, so refuse the configuration instead of failing obscurely.
+#if PM_MAX_OBJECTS >= 512
+    constexpr uint32_t kN = 512, kSegs = 2;
+#elif PM_MAX_OBJECTS >= 256
+    constexpr uint32_t kN = 256, kSegs = 1;
+#else
+#error "R54 needs PM_MAX_OBJECTS >= 256 to fill a segment exactly"
+#endif
 
-    // Fills `o` with 512 objects that fill a 2-segment pool to the last byte
+    // Fills `o` with kN objects that fill a kSegs-segment pool to the last byte
     // (payload 8 -> 16 B blocks), then frees o[0]/o[2]/o[4] so the 16 B bin
     // holds a chain of three blocks kept apart by live neighbours. Reports that
     // bin and the second node of its chain.
@@ -4754,9 +4781,9 @@ static void test_alloc_refusal_diagnosis() {
         pm::internal::FreeBlock* head;
         pm::internal::FreeBlock* second;
     };
-    auto setup = [&](pm::PoolId& pool, pm::RawRef (&o)[512], Bin& bin) {
-        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
-        for (uint32_t i = 0; i < 512; ++i)
+    auto setup = [&](pm::PoolId& pool, pm::RawRef (&o)[kN], Bin& bin) {
+        CHECK_ST(pm::create_pool(pool, kSegs), pm::Status::Ok);
+        for (uint32_t i = 0; i < kN; ++i)
             CHECK_ST(pm::alloc(pool, 8, 8, 0, i, o[i]), pm::Status::Ok);
         CHECK_ST(pm::free(o[0]), pm::Status::Ok);
         CHECK_ST(pm::free(o[2]), pm::Status::Ok);
@@ -4785,8 +4812,8 @@ static void test_alloc_refusal_diagnosis() {
     };
     // The pool is filled to the last byte, so every object must be released
     // again (o[0]/o[2]/o[4] are already free) before it can be destroyed.
-    auto release_all = [&](pm::PoolId pool, pm::RawRef (&o)[512]) {
-        for (uint32_t i = 0; i < 512; ++i) {
+    auto release_all = [&](pm::PoolId pool, pm::RawRef (&o)[kN]) {
+        for (uint32_t i = 0; i < kN; ++i) {
             if (i == 0 || i == 2 || i == 4) continue;
             CHECK_ST(pm::free(o[i]), pm::Status::Ok);
         }
@@ -4797,7 +4824,7 @@ static void test_alloc_refusal_diagnosis() {
     {
         fresh();
         pm::PoolId pool{};
-        pm::RawRef o[512];
+        pm::RawRef o[kN];
         Bin bin{};
         setup(pool, o, bin);
         uint32_t const saved = bin.head->next;
@@ -4816,7 +4843,7 @@ static void test_alloc_refusal_diagnosis() {
     {
         fresh();
         pm::PoolId pool{};
-        pm::RawRef o[512];
+        pm::RawRef o[kN];
         Bin bin{};
         setup(pool, o, bin);
         Pool& P = g().pools[pool];
@@ -4846,12 +4873,21 @@ static void test_alloc_refusal_diagnosis() {
 // ---------------------------------------------------------------------------
 static void test_refusal_bitmap_rules() {
     printf("  [R55] refused alloc: bitmap/head consistency rules\n");
+    // Same exact-fill geometry as R54: minimal 16 B blocks, object count times
+    // 16 must equal whole segments (512 -> 2 segments, 256 -> 1 segment).
+#if PM_MAX_OBJECTS >= 512
+    constexpr uint32_t kN = 512, kSegs = 2;
+#elif PM_MAX_OBJECTS >= 256
+    constexpr uint32_t kN = 256, kSegs = 1;
+#else
+#error "R55 needs PM_MAX_OBJECTS >= 256 to fill a segment exactly"
+#endif
     using namespace pm::internal;
 
-    auto build = [&](pm::PoolId& pool, pm::RawRef (&o)[512], uint32_t& f,
+    auto build = [&](pm::PoolId& pool, pm::RawRef (&o)[kN], uint32_t& f,
                      uint32_t& s) {
-        CHECK_ST(pm::create_pool(pool, 2), pm::Status::Ok);
-        for (uint32_t i = 0; i < 512; ++i)
+        CHECK_ST(pm::create_pool(pool, kSegs), pm::Status::Ok);
+        for (uint32_t i = 0; i < kN; ++i)
             CHECK_ST(pm::alloc(pool, 8, 8, 0, i, o[i]), pm::Status::Ok);
         CHECK_ST(pm::free(o[0]), pm::Status::Ok);
         CHECK_ST(pm::free(o[2]), pm::Status::Ok);
@@ -4874,8 +4910,8 @@ static void test_refusal_bitmap_rules() {
         }
         CHECK(P.bins.head[f][s] != NULL_OFF);
     };
-    auto release_all = [&](pm::PoolId pool, pm::RawRef (&o)[512]) {
-        for (uint32_t i = 0; i < 512; ++i) {
+    auto release_all = [&](pm::PoolId pool, pm::RawRef (&o)[kN]) {
+        for (uint32_t i = 0; i < kN; ++i) {
             if (i == 0 || i == 2 || i == 4) continue;
             CHECK_ST(pm::free(o[i]), pm::Status::Ok);
         }
@@ -4886,7 +4922,7 @@ static void test_refusal_bitmap_rules() {
     {
         fresh();
         pm::PoolId pool{};
-        pm::RawRef o[512];
+        pm::RawRef o[kN];
         uint32_t f = 0, s = 0;
         build(pool, o, f, s);
         Pool& P = g().pools[pool];
@@ -4904,7 +4940,7 @@ static void test_refusal_bitmap_rules() {
     {
         fresh();
         pm::PoolId pool{};
-        pm::RawRef o[512];
+        pm::RawRef o[kN];
         uint32_t f = 0, s = 0;
         build(pool, o, f, s);
         Pool& P = g().pools[pool];
@@ -4940,21 +4976,22 @@ static void test_exhaustion_matrix() {
             if (pm::alloc(pool, 1, 8, 0, n, refs[n]) != pm::Status::Ok) break;
         }
         CHECK(n == PM_MAX_OBJECTS); // the whole slot table is live
+        const uint32_t hi = PM_MAX_OBJECTS - 1; // works at any table size
         fill(refs[7], 1, 7);
-        fill(refs[900], 1, 900);
+        fill(refs[hi], 1, 900);
         pm::RawRef extra{};
         CHECK_ST(pm::alloc(pool, 1, 8, 0, 0xFFFF, extra), pm::Status::NoSpace);
         CHECK(extra.generation == 0);
         // Old refs still free; the freed slots recycle LIFO.
-        verify(refs[900], 1, 900);
+        verify(refs[hi], 1, 900);
         CHECK_ST(pm::free(refs[7]), pm::Status::Ok);
-        CHECK_ST(pm::free(refs[900]), pm::Status::Ok);
+        CHECK_ST(pm::free(refs[hi]), pm::Status::Ok);
         pm::RawRef re7{};
         CHECK_ST(pm::alloc(pool, 1, 8, 0, 7, re7), pm::Status::Ok);
-        CHECK(re7.index == 900); // LIFO: the most recently freed slot
-        CHECK(re7.generation != refs[900].generation);
+        CHECK(re7.index == hi); // LIFO: the most recently freed slot
+        CHECK(re7.generation != refs[hi].generation);
         for (uint32_t i = 0; i < n; ++i) {
-            if (i == 7 || i == 900) continue; // freed above
+            if (i == 7 || i == hi) continue; // freed above
             CHECK_ST(pm::free(refs[i]), pm::Status::Ok);
         }
         CHECK_ST(pm::free(re7), pm::Status::Ok);

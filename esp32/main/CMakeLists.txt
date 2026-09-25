@@ -40,6 +40,12 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PM_MAX_OBJECTS=256
     PM_DEVICE_BUILD=1
     PM_TEST_ZONE_BYTES=${PM_TEST_ZONE_BYTES})
+# With PSRAM enabled the suite's 256 KiB zone is placed in external memory (see
+# tests/suite.cpp for why); the attribute is passed from the build system so the
+# source keeps a single, cppcheck-clean configuration.
+if(CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE PM_ZONE_ATTR=EXT_RAM_BSS_ATTR)
+endif()
 if(PM_DEVICE_NO_SUITE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE PM_DEVICE_NO_SUITE=1)
 endif()
