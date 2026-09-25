@@ -304,39 +304,40 @@ test `tests/concurrency_esp32.cpp`, which is never compiled on the host.
 | cppcheck (warning/style/performance) | exit 0 |
 | TLSF configuration matrix | PASSED |
 | Demo protocol / HTTP smoke | 104 / 27 checks, 0 failures |
-| Coverage of `src/core.cpp` | 97.59% of lines, 98.80% of branches executed, 81.15% taken (Debug pass); the same gate also runs a Release pass (97.77% lines, 83.30% taken) — floor enforced on both |
+| Coverage of `src/core.cpp` | 92.51% of lines, 75.58% of branches executed (Debug pass); the Release pass measures 92.58% lines / 77.30% taken — floor of 85% enforced on both (the drop from the pre-v17 numbers is accounted in HANDOVER_v17 section 5) |
 | libFuzzer, bounded run | no crash, no sanitizer finding |
-| **ESP32-S3 (n16r8) on hardware** | suite **1,120,457** + dual-core concurrency 28 + model 466,859 checks, **all 0 failures**; two runs from reset, identical counts |
-| **Classic ESP32 (D0WDQ6 v1.1) on hardware** | dual-core concurrency 28 + model 466,859 checks, 0 failures; two runs from reset, identical counts. **The suite is not run** — see below |
+| **ESP32-S3 (n16r8) on hardware, v1.0.0-33 (v20 geometry: 64 segments x 1 KiB, internal DRAM)** | suite **939,054** (R1–R57) + dual-core concurrency 28 + model 466,859 checks, **all 0 failures**; rerun from reset, identical counts |
+| **Classic ESP32 (D0WDQ6 v1.1) on hardware, v1.0.0-32 (same geometry)** | suite **939,054** — the full suite runs on this part for the first time — + concurrency 28 + model 466,859 checks, **all 0 failures** |
 
 `tests/run_host.sh --release | --san | --cppcheck | --configs | --coverage | --fuzz`
 runs the host gates. CI executes all of them on every push, plus a consumer smoke
 test, the two demo protocol smoke tests, and a benchmarks job.
 
-### Two targets, and they do not run the same groups
+### Two targets, one suite, one geometry (v20)
 
-The two device rows above are deliberately not presented as one number, because
-the acceptance suite cannot run on the second part and the firmware says so out
-loud rather than reporting a pass.
+Since the fixture-geometry parameterization, **both targets run the full
+suite + concurrency + model** on a 64 KiB zone of 64 segments x 1 KiB in plain
+internal DRAM, and the suite's check count matches bit for bit on host (same
+configuration), the S3, and the classic ESP32: **939,054**, with the model
+differential at 466,859 everywhere.
 
-The suite pins its own zone to 64 segments inside its assertions — test [10]
-asserts that 16 pools x 4 segments fills the zone and test [2] creates a
-32-segment pool — so the zone size is part of what those tests assert rather than
-a parameter they tolerate. A classic ESP32 has ~200 KiB of static DRAM in total
-and the 256 KiB zone does not fit: measured, the link fails with
-`region 'dram0_0_seg' overflowed by 126,744 bytes`. That target therefore compiles
-without the suite, runs the concurrency and model groups (8 KiB and 64 KiB), and
-prints `=== suite SKIPPED (not run, not passed) ===` on the console. The fork is
-driven by `CONFIG_IDF_TARGET` in `esp32/main/CMakeLists.txt`.
+The history is worth keeping because it shaped the fixture: the suite's
+segment COUNT is pinned by its own assertions (test [10] fills the zone with
+16 pools x 4 segments; test [2] uses a 32-segment pool), while the segment
+SIZE is now the compile-time knob `PM_TEST_SEG_BYTES`. Before v20 the zone was
+fixed at 64 x 4 KiB = 256 KiB, which the classic ESP32 cannot link
+(`dram0_0_seg overflowed by 126,744 bytes` — the suite was compiled out there
+with a loud SKIPPED banner) and which pushed the S3's zone into octal PSRAM
+(OCTAL mode is mandatory on n16r8 parts: QUAD aborts and the crash loop takes
+the USB-Serial-JTAG down, measured). Parameterizing the size retired both
+workarounds and put the acceptance fixture back in the internal-SRAM memory
+class that the benchmarks measure.
 
-The reason for adding the second target at all is the lock claim: the host
-`PM_LOCK` is a no-op, so SMP evidence can only come from the dual-core device
-test — and until now that evidence existed on exactly one chip. The classic ESP32
-is a **dual-core LX6** (the S3 is LX7) with a different `portMUX` implementation
-and cache, and the same `tests/concurrency_esp32.cpp` passes on it. Its counters
-also show the race being exercised harder than on the S3: 30 of the maintainer's
-200 compactions were refused because a borrow was live, and both borrowers
-observed paused windows.
+The reason for having the second target at all is unchanged and now stronger:
+the host `PM_LOCK` is a no-op, so SMP evidence can only come from the dual-core
+device test. The classic ESP32 is a **dual-core LX6** (the S3 is LX7) with a
+different `portMUX` implementation and cache, and the same
+`tests/concurrency_esp32.cpp` passes on it — alongside the full suite.
 
 One number is worth singling out: the reference-model differential reports
 **466,859 checks on host, on the S3, and on the classic ESP32** — one

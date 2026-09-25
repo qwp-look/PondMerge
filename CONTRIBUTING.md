@@ -83,6 +83,13 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra \
 
 ## 4. 怎么跑设备端（需要真实硬件）
 
+**一键流程**：`scripts/device_run.sh s3|esp32 [ops] [full|capture]` —— 构建、刷写
+（自动重试）、只读抓取、openocd JTAG 复位（S3）、锚定判定（"app 横幅之后的 ROM
+横幅且未完成 = 崩溃"；完成后 IDF 自动重启产生的横幅不算）。它固化了 v18–v20 的
+全部排障经验：S3 的 CDC 控制线刷写后不可靠（Errno 84）、esptool 失败直接重试
+（约 50% 概率）、芯片楔死在 ROM 时（PC 在 0x4004xxxx，可用 openocd `halt; reg pc`
+确认）用 esptool 刷写强制进下载模式即可解除。抓取诊断细节见脚本头注释。
+
 两个 IDF 工程，**都支持两个目标**：
 
 - `esp32/` — 验收固件（suite + concurrency + model / 只后两组）
