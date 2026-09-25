@@ -3390,7 +3390,7 @@ static void test_compaction_advice() {
         using namespace pm::internal;
         snap_all(pool, pool, refs, 5, seg_base(g().pools[pool].segment_first),
                  4 * PM_TEST_SEG_BYTES);
-        pm::CompactionRequest req{600, 8, 0, 42};
+        pm::CompactionRequest req{600, 8, 0, 42, 0, 0};
         pm::CompactionAdvice a1 = pm::analyze_compaction(pool);
         pm::CompactionAdvice a2 = pm::analyze_compaction(pool, &req);
         bool changed = true;
@@ -3469,7 +3469,7 @@ static void test_compaction_advice() {
         }
 
         // (e) request that fits a SEG/2 hole right now -> NO_ACTION.
-        pm::CompactionRequest req{OP2 - 24, 8, 0, 7};
+        pm::CompactionRequest req{OP2 - 24, 8, 0, 7, 0, 0};
         a = pm::analyze_compaction(pool, &req);
         CHECK(a.verdict == Verdict::NO_ACTION);
         CHECK(a.request_can_fit_now == 1);
@@ -3499,7 +3499,7 @@ static void test_compaction_advice() {
         CHECK_ST(pm::free(o[3]), pm::Status::Ok);
         // A request bigger than one hole (SEG/2) but smaller than the two
         // stranded holes combined (SEG) fits after compaction -> RECOMMENDED.
-        pm::CompactionRequest req{SEG3_REQ, 8, 0, 8};
+        pm::CompactionRequest req{SEG3_REQ, 8, 0, 8, 0, 0};
         pm::CompactionAdvice a = pm::analyze_compaction(pool, &req);
         CHECK(a.verdict == Verdict::COMPACT_RECOMMENDED);
         CHECK(a.request_can_fit_now == 0);
@@ -3507,7 +3507,7 @@ static void test_compaction_advice() {
         CHECK(a.caller_must_establish_quiescence == 1);
         // A request above the total free bytes can never fit ->
         // UNLIKELY_TO_HELP (no fake optimism).
-        pm::CompactionRequest big{SEG3_BIG, 8, 0, 9};
+        pm::CompactionRequest big{SEG3_BIG, 8, 0, 9, 0, 0};
         a = pm::analyze_compaction(pool, &big);
         CHECK(a.verdict == Verdict::COMPACT_UNLIKELY_TO_HELP);
         CHECK(a.request_can_fit_after_compaction_estimate == 0);
@@ -3542,9 +3542,9 @@ static void test_compaction_advice() {
               Verdict::INVALID_METADATA);
         // Round-7: a malformed caller request is INVALID_REQUEST -- input
         // errors are distinct from pool damage and never touch the cache.
-        pm::CompactionRequest bad{64, 3, 0, 1}; // alignment not a power of two
+        pm::CompactionRequest bad{64, 3, 0, 1, 0, 0}; // alignment not a power of two
         CHECK(pm::analyze_compaction(pool, &bad).verdict == Verdict::INVALID_REQUEST);
-        pm::CompactionRequest empty{0, 8, 0, 1}; // an explicit request with size 0
+        pm::CompactionRequest empty{0, 8, 0, 1, 0, 0}; // an explicit request with size 0
         CHECK(pm::analyze_compaction(pool, &empty).verdict == Verdict::INVALID_REQUEST);
         using namespace pm::internal;
         Pool& P = g().pools[pool];
@@ -3750,9 +3750,9 @@ static void test_advice_change_key() {
     CHECK(changed == false);
 
     // (b) request flags/tag are part of the key
-    pm::CompactionRequest r1{400, 8, 0, 1};
-    pm::CompactionRequest r2{400, 8, pm::PM_MOVABLE, 1};
-    pm::CompactionRequest r3{400, 8, 0, 2};
+    pm::CompactionRequest r1{400, 8, 0, 1, 0, 0};
+    pm::CompactionRequest r2{400, 8, pm::PM_MOVABLE, 1, 0, 0};
+    pm::CompactionRequest r3{400, 8, 0, 2, 0, 0};
     pm::poll_compaction_advice(pool, &r1, &changed);
     CHECK(changed == true); // request appears
     pm::poll_compaction_advice(pool, &r1, &changed);
@@ -4629,7 +4629,7 @@ static void test_advice_negative() {
     CHECK(changed == false);
 
     // The same illegal request twice: changed == true both times.
-    pm::CompactionRequest bad{800, 3, 0, 1};
+    pm::CompactionRequest bad{800, 3, 0, 1, 0, 0};
     pm::CompactionAdvice r1 = pm::poll_compaction_advice(pool, &bad, &changed);
     CHECK(changed == true);
     CHECK(r1.verdict == Verdict::INVALID_REQUEST);
@@ -4638,7 +4638,7 @@ static void test_advice_negative() {
     CHECK(r2.verdict == Verdict::INVALID_REQUEST);
 
     // alignment == 0 defaults to PM_ALIGNMENT: a normal verdict.
-    pm::CompactionRequest align0{800, 0, 0, 1};
+    pm::CompactionRequest align0{800, 0, 0, 1, 0, 0};
     pm::CompactionAdvice r3 = pm::poll_compaction_advice(pool, &align0, &changed);
     CHECK(r3.verdict != Verdict::INVALID_REQUEST);
 
@@ -4822,7 +4822,7 @@ static void test_overflow_band() {
     pm::RawRef r{};
     CHECK_ST(pm::alloc(pool, 0xFFFFFFF8u, 8, 0, 1, r), pm::Status::NoSpace);
     CHECK(r.generation == 0);
-    pm::CompactionRequest req{0xFFFFFFF8u, 8, 0, 1};
+    pm::CompactionRequest req{0xFFFFFFF8u, 8, 0, 1, 0, 0};
     CHECK(pm::analyze_compaction(pool, &req).verdict ==
           pm::CompactionVerdict::INVALID_REQUEST);
     VALIDATE(pool);
@@ -5151,6 +5151,165 @@ static void test_validate_refuses_uncoalesced_free() {
 }
 
 // ---------------------------------------------------------------------------
+// (R58) v1.2 partial compaction, budget mode: max_move_bytes is respected
+// exactly (block granularity -- the move that would overshoot is not made),
+// untouched objects keep their address_epoch, and the pool stays consistent.
+// ---------------------------------------------------------------------------
+static void test_partial_budget() {
+    printf("  [R58] partial compact: budget respected\n");
+    fresh();
+    const uint32_t TILE = PM_TEST_SEG_BYTES / 4 - 8; // 16 x TILE tile 4 segs
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef o[16];
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK_ST(pm::alloc(pool, TILE, 8, 0, i, o[i]), pm::Status::Ok);
+        fill(o[i], TILE, 300 + i);
+    }
+    CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+    CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+    VALIDATE(pool);
+
+    pm::CompactionRequest req{};
+    req.max_move_bytes = 3 * (TILE + 8) - 1; // the third move would overshoot
+    CHECK_ST(pm::compact(pool, &req), pm::Status::Ok);
+    pm::PoolStats st = pm::get_stats(pool);
+    CHECK(st.bytes_moved == 2 * (TILE + 8)); // o1 and o3 moved, then stopped
+    CHECK(st.objects_moved == 2);
+    VALIDATE(pool);
+    verify(o[1], TILE, 301);
+    verify(o[3], TILE, 303);
+    verify(o[4], TILE, 304);
+    // Untouched objects: epoch unchanged. Moved ones: bumped exactly once.
+    {
+        using namespace pm::internal;
+        for (uint32_t i : {4u, 5u, 15u})
+            CHECK(g().objects[o[i].index].address_epoch == 1);
+        CHECK(g().objects[o[1].index].address_epoch == 2);
+        CHECK(g().objects[o[3].index].address_epoch == 2);
+    }
+    // A full compact afterwards still works and finishes the job: the two
+    // remaining holes coalesce into one run of SEG/2 bytes at the tail.
+    CHECK_ST(pm::compact(pool), pm::Status::Ok);
+    st = pm::get_stats(pool);
+    CHECK(st.largest_free_block == 2 * (TILE + 8));
+    VALIDATE(pool);
+    for (uint32_t i = 1; i < 16; ++i) {
+        if (i == 2) continue; // freed above
+        verify(o[i], TILE, 300 + i);
+        pm::RawRef c = o[i]; c.pool_hint = pm::CROSS_HINT;
+        CHECK_ST(pm::free(c), pm::Status::Ok);
+    }
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R59) v1.2 partial compaction, target already satisfied: zero work.
+// ---------------------------------------------------------------------------
+static void test_partial_target_satisfied() {
+    printf("  [R59] partial compact: target already satisfied\n");
+    fresh();
+    const uint32_t TILE = PM_TEST_SEG_BYTES / 4 - 8;
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef o[16];
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK_ST(pm::alloc(pool, TILE, 8, 0, i, o[i]), pm::Status::Ok);
+        fill(o[i], TILE, 400 + i);
+    }
+    CHECK_ST(pm::free(o[0]), pm::Status::Ok); // one hole of TILE+8 bytes
+    VALIDATE(pool);
+
+    pm::CompactionRequest req{};
+    req.requested_size = TILE;                // fits the existing hole exactly
+    req.requested_alignment = 8;
+    uint32_t const epoch0 = pm::get_stats(pool).structure_epoch;
+    CHECK_ST(pm::compact(pool, &req), pm::Status::Ok);
+    pm::PoolStats st = pm::get_stats(pool);
+    CHECK(st.objects_moved == 0 && st.bytes_moved == 0); // nothing to do
+    // compact() bumps structure_epoch on every successful call, even a
+    // no-op one -- the epoch is a maintenance counter, not a change detector.
+    CHECK(pm::get_stats(pool).structure_epoch == epoch0 + 1);
+    VALIDATE(pool);
+    // The request is allocatable right now.
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(pool, TILE, 8, 0, 99, r), pm::Status::Ok);
+    fill(r, TILE, 999);
+    CHECK_ST(pm::free(r), pm::Status::Ok);
+    for (uint32_t i = 1; i < 16; ++i) {
+        pm::RawRef c = o[i]; c.pool_hint = pm::CROSS_HINT;
+        CHECK_ST(pm::free(c), pm::Status::Ok);
+    }
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R60) v1.2 partial compaction, target + budget together: the incremental
+// win (one move instead of fourteen), the budget cutoff, and the malformed
+// target alignment.
+// ---------------------------------------------------------------------------
+static void test_partial_target_and_budget() {
+    printf("  [R60] partial compact: target + budget\n");
+    fresh();
+    const uint32_t TILE = PM_TEST_SEG_BYTES / 4 - 8;
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef o[16];
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK_ST(pm::alloc(pool, TILE, 8, 0, i, o[i]), pm::Status::Ok);
+        fill(o[i], TILE, 500 + i);
+    }
+    // Holes [0, SEG/4) and [2*SEG/4, 3*SEG/4): each smaller than the target,
+    // but the walk merges them after ONE move -- the incremental win.
+    CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+    CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+    pm::CompactionRequest req{};
+    req.requested_size = TILE + 8;            // needs more than one hole
+    req.requested_alignment = 8;
+    CHECK_ST(pm::compact(pool, &req), pm::Status::Ok);
+    pm::PoolStats st = pm::get_stats(pool);
+    CHECK(st.objects_moved == 1);             // o1 moved; the merged gap suffices
+    CHECK(st.bytes_moved == TILE + 8);
+    VALIDATE(pool);
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(pool, TILE + 8 - 8, 8, 0, 99, r), pm::Status::Ok);
+    fill(r, TILE, 777);
+    CHECK_ST(pm::free(r), pm::Status::Ok);
+
+    // Budget below the (single) needed move: zero work, target unmet.
+    CHECK_ST(pm::free(o[4]), pm::Status::Ok);
+    pm::CompactionRequest tight{};
+    tight.requested_size = 2 * (TILE + 8);
+    tight.requested_alignment = 8;
+    tight.max_move_bytes = TILE + 8 - 1;      // cannot afford any move
+    st = pm::get_stats(pool);
+    uint32_t const live0 = st.object_count;
+    CHECK_ST(pm::compact(pool, &tight), pm::Status::Ok);
+    st = pm::get_stats(pool);
+    CHECK(st.bytes_moved == 0 && st.objects_moved == 0);
+    CHECK(st.object_count == live0);
+    VALIDATE(pool);
+
+    // Malformed target alignment: INVALID_REQUEST, zero side effects.
+    pm::CompactionRequest bad{};
+    bad.requested_size = TILE;
+    bad.requested_alignment = 3;
+    CHECK_ST(pm::compact(pool, &bad), pm::Status::InvalidRequest);
+    VALIDATE(pool);
+
+    // Full compact still finishes the job afterwards.
+    CHECK_ST(pm::compact(pool), pm::Status::Ok);
+    VALIDATE(pool);
+    for (uint32_t i = 1; i < 16; ++i) {
+        if (i == 2 || i == 4) continue;
+        verify(o[i], TILE, 500 + i);
+        pm::RawRef c = o[i]; c.pool_hint = pm::CROSS_HINT;
+        CHECK_ST(pm::free(c), pm::Status::Ok);
+    }
+    done();
+}
+
+// ---------------------------------------------------------------------------
 // (R46) A4-07: exhaustion matrix. (a) all PM_MAX_OBJECTS descriptor slots go
 // live; a further alloc is NoSpace while old refs stay freeable and the slot
 // chain recycles LIFO. (b) pool-table exhaustion (16 pools with segments
@@ -5340,6 +5499,9 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R55_refusal_bitmap_rules", test_refusal_bitmap_rules);
     run("R56_create_pool_bounds", test_create_pool_bounds);
     run("R57_validate_uncoalesced_free", test_validate_refuses_uncoalesced_free);
+    run("R58_partial_budget", test_partial_budget);
+    run("R59_partial_target_satisfied", test_partial_target_satisfied);
+    run("R60_partial_target_and_budget", test_partial_target_and_budget);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

@@ -72,6 +72,7 @@ init(cfg) → create_pool → alloc/对象操作 → 维护（compact/merge/spli
 | 操作 | 入口状态 | 失败语义 | 成功结果 | 复杂度（最坏） |
 |---|---|---|---|---|
 | `compact` | Running/Paused | 规划失败零改动；借用拒绝时**留在 Paused** | Running，epoch+1 | O(objects + moved)，另加 O(objects log objects) 恢复地址序 |
+| `compact(pool, &req)` | 同上 | v1.2 部分整理：目标/预算见 COMPACTION_POLICY.md；**装不进屏障时截断成功而非拒绝** | 同上 | 同上，搬移 ≤ 预算 |
 | `merge(s,t)` | 两池 Running/Paused | 规划失败两池逐字节不变 | target Running（epoch+1），source Empty | O(objects + free + moved)，另加 O(objects log objects) 恢复地址序 |
 | `split(s,n)` | Running/Paused | 零改动；新池槽位回收 | 两池 Running；新池 epoch=1 | O(objects + moved)，另加 O(objects log objects) 恢复地址序 |
 | `validate` | 任意非 Empty | — | Ok / CorruptMetadata | O((live+free)²) |
@@ -121,6 +122,7 @@ Host 运行不能证明锁语义，SMP 证据来自双核设备测试（`tests/c
 | `PoolChanged` | local 引用的对象已换池 | merge/split 后 |
 | `AlreadyPaused` | 已处于 Paused | 重复 pause |
 | `CorruptMetadata` | 元数据损坏（精确报告，不伪装） | 故障注入/内存踩踏 |
+| `InvalidRequest` | 调用方请求畸形（v1.2） | `compact(pool, &req)` 的目标对齐非法 |
 | `NotInitialized` | 库未初始化（`init()` 之前/`deinit()` 之后调用） | 忘记 `init()`；v19 起取代此前的 `CorruptMetadata` |
 
 ## 10. validate 与 PoolStats

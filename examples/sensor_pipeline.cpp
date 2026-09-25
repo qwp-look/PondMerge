@@ -260,7 +260,7 @@ void evict_oldest() {
 // The one place the standard compaction flow lives (COMPACTION_POLICY.md 6).
 // Returns: 1 = demand satisfied (maybe after compaction), 0 = not satisfied.
 int export_batch(pm::PoolId pool) {
-    pm::CompactionRequest req{EXPORT_BYTES, 1, 0, 0};
+    pm::CompactionRequest req{EXPORT_BYTES, 1, 0, 0, 0, 0}; // 0 limits = full pass
     pm::pm_local_ptr<uint8_t> batch = pm::pm_alloc_buffer(pool, EXPORT_BYTES,
                                                           pm::PM_MOVABLE).value;
     if (batch.valid()) { g_c.exports_ok++; (void)pm::pm_destroy(batch); return 1; }
@@ -425,7 +425,7 @@ int pm_sensor_pipeline_run() {
 
         // ---- monitor loop: report-only, never executes anything ------------
         if (tick % MONITOR_EVERY == 0) {
-            pm::CompactionRequest req{EXPORT_BYTES, 1, 0, 0};
+            pm::CompactionRequest req{EXPORT_BYTES, 1, 0, 0, 0, 0}; // 0 limits = full pass
             bool changed = false;
             pm::CompactionAdvice a = pm::poll_compaction_advice(pool, &req, &changed);
             g_c.monitor_polls++;

@@ -329,12 +329,37 @@ uint32_t pondmerge_run_model(uint32_t zone_bytes, uint32_t ops) {
             cross.pool_hint = pm::CROSS_HINT;
             model_check(pm::free(cross) == pm::Status::Ok, "free must succeed");
             o = M.objs[--M.nlive];
-        } else if (choice < 7) { // ---- compact
+        } else if (choice < 7) { // ---- compact (full or partial)
             g_phase = "compact";
             uint32_t pi = xorshift(rng) % n;
             trace_op(3, pi);
-            pm::Status st = pm::compact(ids[pi]);
+            // Every third compaction is a PARTIAL one (v1.2): a random budget
+            // and/or a random target. The oracle treats it like any compact --
+            // the invariants (payloads, accounting, validate) must hold for
+            // every prefix of the plan exactly as for the full walk -- plus
+            // one partial-specific rule: the budget is never exceeded.
+            uint32_t budget_b = 0, budget_o = 0, target = 0;
+            uint32_t roll = xorshift(rng) % 3;
+            if (roll == 1) budget_b = 1 + xorshift(rng) % 4096;
+            if (roll == 2) target = 1 + xorshift(rng) % 2048;
+            if (roll == 0) budget_o = 1 + xorshift(rng) % 8;
+            pm::CompactionRequest req{};
+            req.requested_size = target;
+            req.requested_alignment = 8;
+            req.max_move_bytes = budget_b;
+            req.max_move_objects = budget_o;
+            pm::Status st = pm::compact(ids[pi], &req);
             model_check(st == pm::Status::Ok, "compact must succeed when quiescent");
+            if (budget_b != 0) {
+                pm::PoolStats ps = pm::get_stats(ids[pi]);
+                model_check(ps.bytes_moved <= budget_b,
+                            "partial compact never exceeds max_move_bytes");
+            }
+            if (budget_o != 0) {
+                pm::PoolStats ps = pm::get_stats(ids[pi]);
+                model_check(ps.objects_moved <= budget_o,
+                            "partial compact never exceeds max_move_objects");
+            }
         } else if (choice < 8) { // ---- merge two adjacent pools
             g_phase = "merge";
             uint32_t a = 0, b = 0;

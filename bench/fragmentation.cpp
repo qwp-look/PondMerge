@@ -225,7 +225,7 @@ Report run_pondmerge(const char* name, bool compact_on_failure) {
     r.live_after_scatter = live;
     printf("  %-32s after scatter: live=%u\n", name, (unsigned)live);
 
-    pm::CompactionRequest req{PROBE_BYTES, 8, 0, 0};
+    pm::CompactionRequest req{PROBE_BYTES, 8, 0, 0, 0, 0};
 
     // One large contiguous demand, with the SAME compaction policy in both
     // phases. Returns whether the demand was eventually satisfied.

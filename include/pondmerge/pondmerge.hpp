@@ -73,6 +73,12 @@ enum class Status : int8_t {
     // broken metadata, alarming and misleading for the most common beginner
     // mistake (calling an entry before init()).
     NotInitialized,
+    // A malformed caller request (v1.2: compact(pool, req) with a target
+    // alignment that no allocation could ever carry). The advice verdict
+    // INVALID_REQUEST predates this and keeps its own enum -- that one
+    // classifies pool-independent caller errors inside the advice state
+    // machine, this one is an ordinary Status.
+    InvalidRequest,
 };
 
 inline const char* status_name(Status s) {
@@ -89,6 +95,7 @@ inline const char* status_name(Status s) {
         case Status::AlreadyPaused: return "ALREADY_PAUSED";
         case Status::CorruptMetadata: return "CORRUPT_METADATA";
         case Status::NotInitialized: return "NOT_INITIALIZED";
+        case Status::InvalidRequest: return "INVALID_REQUEST";
     }
     return "?";
 }
@@ -275,6 +282,19 @@ Status resolve(RawRef const& ref, uint32_t access_size, uint32_t access_align,
 //                   reports the damage (R54, docs/AUDIT_LEDGER.md)
 //   analyze_compaction O(objects log objects + free blocks)
 Status compact(PoolId pool);
+// Partial compaction (v1.2). req == nullptr behaves exactly like compact(pool).
+// With a request: requested_size/alignment is the TARGET -- the plan stops at
+// the first prefix after which an allocation of that size/alignment would
+// succeed (0 size = no target); max_move_bytes/max_move_objects cap the work
+// (0 = unlimited). Whichever limit binds first ends the plan; blocks after it
+// stay where they are, holes included -- analyze_compaction remains the way
+// to learn what a FULL pass would have gained. Returns Ok on success (the
+// caller reads PoolStats::bytes_moved/objects_moved for what actually moved);
+// InvalidRequest for a target alignment that is not 0/default/pow2/<= 8.
+// The packing-impossible cases that make full compact refuse (an object that
+// cannot fit below the next pinned barrier) simply END a partial plan instead.
+struct CompactionRequest; // defined in the advice section below
+Status compact(PoolId pool, CompactionRequest const* req);
 Status merge(PoolId source, PoolId target);
 // Splits `source` after `new_pool_segments` segments; the new pool owns the
 // upper range. Crossing movable objects are relocated; crossing pinned objects
@@ -324,7 +344,24 @@ struct CompactionRequest {
     uint32_t requested_alignment; // 0 = default PM_ALIGNMENT
     uint16_t requested_flags;     // informational (PM_MOVABLE / PM_PINNED / ...)
     uint32_t user_tag;
-};
+    // v1.2 partial-compaction controls, used by compact(pool, req). Zero (the
+    // value older aggregate initializers produce) means "no limit": the
+    // compaction then packs the whole pool exactly like compact(pool) does.
+    //
+    //   max_move_bytes    stop the plan before the move that would exceed
+    //                     this many block bytes (block = payload + header,
+    //                     the unit PoolStats::bytes_moved counts)
+    //   max_move_objects  stop before moving more than this many objects
+    //
+    // requested_size/alignment double as the TARGET: the plan stops at the
+    // first prefix after which a free run of roundup8(size+8) B exists (the
+    // packing slides holes upward as it advances, so this is checked per
+    // prefix). Whichever limit binds first wins; a target the budget cannot
+    // reach simply ends with the budget spent.
+    uint32_t max_move_bytes = 0;    // default member init: 0 = unlimited, so
+    uint32_t max_move_objects = 0;  // 4-field aggregate initializers keep
+};                                  // compiling (and -Wmissing-field-
+                                    // initializers stays quiet everywhere)
 
 // Tunable advice thresholds. Defaults are documented in
 // docs/COMPACTION_POLICY.md; query them, do not assume them. Both apply to

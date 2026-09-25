@@ -978,7 +978,7 @@ uint32_t s_free_off[kFreeOffCap];
 // Address-order stable packing with pinned barriers; plan fully before any
 // move (doc sections 8.1-8.3). This function NEVER publishes pool state: the
 // caller commits Running/structure_epoch under the lock (round-3 guide 8).
-Status compact_impl(Pool& P) {
+Status compact_impl(Pool& P, CompactionRequest const* req) {
     GlobalState& G = g();
     if (P.borrow_count != 0) return Status::Busy;
     uint64_t t0 = pm_port_ticks_us();
@@ -1002,9 +1002,61 @@ Status compact_impl(Pool& P) {
         s_barriers[nbar++] = d.address - BLOCK_HEADER_SIZE;
     }
 
+    // Partial compaction (v1.2): a request bounds the plan two ways. The
+    // TARGET (requested_size/alignment) ends the plan at the first prefix
+    // after which an allocation of that size would succeed; the BUDGET
+    // (max_move_bytes / max_move_objects) ends it before the move that would
+    // exceed the cap. Whichever binds first wins; blocks after the cut keep
+    // their addresses (holes included) and finalize_layout rebuilds the whole
+    // stream from the final addresses exactly as it does for a full pass.
+    //
+    // The target check needs the largest free run reachable at each prefix:
+    // after packing blocks 0..k-1 the free space is the gap [cursor, p_k)
+    // (every hole the cursor walked over, vacated slots included) plus the
+    // ORIGINAL holes above p_k. The latter is a suffix max over the gaps,
+    // precomputed here in O(n) into s_ord_key (free since
+    // collect_live_sorted is done with it).
+    uint32_t need = 0;            // roundup8(target block bytes), 0 = no target
+    uint32_t budget_b = 0;        // 0 = unlimited
+    uint32_t budget_o = 0;        // 0 = unlimited
+    if (req) {
+        if (req->requested_size) {
+            if (req->requested_alignment != 0 &&
+                ((req->requested_alignment & (req->requested_alignment - 1)) != 0 ||
+                 req->requested_alignment > PM_MAX_ALIGNMENT))
+                return Status::InvalidRequest;
+            need = (req->requested_size + BLOCK_HEADER_SIZE + 7u) & ~7u;
+        }
+        budget_b = req->max_move_bytes;
+        budget_o = req->max_move_objects;
+    }
+
     {
         uint8_t* cursor = start;
         uint32_t bar = 0;
+        // suffix_max_hole[i] = largest original hole at or after slot i
+        // (hole_j = the gap between slot j and slot j+1; the tail after the
+        // last slot counts too). These are holes of the UNPROCESSED region,
+        // whose layout is untouched by the moves planned below it.
+        if (nslot != 0) { // an empty pool has nothing to move or reorder
+        ObjectDesc const& dl = G.objects[s_slots[nslot - 1]];
+            uint64_t run = (uint64_t)(uintptr_t)end -
+                           ((uint64_t)(uintptr_t)dl.address - BLOCK_HEADER_SIZE +
+                            dl.block_size);
+            s_ord_key[nslot - 1] = (uint32_t)(run > 0xFFFFFFFFu ? 0xFFFFFFFFu : run);
+            for (uint32_t i = nslot - 1; i-- > 0;) {
+                ObjectDesc const& d = G.objects[s_slots[i]];
+                ObjectDesc const& dn = G.objects[s_slots[i + 1]];
+                uint64_t hole_after_i =
+                    ((uint64_t)(uintptr_t)dn.address - BLOCK_HEADER_SIZE) -
+                    ((uint64_t)(uintptr_t)d.address - BLOCK_HEADER_SIZE +
+                     d.block_size);
+                if (hole_after_i > run) run = hole_after_i;
+                s_ord_key[i] = (uint32_t)(run > 0xFFFFFFFFu ? 0xFFFFFFFFu : run);
+            }
+        } // nslot != 0
+        uint64_t moved_b = 0;
+        uint32_t moved_o = 0;
         for (uint32_t i = 0; i < nslot; ++i) {
             ObjectDesc const& d = G.objects[s_slots[i]];
             uint8_t* bstart = d.address - BLOCK_HEADER_SIZE;
@@ -1016,13 +1068,34 @@ Status compact_impl(Pool& P) {
                 continue;
             }
             uint8_t const* barrier = (bar < nbar) ? s_barriers[bar] : end;
-            if (cursor + bsize > barrier)
+            if (cursor + bsize > barrier) {
+                // Full compact refuses here. A partial plan simply ends:
+                // the object cannot pack below the next pinned barrier, and
+                // blocks after it belong to the region above.
+                if (req) break;
                 return (bar < nbar) ? Status::PinnedConflict : Status::NoSpace;
+            }
+            // Target check BEFORE spending the move: at this prefix the free
+            // runs are the walked-over gap [cursor, bstart) and the original
+            // gaps from bstart onward (suffix max, tail included).
+            if (need != 0) {
+                uint64_t walked_gap =
+                    (uint64_t)(uintptr_t)bstart - (uint64_t)(uintptr_t)cursor;
+                uint64_t best = walked_gap > (uint64_t)s_ord_key[i]
+                                    ? walked_gap : (uint64_t)s_ord_key[i];
+                if (best >= need) break; // target reached without this move
+            }
+            // Budget check BEFORE the move: block granularity, no overshoot.
+            if ((budget_b != 0 && moved_b + bsize > budget_b) ||
+                (budget_o != 0 && moved_o + 1 > budget_o))
+                break; // budget spent; target (if any) stays unmet
             if (bstart != cursor) {
                 s_plan[nplan].slot = s_slots[i];
                 s_plan[nplan].dst_off = off_of(cursor);
                 s_plan[nplan].size = bsize;
                 nplan++;
+                moved_b += bsize;
+                moved_o++;
             }
             cursor += bsize;
         }
@@ -2019,6 +2092,10 @@ CompactionAdvice poll_compaction_advice(PoolId pool_id, CompactionRequest const*
 // Compaction (doc section 8)
 // ---------------------------------------------------------------------------
 Status compact(PoolId id) {
+    return compact(id, nullptr);
+}
+
+Status compact(PoolId id, CompactionRequest const* req) {
     GlobalState const& G = g();
     Pool* P = pool_at(id);
     if (!G.initialized) return Status::NotInitialized;
@@ -2044,7 +2121,7 @@ Status compact(PoolId id) {
     }
     PM_UNLOCK();
     if (st != Status::Ok) return st;
-    Status r = compact_impl(*P);
+    Status r = compact_impl(*P, req);
     // Final commit under the same lock class borrow_begin uses (round-3
     // guide 8): the pool is published Running -- and only then -- after the
     // whole maintenance body succeeded. A planning failure restores the

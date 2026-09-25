@@ -261,7 +261,7 @@ int run_window() {
     // the timed path: the timed regime below is "full pool, K dispersed
     // holes", and without this settle the scatter's free space would let the
     // first probes succeed without any compaction at all.
-    pm::CompactionRequest req{PROBE_BYTES, 8, 0, 0};
+    pm::CompactionRequest req{PROBE_BYTES, 8, 0, 0, 0, 0}; // 0 limits = full pass
     {
         pm::Status const cs = pm::compact(pool);
         if (cs != pm::Status::Ok) {

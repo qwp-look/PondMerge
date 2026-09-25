@@ -129,3 +129,45 @@ pinned/DMA/external 对象是搬移屏障：整理会在其两侧分别打包。
 屏障间剩余空间不足时，`compact` 可能 `PinnedConflict`/`NoSpace` 失败——
 建议层不预测 pinned 布局的细节，`has_pinned_objects` 只是提示。设计上应
 控制 pinned 对象的数量与聚拢摆放。
+
+
+## 部分整理（v1.2）
+
+`compact(pool, &req)` 在完整整理的语义之上增加两种**有界**模式，`req == nullptr`
+时与 `compact(pool)` 完全等价：
+
+```cpp
+pm::CompactionRequest req{};
+req.requested_size  = 4096;  // 目标：整理到 4 KiB 的连续空间可分配为止
+req.requested_alignment = 8;
+req.max_move_bytes  = 8192;  // 预算：搬移不超过 8 KiB（块字节口径）
+pm::compact(pool, &req);
+```
+
+* **目标（requested_size/alignment）**：计划在第一个"此后 `size` 的分配即可
+  成功"的前缀处停止。打包游标把洞向上滑动，逐前缀检查：已走过的洞合并成的
+  连续段 ∪ 上方原始洞的最大者 ≥ `roundup8(size+8)` 即满足。
+* **预算（max_move_bytes / max_move_objects）**：以块字节（= `bytes_moved` 的
+  计数口径）为单位，截断到最后一个完整对象，绝不超额。
+* 两个限制哪个先触发哪个生效；截断之后的对象保持原地址（洞原样保留）——
+  `analyze_compaction` 仍然是了解"完整整理还能带来多少"的入口。
+
+### 语义边界（必须写明）
+
+* **有界暂停 ≠ 硬实时**：暂停上限可预算（计划 O(objects) + 搬移 ≤ 预算 +
+  finalize O(objects)），但仍是调用方触发的停顿；v1 非目标（不在 ISR/后台
+  整理）不变。
+* **部分整理 ≠ 碎片消除**：目标满足后洞仍在（advice 可能继续报
+  RECOMMENDED）；连续多次部分整理累积效果趋近完整整理。
+* **失败面更小**：完整整理在对象装不进下一个 pinned 屏障前会整体拒绝
+  （PinnedConflict/NoSpace）；部分整理在同一个点**截断成功**——搬不动就不搬。
+  `compact(pool)` 的全量语义（含拒绝行为）原样保留。
+* `structure_epoch` 每次成功调用 +1（包括零搬迁的调用）——它是维护计数器，
+  不是变更检测器；advice 的变更键继续负责抑制重复提示。
+
+### 验证
+
+R58（预算恰被尊重、未搬对象 epoch 不变）、R59（目标已满足 → 零搬迁、零
+epoch 外 churn）、R60（目标+预算组合、预算截断、非法对齐 → `InvalidRequest`），
+以及模型差分的随机部分整理（随机预算/目标，预言机校验 `bytes_moved ≤ 预算`
+与全部既有不变式）。

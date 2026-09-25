@@ -249,6 +249,15 @@ pm::CompactionRequest req{2000, 8, 0, 0};
 pm::CompactionAdvice a = pm::analyze_compaction(pool, &req);
 if (a.verdict == pm::CompactionVerdict::COMPACT_RECOMMENDED) { /* 安排静默期 */ }
 pm::set_compaction_thresholds({100, 512});   // 碎片阈值（可查询可配置）
+
+// 部分整理（v1.2；详见 COMPACTION_POLICY.md）：目标 + 预算的有界整理
+pm::CompactionRequest part{};
+part.requested_size = 4096;                  // 整理到 4 KiB 连续空间可分配
+part.max_move_bytes = 8192;                  // 搬移预算 8 KiB
+pm::compact(pool, &part);
+pm::CompactionRequest part{};                // v1.2 部分整理：目标 + 预算
+part.requested_size = 4096; part.max_move_bytes = 8192;
+pm::compact(pool, &part);                    // 有界暂停，见 COMPACTION_POLICY.md
 ```
 
 ## 集成方式

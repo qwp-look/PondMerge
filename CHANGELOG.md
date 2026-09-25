@@ -5,6 +5,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **Partial compaction: `compact(pool, &req)`** -- bounded compaction driven by
+  the caller's requirement. The request's `requested_size`/`requested_alignment`
+  (the same fields the advice already interprets) become the TARGET: the plan
+  stops at the first prefix after which that allocation would succeed; the new
+  `max_move_bytes`/`max_move_objects` fields cap the work in PoolStats::
+  bytes_moved units. Whichever limit binds first ends the plan; a null request
+  or zero limits keep the exact full-compaction semantics. Two documented
+  consequences: the pause scales with the requirement instead of the
+  fragmentation, and the packing-impossible case that makes full `compact`
+  refuse (an object that cannot fit below the next pinned barrier) ends a
+  partial plan successfully instead. New `Status::InvalidRequest` (appended to
+  the enum) reports a malformed target alignment. Verified by R58/R59/R60 and
+  by the model differential running random partial compacts against its
+  independent oracle.
+
 ## [1.1.0] - 2026-09-25
 
 ### Security
