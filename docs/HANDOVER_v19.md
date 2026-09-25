@@ -87,9 +87,15 @@ README 却声称两条路径都被验证）；README 写明两条纯 CMake 路�
 | 协议 / HTTP 冒烟 | **104 / 27** checks, 0 failures |
 | 覆盖率 / 配置矩阵 / fuzz / 示例自检 / 基准构建 | PASSED（11/11 门禁） |
 | Host Debug 256 档 | 1,140,849 checks, 0 failures |
-| ESP32-S3 实机 | suite **1,140,849**（R56+R57 在跑）+ 并发 28 + model 466,859，0 failures；与 host 256 档**逐位一致** |
+| ESP32-S3 实机（`60b079c`，`v1.0.0-28-g60b079c`） | suite **1,140,849**（R56+R57 在跑）+ 并发 28 + model 466,859，0 failures；与 host 256 档**逐位一致** |
 
 ## 7. 未做 / 待办
+
+- **一次未复现的设备重启**：约 7 次完整套件运行中观察到 1 次 R55 进行中无
+  panic 输出的重启（ROM 横幅后 bootloader 无输出，USB CDC 随之失联）；紧随其后的
+  两次完整重跑全绿（含同二进制）。已尝试 openocd USJ 复位 + 只读抓取的观察闭环，
+  未能捕获现场。候选原因：PSRAM/USB 硬件抖动、或低概率的未定义行为——**列入
+  监控**：再次出现时用 openocd `halt` 抓 PC 现场（复位前）。
 
 - 低优先级项（下轮候选）：`seg_base()` 在几何证明前形成指针（UB 纯化）、
   未初始化调用报 `CorruptMetadata`（考虑 `NotInitialized` 状态码）、

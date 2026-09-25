@@ -381,7 +381,7 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 | 协议回归 / HTTP 回归 | 104 / 27 checks, 0 failures |
 | `src/core.cpp` 覆盖率 | 92.51% 行 / 75.58% 分支执行（Debug 档；Release 档 92.58% 行 / 77.30% 分支选取；下限 85% 强制。下降原因见 HANDOVER_v17 §5） |
 | libFuzzer（有界运行） | 无崩溃、无 sanitizer 发现 |
-| ESP32-S3 (n16r8) 实机，App version `v1.0.0-22-g21f94da` | 套件 **1,140,828**（R1–R55 全量，zone 在 PSRAM）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures；复位重跑计数一致 |
+| ESP32-S3 (n16r8) 实机，App version `v1.0.0-28-g60b079c` | 套件 **1,140,849**（R1–R57 全量，zone 在 PSRAM）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures；与 host 256 对象档逐位一致 |
 | 经典 ESP32 (D0WDQ6 v1.1) 实机，App version `v1.0.0-6-g2324312` | 双核并发 28 + 模型 466,859 checks，0 failures；两次复位重跑计数一致。**套件未运行**（见下） |
 
 > **经典 ESP32 的记录仍停在旧提交上**：该板本轮未接（v17 §9），其 App version
