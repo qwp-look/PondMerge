@@ -554,7 +554,17 @@ advice, ONE timed `compact()`, retry, refill the exact freed sizes in order.
 512 events per run.
 
 Setup: this chip at 240 MHz, 192 KiB region, `PM_MAX_OBJECTS=256`, `PM_DEBUG=0`,
-watchdogs off. App version `v1.0.0-13-g315fce7`, two independent captures.
+watchdogs off.
+
+> **2026-09-25 重测（当前权威数字）**：v17 的搬运原语与排序落地后，同一负载、
+> 同一芯片、同一配置在 `v1.0.0-30-gdce28e5` 上重跑，512 事件单次抓取：
+> **p50 = 825.6 µs**（旧 8,977.65 → **10.9×**），p99 = 911.0 µs（旧 9,558.16 →
+> **10.5×**），min = 673.2 µs（旧 6,541.4 → **9.7×**），mean = 823.3 µs
+> （旧 8,864.05 → **10.8×**）。Probe outcomes、moved bytes（118,216 / 164,182 /
+> 181,392）与 structure audit 全部与旧记录**逐字节一致**——状态确定性跨算法
+> 重构复现，时间层的差异全部来自 v17 的搬运/排序改动本身。
+>
+> 历史（改前）记录保留如下，供对照。
 
 Probe outcomes per run: pre-compact ok 0, rescued by compact **512**, still
 failed 0; refill refusals 0; structure audit OK. The window (one `compact()`
@@ -593,6 +603,10 @@ quintile of the window itself (run 1; run 2 agrees to the fourth digit):
 At the means this is 8.864 ms / 164,182 B = **54.0 ns/B = 18.5 MB/s**, against
 the single event's 18.3 MB/s in section 5.6 -- the distribution and the
 one-point record agree.
+
+2026-09-25 重测的同一比值：823.3 µs / 164,182 B = **5.0 ns/B = 199.4 MB/s**
+（v17 搬运原语从 memmove 换为按方向拷贝后的设备带宽，见 §1 F 行），分布与
+单点记录同样一致。
 
 Two cross-checks are printed by the benchmark and were checked on both runs:
 

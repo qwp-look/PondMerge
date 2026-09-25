@@ -89,13 +89,23 @@ README 却声称两条路径都被验证）；README 写明两条纯 CMake 路�
 | Host Debug 256 档 | 1,140,849 checks, 0 failures |
 | ESP32-S3 实机（`60b079c`，`v1.0.0-28-g60b079c`） | suite **1,140,849**（R56+R57 在跑）+ 并发 28 + model 466,859，0 failures；与 host 256 档**逐位一致** |
 
-## 7. 未做 / 待办
+## 7. 遗留项收口状态（本轮全部处理）
+
+| 项 | 状态 |
+|---|---|
+| seg_base UB 纯化 / NotInitialized 状态码 / operator-> 诊断 / segment_size 契约 | **完成**（`dce28e5`，见 §8 CHANGELOG 摘要） |
+| validate 整理窗口百分位重取（v17 §9 遗留） | **完成**：`v1.0.0-30-gdce28e5` 上 512 事件重测，p50 8,977.65 → **825.6 µs（10.9×）**，moved bytes 逐字节一致；`bench/RESULTS.md` §5.8 已更新，旧记录保留对照 |
+| 经典 ESP32 重烧（v18 §6 遗留） | **硬件阻塞**：本轮该板未连接（仅 `/dev/ttyACM0` 的 S3 在线）。README 验收表已注明该行为推断非实测；板子接上后 `rm -f sdkconfig` + `set-target esp32` + 双 defaults 文件重烧即可 |
+
+## 8. 观察与监控
 
 - **一次未复现的设备重启**：约 7 次完整套件运行中观察到 1 次 R55 进行中无
   panic 输出的重启（ROM 横幅后 bootloader 无输出，USB CDC 随之失联）；紧随其后的
   两次完整重跑全绿（含同二进制）。已尝试 openocd USJ 复位 + 只读抓取的观察闭环，
   未能捕获现场。候选原因：PSRAM/USB 硬件抖动、或低概率的未定义行为——**列入
   监控**：再次出现时用 openocd `halt` 抓 PC 现场（复位前）。
+- 设备刷写今日成功率约 50%（`Packet content transfer stopped`/串口噪声），
+  重试即可恢复；先起只读抓取再刷写的流程可把刷后状态一并捕获。
 
 - 低优先级项（下轮候选）：`seg_base()` 在几何证明前形成指针（UB 纯化）、
   未初始化调用报 `CorruptMetadata`（考虑 `NotInitialized` 状态码）、
