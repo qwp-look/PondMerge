@@ -27,6 +27,29 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`validate()` no longer answers Ok on, nor runs a quadratic scan over,
+  hostile free-block layouts (red test R57).** A pool tampered into uniform
+  16 B binned blocks passes every structural check above the coverage sweep
+  but is impossible for the library: free() coalesces its physical
+  neighbours, so binned free blocks are maximal runs and there are at most
+  live+1 of them. Two consequences fixed at once: an oversized layout (more
+  binned blocks than PM_MAX_OBJECTS + 1) used to fall into the quadratic
+  fallback -- 11.3 s measured at 1 MiB on host, minutes-to-hours extrapolated
+  on an MCU, contradicting validate()'s bounded-time promise; a layout that
+  DID fit the scratch validated as **Ok** despite physically adjacent binned
+  free blocks. The count bound is now enforced as corruption in O(n), the
+  ~55-line fallback is deleted, the sweep gained the gap==0 free-to-free
+  rule, and AUDIT_LEDGER's dead-branch registry is corrected (the branch was
+  reachable).
+- **Stale metadata-budget numbers re-measured and corrected.** The README /
+  README.en tables still carried pre-v17 values (27,064 / 28,672 / 108,040 /
+  "105 KiB") that under-reported the v17 address-order scratch. All six
+  configurations re-measured 2026-09-25 (x86-64 Release: 64/2=7,812 through
+  1024/16=116,236, formula-exact; ESP32-S3 256/16=30,729 from the acceptance
+  firmware), "about 105 KiB" -> "about 113.5 KiB", and the "matches .bss to
+  within +/-8 bytes" claim replaced by an honest note that metadata_bytes is
+  the budget's upper bound (GCC section placement measurably differs at
+  512/8 and 1024/16).
 - **`set(PM_MAX_OBJECTS ...)` before `add_subdirectory()` actually overrides
   now.** The library pinned `cmake_minimum_required(3.16)`, which holds
   CMP0126 at OLD behaviour: the library's own `set(... CACHE STRING ...)`

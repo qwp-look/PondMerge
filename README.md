@@ -99,39 +99,40 @@ metadata_bytes = 72 + 476 × PM_MAX_POOLS + 106 × PM_MAX_OBJECTS + 4（Release 
 
 **这条闭式公式是 x86-64 的，不能照搬到 32 位目标。** `ObjectDesc` 里有一个
 指针，所以在 ESP32-S3 上它是 52 B 而不是 64 B，系数量级因此不同：目标上每对象
-约 **82 B**（52 描述符 + 30 计划 scratch），而不是 98 B。实测过的设备配置：
+约 **90 B**（52 描述符 + 38 计划 scratch；v17 起含地址序 scratch），而不是 98 B。实测过的设备配置：
 
 | 平台 | `PM_MAX_OBJECTS` | `PM_MAX_POOLS` | `metadata_bytes` |
 |---|---|---|---|
-| x86-64 | 256 | 16 | 34,837（实测） |
-| **ESP32-S3（32 位）** | **256** | **16** | **28,672（实测）** |
-| x86-64 | 1024 | 16 | 108,040（实测） |
+| x86-64 | 256 | 16 | 34,828（Release 实测；Debug 34,837） |
+| **ESP32-S3（32 位）** | **256** | **16** | **30,729（实测，2026-09-25 验收固件）** |
+| x86-64 | 1024 | 16 | 116,236（Release 实测） |
 
 **要算 RAM 预算就用运行时的 `global_stats().metadata_bytes`**，它对任何 ABI 都是
-精确值；闭式公式只是图示，不是契约。下表是 x86-64 的实测值（`metadata_bytes` 与
-链接器看到的真实 `.bss` 对照）：
+精确上界；闭式公式只是图示，不是契约。下表 6 组配置全部为 2026-09-25 的 Release
+实测值（x86-64，g++ 15.2，公式逐一吻合）：
 
-| `PM_MAX_OBJECTS` | `PM_MAX_POOLS` | `metadata_bytes` | 真实 `.bss` | 适用 |
-|---|---|---|---|---|
-| 64 | 2 | 7,296 | 7,296 | 极小目标 |
-| 128 | 4 | 14,520 | 14,528 | 小型 MCU |
-| 256 | 4 | 27,064 | 27,072 | 小型 MCU（推荐起点） |
-| **256** | **16** | **34,837** | **34,832** | **ESP32-S3 验收固件所用配置** |
-| 512 | 8 | 54,056 | 54,048 | 中型 |
-| 1024 | 16 | 116,236 | 116,228 | 默认（Host / 大内存目标） |
+| `PM_MAX_OBJECTS` | `PM_MAX_POOLS` | `metadata_bytes`（实测） | 适用 |
+|---|---|---|---|
+| 64 | 2 | 7,812 | 极小目标 |
+| 128 | 4 | 15,548 | 小型 MCU |
+| 256 | 4 | 29,116 | 小型 MCU（推荐起点） |
+| **256** | **16** | **34,828** | **ESP32-S3 验收固件所用配置** |
+| 512 | 8 | 58,156 | 中型 |
+| 1024 | 16 | 116,236 | 默认（Host / 大内存目标） |
 
 读法：
 
-- **默认 1024/16 约吃掉 105 KiB 静态 RAM。** 多数 MCU 承受不起，务必下调。
-  在 ESP-IDF 里把 `PM_MAX_OBJECTS` 设为 256 可降至 **28.0 KiB（ESP32-S3 实测
-  28,672 B；x86-64 同配置为 32 KiB）**。
-- `metadata_bytes` 已与真实 `.bss` 吻合到 ±8 字节；两者差异只来自对齐填充。
-  **预算时仍留一点余量。**
+- **默认 1024/16 约吃掉 113.5 KiB（116,236 B）静态 RAM。** 多数 MCU 承受不起，
+  务必下调。把 `PM_MAX_OBJECTS` 设为 256 可降至 **30 KiB（ESP32-S3 实测
+  30,729 B；x86-64 同配置为 34 KiB）**。
+- 预算以 `metadata_bytes` 为准、把它当**上界**用：链接器实际放置的 `.bss` 可能
+  因 GCC 的节放置（toplevel reorder / 节锚定）与该计数相差正负几 KB——2026-09-25
+  在 512/8 与 1024/16 档实测到 `.bss` 反而**更小** 2–4 KB。宁可多算 4 KiB，不要
+  少算。
 - 该字段在 v1.0.0 之前**漏计了整理建议缓存**（随 `PM_MAX_POOLS` 增长，实测少报
-  128 B @2 pools 到 960 B @16 pools），现已计入，并以上表代替原来的口头描述。
-- 上表第 4 行的 x86-64 值 32,776 是闭式公式算出的；**同一配置在设备上实测为
-  28,672**，差 4,104 B 全部来自指针宽度。这条差异写在这里，是因为早先的本表
-  声称"Host/ESP32 同"——那是错的。
+  128 B @2 pools 到 960 B @16 pools），v17 起已计入；本表此前的 4 行旧值
+  （27,064 等）就是漏计期的产物，2026-09-25 全部重测更正——**引数字前先跑
+  `global_stats()` 复核**。
 
 ## 关键语义
 
@@ -274,7 +275,7 @@ idf_component_register(SRCS "main.cpp" REQUIRES pondmerge)
 在工程 CMakeLists 里缩小元数据预算（数值见上一节的表）：
 
 ```cmake
-set(PM_MAX_OBJECTS 256)   # 约 105 KiB → 约 28 KiB 静态 RAM（ESP32-S3 实测）
+set(PM_MAX_OBJECTS 256)   # 约 113.5 KiB → 约 30 KiB 静态 RAM（ESP32-S3 实测 30,729 B）
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(your_app)
 ```
@@ -371,9 +372,9 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 
 | 档位 | 结果 |
 |---|---|
-| Host Debug（10000 op） | 5,432,806 checks, 0 failures |
-| Host Release（10000 op） | 5,432,813 checks, 0 failures |
-| ASan/UBSan（3000 op） | 1,531,817 checks, 0 failures |
+| Host Debug（10000 op） | 5,432,827 checks, 0 failures |
+| Host Release（10000 op） | 5,432,834 checks, 0 failures |
+| ASan/UBSan（3000 op） | 1,531,838 checks, 0 failures |
 | 参考模型对拍 | 466,859 checks, 0 failures |
 | cppcheck（warning/style/performance） | exit 0，三类计数 0/0/0 |
 | 配置矩阵 | PASSED |

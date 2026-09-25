@@ -8,7 +8,7 @@
 #   scripts/gates.sh            # all eleven gates, in CONTRIBUTING.md's order
 #   scripts/gates.sh -v         # same, without collapsing each gate's output
 #
-# The expected pass counts (5,432,806 / 5,432,813 / 1,531,817 checks; model
+# The expected pass counts (5,432,827 / 5,432,834 / 1,531,838 checks; model
 # 466,859; protocol 104; HTTP 27) are stated in CONTRIBUTING.md section 3 -- a
 # gate that "passes" with different numbers is itself worth investigating.
 # (The San figure is the 3000-op default of run_host.sh --san; Debug and

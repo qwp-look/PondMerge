@@ -77,7 +77,7 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra \
 真实场景集成参考是 `examples/sensor_pipeline.cpp`（host/设备同一份源码，
 设备工程在 `examples/sensor_pipeline_esp32/`）——写新集成时先读它。
 
-全部通过应看到 **5,432,806 (Debug) / 5,432,813 (Release) / 1,531,817 (San，
+全部通过应看到 **5,432,827 (Debug) / 5,432,834 (Release) / 1,531,838 (San，
 3000 ops) checks, 0 failures**，模型对拍 **466,859**。CI（`.github/workflows/ci.yml`）
 在每次 push 上跑这十一项 + 消费路径冒烟 + 基准构建。
 

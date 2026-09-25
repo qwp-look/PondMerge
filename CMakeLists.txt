@@ -142,7 +142,7 @@ if(ESP_PLATFORM)
     # plain CMake variables before the component is processed, which is the
     # intended way to fit the metadata budget of a small target:
     #
-    #   set(PM_MAX_OBJECTS 256)      # 31 KiB instead of 105 KiB of static RAM
+    #   set(PM_MAX_OBJECTS 256)      # ~30 KiB (30,729 B on ESP32-S3) instead of ~113.5 KiB (116,236 B)
     #   set(PM_MAX_POOLS 4)
     #
     # Anything not set falls through to the core defaults in pm_config.h.
