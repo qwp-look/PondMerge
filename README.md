@@ -381,9 +381,10 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 | 协议回归 / HTTP 回归 | 104 / 27 checks, 0 failures |
 | `src/core.cpp` 覆盖率 | 92.51% 行 / 75.58% 分支执行（Debug 档；Release 档 92.58% 行 / 77.30% 分支选取；下限 85% 强制。下降原因见 HANDOVER_v17 §5） |
 | libFuzzer（有界运行） | 无崩溃、无 sanitizer 发现 |
-| ESP32-S3 (n16r8) 实机（v20 前基线，App version `v1.0.0-28-g60b079c`） | 套件 **1,140,849**（R1–R57，zone 256 KiB 在 PSRAM）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures |
-| 经典 ESP32 (D0WDQ6 v1.1) 实机（v20 前基线，App version `v1.0.0-31-g6d83194`） | 双核并发 28 + 模型 466,859 checks，0 failures；套件未运行（v20 前该目标编不进套件） |
-| **v20 夹具参数化后**：经典 ESP32 (D0WDQ6 v1.1)，App version `v1.0.0-32` | **套件首次在经典 ESP32 上运行：939,054 checks**（R1–R57，zone 64 KiB = 64 段 × 1 KiB，静态 DRAM）+ 双核并发 28 + 模型 466,859，全部 0 failures；与 host 同配置同几何**逐位一致** |
+| **v20 夹具参数化后（当前几何：64 段 × 1 KiB = 64 KiB zone，静态 DRAM，无 PSRAM）** ||
+| ESP32-S3 (n16r8) 实机，App version `v1.0.0-33-g079e4e5` | 套件 **939,054**（R1–R57 全量）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures；复位重跑计数一致 |
+| 经典 ESP32 (D0WDQ6 v1.1) 实机，App version `v1.0.0-32` | 套件 **939,054**（首次在经典 ESP32 上运行）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures |
+| 历史（v20 前基线，256 KiB zone）：S3 `v1.0.0-28` 套件 1,140,849；经典 ESP32 `v1.0.0-31` 套件未运行（编不进）——详见 HANDOVER_v18/v19 |
 
 > 经典 ESP32 的记录已于 2026-09-25 在当前提交（`6d83194`）上重取（v19 收口）：
 > 此前它停在 `v1.0.0-6`，晚于 v17 算法重构的适用性只能靠推断；现在这条推断已由
@@ -480,19 +481,20 @@ idf.py -B build -p /dev/ttyUSB0 flash monitor       # UART0 + CH340 桥接
 实机记录（S3 基线 `21f94da`；经典 ESP32 于 v20 在当前提交上重取，复位重跑一致）：
 
 ```
-经典 ESP32 (D0WDQ6 v1.1) · /dev/ttyUSB0（CH340，160 MHz）· v1.0.0-32（v20，当前）
-  suite（基础 13 组 + R1–R57，2000 ops，zone 64 KiB）：939,054 checks, 0 failures PASSED
-  双核并发（200 轮 pause/compact/resume + 双核 borrower）：28 checks, 0 failures
+ESP32-S3 (n16r8) · /dev/ttyACM0（USB-Serial-JTAG）· v1.0.0-33-g079e4e5（v20，当前，zone 64 KiB 纯 DRAM）
+  suite（基础 13 组 + R1–R57，2000 ops）：939,054 checks, 0 failures PASSED
+  双核并发：28 checks, 0 failures
   参考模型对拍（4000 ops）：466,859 checks, 0 failures PASSED
 
-ESP32-S3 (n16r8) · /dev/ttyACM0（USB-Serial-JTAG）· v1.0.0-28-g60b079c（v20 前基线，zone 256 KiB 在 PSRAM）
-  suite（基础 13 组 + R1–R55，2000 ops）：1,140,849 checks, 0 failures PASSED
+经典 ESP32 (D0WDQ6 v1.1) · /dev/ttyUSB0（CH340，160 MHz）· v1.0.0-32（v20，当前）
+  suite（基础 13 组 + R1–R57，2000 ops，zone 64 KiB）：939,054 checks, 0 failures PASSED
   双核并发：28 checks, 0 failures
   参考模型对拍（4000 ops）：466,859 checks, 0 failures PASSED
 ```
 
-> S3 在 v20 几何（64 KiB zone、纯 DRAM）下的构建已验证可链接（无 PSRAM），
-> 板子回连后重烧刷写即可补上该几何的实机行。
+> S3 的 1 KiB 几何实机行已补齐（2026-09-25 晚）：三平台在**同一几何、同一配置**
+> 下的套件计数逐位一致（939,054），model 同为 466,859——"三平台同数"叙事在
+> 新几何下完整保持。
 
 三个平台（host、S3、经典 ESP32）的参考模型对拍都是**同一个 466,859 checks**：
 这是同一份确定性差分测试在三种架构上逐项走完了同样多的判定。并发的
