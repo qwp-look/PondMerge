@@ -296,7 +296,8 @@ target_link_libraries(your_app PRIVATE pondmerge::pondmerge)
 ### 3. 安装后用 find_package
 
 ```sh
-cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/your/prefix
+# PM_* 预算在库的 configure 一步定型（编译进导出的 target）：
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/your/prefix -DPM_MAX_OBJECTS=256
 cmake --build build && cmake --install build
 ```
 
@@ -305,8 +306,19 @@ find_package(pondmerge 1.0 REQUIRED)
 target_link_libraries(your_app PRIVATE pondmerge::pondmerge)
 ```
 
+> **`PM_MAX_OBJECTS` 等 PM_* 预算在两条纯 CMake 路径上的覆盖方式不同**，且覆盖
+> 失败无任何告警（静默回到 1024 对象 ≈ 116 KiB 元数据）：
+> - **路径 2（add_subdirectory）**：在 `add_subdirectory` **之前**写普通
+>   `set(PM_MAX_OBJECTS 256)`（与上面 IDF 写法相同；需要本库 3.21+ 的
+>   cmake_minimum_required——CMP0126，旧策略下 CACHE set 会抹掉你的普通变量，
+>   已实测并写进 `tests/consumer_smoke.sh` 的断言）。
+> - **路径 3（find_package）**：预算在**安装库时**定型，consumer 侧的
+>   `set()` / `-D` **都改不了**已安装的导出 target——必须在库的 configure
+>   步骤传 `-DPM_MAX_OBJECTS=...`（如上）。
+
 路径 2/3 由 `tests/consumer_smoke.sh` 端到端验证（配置 → 构建 → 安装 →
-`find_package` → 链接 → 运行），CI 每次执行。
+`find_package` → 链接 → 运行；外加 add_subdirectory 路径与覆盖生效断言），
+CI 每次执行。
 
 ### 4. 手工编译（最小路径）
 

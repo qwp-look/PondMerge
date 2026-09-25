@@ -27,6 +27,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`set(PM_MAX_OBJECTS ...)` before `add_subdirectory()` actually overrides
+  now.** The library pinned `cmake_minimum_required(3.16)`, which holds
+  CMP0126 at OLD behaviour: the library's own `set(... CACHE STRING ...)`
+  silently wiped a consumer's plain variable of the same name, so the
+  RAM-critical override compiled in with the 1024-object default (~116 KiB
+  of metadata) and no diagnostic — measured end to end. The minimum is now
+  3.21 (NEW policy leaves the consumer's variable in charge; no feature
+  needs it), and `tests/consumer_smoke.sh` covers the add_subdirectory path
+  with a hard assertion on the resulting metadata budget (it previously
+  covered only install + find_package, while the README claimed both paths
+  were verified). The README now documents the different override mechanics
+  of each consumption path — under find_package the budget is frozen at
+  library-install time and a consumer-side `-D` does nothing.
+
 - **Clicking "reset scene" no longer permanently deadlocks the demo server.**
   `push()` called `log_protocol_error()` while holding the non-reentrant
   `STATE_LOCK`, which re-entered the same lock on the

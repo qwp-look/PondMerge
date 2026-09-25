@@ -26,7 +26,13 @@
 # ---------------------------------------------------------------------------
 if(NOT ESP_PLATFORM)
 
-    cmake_minimum_required(VERSION 3.16)
+    # 3.21, not because any feature needs it, but for CMP0126: at the OLD
+    # policy a set(... CACHE STRING ...) inside this file silently wiped a
+    # consumer's plain set(PM_MAX_OBJECTS 128) before add_subdirectory(), so
+    # the RAM-critical overrides compiled in with the 1024 default and no
+    # diagnostic (measured: metadata_bytes stayed at 116,245). The NEW
+    # behaviour leaves a normal variable of the same name in charge.
+    cmake_minimum_required(VERSION 3.21)
     project(pondmerge
         VERSION 1.0.0
         DESCRIPTION "Managed memory for MMU-less MCUs: pools, logical refs, explicit compaction"

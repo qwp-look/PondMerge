@@ -73,3 +73,54 @@ cmake --build "$CONSUMER/build" -j > "$WORK/con-build.log" 2>&1 || {
 echo "== 4/4 run the consumer =="
 "$CONSUMER/build/smoke"
 echo "consumer smoke PASSED (exit 0)"
+
+# ---------------------------------------------------------------------------
+# Path 2 of the README's integration section: add_subdirectory(). This path
+# has its own trap: a consumer's plain set(PM_MAX_OBJECTS 128) must actually
+# win over the library's CACHE default (CMP0126, needs 3.21+). Before the
+# policy bump the override was silently ignored and the library compiled with
+# 1024 objects (~116 KiB of metadata) -- exactly what the README warns small
+# targets about, with no diagnostic. The consumer asserts the small-table
+# metadata budget instead, so a regression here fails the smoke.
+# ---------------------------------------------------------------------------
+echo "== 5/5 add_subdirectory path: set(PM_MAX_OBJECTS) must take effect =="
+SUB="$WORK/subconsumer"
+mkdir -p "$SUB"
+cat > "$SUB/CMakeLists.txt" <<'CMAKE_EOF'
+cmake_minimum_required(VERSION 3.16)
+project(subconsumer CXX)
+set(PM_MAX_OBJECTS 128)                 # the documented IDF-style override
+set(PM_MAX_POOLS 4)                     # matches README's 128/4 budget row
+add_subdirectory(${POND_MERGE_ROOT} pondmerge-ext)
+add_executable(smoke2 main.cpp)
+target_link_libraries(smoke2 PRIVATE pondmerge::pondmerge)
+CMAKE_EOF
+
+# 72 + 476*4 + 106*128 + 4 = 15,548 B for the 128/4 table; anything above
+# ~20 KiB means the override did not reach the compile line.
+cat > "$SUB/main.cpp" <<'CPP_EOF'
+#include "pondmerge/pondmerge.hpp"
+
+static uint8_t zone[64 * 1024] __attribute__((aligned(16)));
+
+int main() {
+    pm::Config cfg{zone, sizeof(zone), 4096};
+    if (pm::init(cfg) != pm::Status::Ok) return 1;
+    pm::GlobalStats gs = pm::global_stats();
+    // 128 objects / 4 pools: ~15.5 KiB. The 1024/16 default is ~116 KiB.
+    if (gs.metadata_bytes < 12000 || gs.metadata_bytes > 20000) return 11;
+    if (pm::deinit() != pm::Status::Ok) return 2;
+    return 0;
+}
+CPP_EOF
+
+cmake -S "$SUB" -B "$SUB/build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DPOND_MERGE_ROOT="$ROOT" > "$WORK/sub-cfg.log" 2>&1 || {
+        echo "FAIL: add_subdirectory consumer configure"; cat "$WORK/sub-cfg.log"; exit 1; }
+cmake --build "$SUB/build" -j > "$WORK/sub-build.log" 2>&1 || {
+    echo "FAIL: add_subdirectory consumer build"; cat "$WORK/sub-build.log"; exit 1; }
+"$SUB/build/smoke2" || {
+    echo "FAIL: PM_MAX_OBJECTS override did not take effect (metadata_bytes out of range)"
+    exit 1; }
+echo "add_subdirectory override PASSED (metadata within the 128-object budget)"
