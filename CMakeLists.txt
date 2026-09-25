@@ -34,7 +34,7 @@ if(NOT ESP_PLATFORM)
     # behaviour leaves a normal variable of the same name in charge.
     cmake_minimum_required(VERSION 3.21)
     project(pondmerge
-        VERSION 1.0.0
+        VERSION 1.1.0
         DESCRIPTION "Managed memory for MMU-less MCUs: pools, logical refs, explicit compaction"
         LANGUAGES CXX)
 
