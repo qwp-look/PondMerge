@@ -304,7 +304,7 @@ test `tests/concurrency_esp32.cpp`, which is never compiled on the host.
 | cppcheck (warning/style/performance) | exit 0 |
 | TLSF configuration matrix | PASSED |
 | Demo protocol / HTTP smoke | 104 / 27 checks, 0 failures |
-| Coverage of `src/core.cpp` | 92.51% of lines, 75.58% of branches executed (Debug pass); the Release pass measures 92.58% lines / 77.30% taken — floor of 85% enforced on both (the drop from the pre-v17 numbers is accounted in HANDOVER_v17 section 5) |
+| Coverage of `src/core.cpp` | 96.75% of lines, 80.07% of branches executed (Debug pass); the Release pass measures 96.91% lines / 82.06% taken — floor of 85% enforced on both (line-level attribution in AUDIT_LEDGER section 7.1) |
 | libFuzzer, bounded run | no crash, no sanitizer finding |
 | **ESP32-S3 (n16r8) on hardware, v1.0.0-33 (v20 geometry: 64 segments x 1 KiB, internal DRAM)** | suite **939,054** (R1–R57) + dual-core concurrency 28 + model 466,859 checks, **all 0 failures**; rerun from reset, identical counts |
 | **Classic ESP32 (D0WDQ6 v1.1) on hardware, v1.0.0-32 (same geometry)** | suite **939,054** — the full suite runs on this part for the first time — + concurrency 28 + model 466,859 checks, **all 0 failures** |

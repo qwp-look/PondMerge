@@ -237,6 +237,24 @@
 | 第十五轮：`bins_bitmap_consistent` 的「头部尺寸不选它所在 bin」规则 | 公开 API 下构造不出会走到它的形状：抬高头部尺寸会让它成为本次请求的**适配目标**（bins_find 成功，诊断路径根本不运行），压低到请求以下则由链上其余节点满足遍历；保留为「头与位图必须自洽」这一族规则的完备性守卫（R55 覆盖同族的另两条） |
 | L2234 | validate 阶段 3 的 `same_start != 1` 重复起点拒绝 | 阶段 2 的 fl/sl 尺寸类匹配与互逆链接已拒绝任何重复登记（同一偏移不能同时匹配两个尺寸类）；保留为零长度 gap 的最后防线 |
 
+### 7.1 覆盖缺口逐行归账（v20，gcov 修好后首次可行）
+
+v17 §9 记录的"gcov 注解空壳"已破案并修复：门禁在 `build/cov/` 里运行 gcov，
+而 `.gcno` 记录的相对源路径在彼处不解析——摘要百分比照常算出，注解文件却只写
+一个头（`Cannot open source file src/core.cpp`）。修复：门禁把 `src/`、
+`include/`、`tests/` 符号链接进 pass 目录。注解文件自此有全文。
+
+Debug 档 45 个未覆盖行（Release 档 42 个）逐行归账如下：
+
+| 未覆盖行 | 归账 | 性质 |
+|---|---|---|
+| `pm_debug_abort` / `pm_debug_assert_fail` 全函数（1,088–1,103） | Debug 断言中止路径：套件不触发 `operator->` 失败（那是编程错误中止，探针已验证） | 预期未覆盖 |
+| `sort_packed_keys` 全函数（392–409） | 仅在 `PM_MAX_OBJECTS <= 256` 且 zone ≤ 2^24 时运行——host 门禁 1024 走比较器回退；**设备构建走此路径**（§7 已登记的宽度契约守卫） | 配置守卫，设备已覆盖 |
+| `move_block` 的 `memmove` 重叠回退（67–68） | 规划器证明不重叠才 memcpy；重叠即契约违反 | 防御分支 |
+| `bump_epoch` 的回绕重映射（254–256） | 需要 2^32 次整理 | 预期不可达 |
+| `check_ref` 的对齐拒绝（566）、`free_block_binned` 根检查（643）、`audit_pool_bins` 两条（783/799）、`compact_impl` 两条（1,001/1,020）、`merge` 的 Busy/恢复/分类（2,092–2,180）、`split` 的规划分类（2,342–2,344）、`alloc` 的首适应耗尽尾（1,456–1,457）、`destroy_pool` Busy（1,249）、`borrow_end` 的 token 分支（1,703）、`analyze_compaction` 的 INVALID_REQUEST 尾（1,822–1,823） | 损坏/故障注入拒绝路径：**可达但需要更细的注入场景**（对 R13–R15/R28/R47 未覆盖的特定子分支，如 merge 的 PinnedConflict 分类、compact 的 Pinned-vs-NoSpace 区分） | 后续轮次的红测试候选清单 |
+| `borrow_end` 的 assert（1,721） | 同 pm_debug_abort：`operator->` 中止路径 | 预期未覆盖 |
+
 ## 8. 账本维护记录
 
 - 2026-09-24（第十五轮）：同步维护路径算法重构的落地（free 的 O(1) 锚定证明、

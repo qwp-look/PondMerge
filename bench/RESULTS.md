@@ -643,6 +643,26 @@ What this section does NOT establish:
 
 ---
 
+### 5.9 In-repo bench re-run on the current core (2026-09-25, v1.0.0-30)
+
+The in-repo bench project (`bench/esp32`, the 192 KiB internal-RAM region) was
+rebuilt from the current core and re-run end to end on the S3. Purpose: confirm
+that the v17 algorithm changes and the v19/v20 fixes did not disturb the
+device-side claims measured in the out-of-tree fixture. Findings, all
+consistent:
+
+* `alloc`/`free` pair stays **flat in the live count** (8,321 -> 8,271 ns over
+  live 16 -> 256, x0.99); `free` ~5.7-5.8 us, `alloc` 6.3-9.7 us on this
+  instrument (per-op attribution REJECTED by its own cross-checks -- the
+  clock-call cost at these magnitudes is why the out-of-tree fixture exists).
+* `validate` scaling **exponent 0.98** (the v17 linearization holds);
+  `get_stats` 0.75.
+* Fragmentation A/B and the churn harness run clean; `metadata_bytes` reports
+  30,724 B at 256 objects (the acceptance firmware's 30,729 differs by the
+  concurrency test's own footprint).
+* The compaction-window percentiles are the ones recorded in section 5.8's
+  2026-09-25 re-measure.
+
 ## 6. A second device: classic ESP32 (ESP32-D0WDQ6, LX6)
 
 Section 5 is one part, which makes "the device" and "this ESP32-S3" the same

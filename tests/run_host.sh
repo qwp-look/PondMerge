@@ -59,6 +59,17 @@ case "$1" in
         pm_debug=$1; covdir=$2; label=$3; ops=$4
         rm -rf "build/$covdir"
         mkdir -p "build/$covdir"
+        # gcov resolves the source paths recorded in the .gcno relative to its
+        # working directory. Run from the pass directory those paths
+        # ("src/core.cpp", ...) do not exist: the summary percentages still
+        # compute, but every annotated .gcov file comes out as a header-only
+        # shell and per-line attribution is impossible (v17 section 9 recorded
+        # exactly that symptom). Symlinking the source roots into the pass
+        # directory lets gcov find them; the annotation files then carry the
+        # uncovered-line markers the ledger attributes.
+        ln -sfn "$PWD/src" "build/$covdir/src"
+        ln -sfn "$PWD/include" "build/$covdir/include"
+        ln -sfn "$PWD/tests" "build/$covdir/tests"
         for src in src/core tests/suite tests/model tests/main; do
             # Named after the SOURCE basename on purpose: gcov locates the notes
             # file by the source file's basename, so build/cov/core.gcno is what
