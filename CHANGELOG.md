@@ -27,6 +27,28 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Calling any entry before `init()` (or after `deinit()`) now answers
+  `NotInitialized` instead of `CorruptMetadata`** (new `Status` value, appended
+  to the enum so every pre-existing numeric value is unchanged). The old
+  answer was accurate for broken metadata and alarming for the most common
+  beginner mistake: it pointed a fresh integrator straight at a
+  memory-corruption hunt. `pause`/`resume` keep their pool-table semantics
+  (`InvalidPool`) and the advice verdict stays `INVALID_METADATA`; R37 pins
+  the full post-deinit refusal matrix.
+- **`operator->` failures now name the refusing status in the Debug abort**
+  (`PondMerge ASSERT ...: INVALID_REF` instead of a bare location) — the
+  status was always available, it just never reached the message. Release
+  builds are untouched (the documented null-deref contract).
+- **`seg_base()`/`pool_start()` no longer feed unproven geometry into pointer
+  arithmetic.** `get_stats`, `validate`, `audit_pool_bins` and the cheap
+  bitmap screen now derive their offsets from a pointer-free
+  `pool_start_off(Pool)` (pure integer math on the segment fields): a
+  corrupted `segment_first` used to enter pointer arithmetic before any
+  geometry proof — undefined behaviour rather than the documented clean
+  refusal (audit item A4-10).
+- **The `Config::segment_size` doc now says "power of two, >= 1 KiB"**, which
+  is what `init()` has always enforced; the old ">= 4 KiB" comment was
+  stricter than the code.
 - **`validate()` no longer answers Ok on, nor runs a quadratic scan over,
   hostile free-block layouts (red test R57).** A pool tampered into uniform
   16 B binned blocks passes every structural check above the coverage sweep

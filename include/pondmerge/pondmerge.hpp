@@ -68,6 +68,11 @@ enum class Status : int8_t {
     PoolChanged,        // local ref whose object moved to another pool
     AlreadyPaused,
     CorruptMetadata,
+    // Appended last so every pre-existing numeric value is unchanged. The
+    // "library is down" answer used to be CorruptMetadata -- accurate for
+    // broken metadata, alarming and misleading for the most common beginner
+    // mistake (calling an entry before init()).
+    NotInitialized,
 };
 
 inline const char* status_name(Status s) {
@@ -83,6 +88,7 @@ inline const char* status_name(Status s) {
         case Status::PoolChanged: return "POOL_CHANGED";
         case Status::AlreadyPaused: return "ALREADY_PAUSED";
         case Status::CorruptMetadata: return "CORRUPT_METADATA";
+        case Status::NotInitialized: return "NOT_INITIALIZED";
     }
     return "?";
 }
@@ -112,7 +118,10 @@ struct RawRef {
 struct Config {
     uint8_t* zone;         // start of the Auto Zone (>= 8 byte aligned)
     uint32_t zone_size;    // total bytes, multiple of segment_size preferred
-    uint32_t segment_size; // pool resize granularity (power of two, >= 4 KiB)
+    // pool resize granularity (power of two, >= 1 KiB). The init() check is
+    // the contract (core.cpp rejects < 1024); an earlier revision of this
+    // comment said ">= 4 KiB", stricter than the code ever enforced.
+    uint32_t segment_size;
 };
 
 struct PoolStats {
@@ -521,11 +530,16 @@ public:
         return {Status::Ok, static_cast<T*>(addr)};
     }
 
-    // C++ syntax sugar; failure is a programming error (Debug asserts,
-    // Release yields a null deref). Prefer try_borrow() on cold paths.
+    // C++ syntax sugar; failure is a programming error (Debug aborts with the
+    // refusing status in the message; Release yields a null deref). Prefer
+    // try_borrow() on cold paths.
     pm_access_proxy<T> operator->() const {
         auto r = try_borrow();
-        PM_ASSERT(r.ok());
+#if PM_DEBUG
+        if (!r.ok())
+            pm_debug_assert_fail(__FILE__, __LINE__,
+                                 status_name(r.status));
+#endif
         return pm_access_proxy<T>(std::move(r.value));
     }
 

@@ -4162,32 +4162,35 @@ static void test_post_deinit() {
     CHECK_ST(pm::free(r), pm::Status::Ok);
     CHECK_ST(pm::deinit(), pm::Status::Ok);
 
+    // The "library is down" answer is NotInitialized (v19): CorruptMetadata
+    // used to point every beginner at a memory-corruption hunt. pause/resume
+    // keep their pool-table semantics (pool_at finds nothing -> InvalidPool).
     pm::RawRef out{};
-    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, out), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::alloc(pool, 64, 8, 0, 1, out), pm::Status::NotInitialized);
     CHECK(out.generation == 0);
-    CHECK_ST(pm::free(out), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::free(out), pm::Status::NotInitialized);
     void* p = nullptr;
-    CHECK_ST(pm::resolve(out, 0, 1, p), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::resolve(out, 0, 1, p), pm::Status::NotInitialized);
     CHECK(p == nullptr);
-    CHECK_ST(pm::borrow_begin(out, 0, 1, p), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::borrow_begin(out, 0, 1, p), pm::Status::NotInitialized);
     CHECK(p == nullptr);
-    CHECK_ST(pm::set_destroy_fn(out, &counting_destroy), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::set_destroy_fn(out, &counting_destroy), pm::Status::NotInitialized);
     pm::PoolId nid{};
-    CHECK_ST(pm::create_pool(nid, 1), pm::Status::CorruptMetadata);
-    CHECK_ST(pm::destroy_pool(pool), pm::Status::InvalidPool);
+    CHECK_ST(pm::create_pool(nid, 1), pm::Status::NotInitialized);
+    CHECK_ST(pm::destroy_pool(pool), pm::Status::NotInitialized);
     CHECK_ST(pm::pause(pool), pm::Status::InvalidPool);
     CHECK_ST(pm::resume(pool), pm::Status::InvalidPool);
-    CHECK_ST(pm::compact(pool), pm::Status::InvalidPool);
-    CHECK_ST(pm::merge(pool, (pm::PoolId)3), pm::Status::CorruptMetadata);
-    CHECK_ST(pm::split(pool, 1, nid), pm::Status::CorruptMetadata);
-    CHECK_ST(pm::validate(pool), pm::Status::CorruptMetadata);
+    CHECK_ST(pm::compact(pool), pm::Status::NotInitialized);
+    CHECK_ST(pm::merge(pool, (pm::PoolId)3), pm::Status::NotInitialized);
+    CHECK_ST(pm::split(pool, 1, nid), pm::Status::NotInitialized);
+    CHECK_ST(pm::validate(pool), pm::Status::NotInitialized);
     CHECK(pm::analyze_compaction(pool).verdict == pm::CompactionVerdict::INVALID_METADATA);
     CHECK(pm::get_stats(pool).valid == 0);
     CHECK(pm::global_stats().max_live_objects == 0);
     bool changed = true;
     pm::poll_compaction_advice(pool, nullptr, &changed);
     CHECK(changed == false); // identical INVALID_METADATA observation: suppressed
-    CHECK_ST(pm::deinit(), pm::Status::InvalidPool); // already down
+    CHECK_ST(pm::deinit(), pm::Status::NotInitialized); // already down
 
     // A normal init() brings the system back.
     CHECK_ST(pm::init(pm::Config{g_zone, sizeof(g_zone), 4096}), pm::Status::Ok);

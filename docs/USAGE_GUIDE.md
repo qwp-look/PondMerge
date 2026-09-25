@@ -121,6 +121,7 @@ Host 运行不能证明锁语义，SMP 证据来自双核设备测试（`tests/c
 | `PoolChanged` | local 引用的对象已换池 | merge/split 后 |
 | `AlreadyPaused` | 已处于 Paused | 重复 pause |
 | `CorruptMetadata` | 元数据损坏（精确报告，不伪装） | 故障注入/内存踩踏 |
+| `NotInitialized` | 库未初始化（`init()` 之前/`deinit()` 之后调用） | 忘记 `init()`；v19 起取代此前的 `CorruptMetadata` |
 
 ## 10. validate 与 PoolStats
 

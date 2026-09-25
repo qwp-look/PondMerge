@@ -153,10 +153,12 @@ pm::validate(pool);     // 可选：全量结构审计
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| 任何入口返回 `NOT_INITIALIZED` | 忘记 `pm::init()`，或在 `deinit()` 之后 | 先 `init()`；每个程序生命周期一次 |
 | `alloc` 返回 `NoSpace` | 池满或最大连续块不足 | `analyze_compaction` 看建议；必要时 compact |
 | `pm_destroy` 返回 `Busy` | 对象有活跃借用（RAII acc 未销毁） | 结束借用后重试 |
 | `borrow_begin` 返回 `PoolChanged` | 对象被 merge 到其他池，local 引用失效 | 改用 `pm_as_cross()` 重建引用 |
 | `borrow_begin` 返回 `InvalidRef` | generation 过期（对象已释放重建） | 引用已死，重新分配 |
+| `pod->field` 触发 `PondMerge ASSERT`（消息末尾是状态名） | `operator->` 失败=编程错误（如对象已销毁/借用被拒） | Debug 下中止且消息带拒绝状态；**勿保存 `&pod->field`**（借用随表达式结束） |
 | `compact` 返回 `Busy` 且池变 Paused | 有活跃借用或池已在维护态 | `resume()` 恢复；排除借用后重试 |
 | compact 后旧裸指针失效 | 正常：裸指针不跟随搬迁 | 用 `pm_ptr`，或在 compact 后重新 `resolve` |
 | 设备串口"卡死" | USB-Serial-JTAG 发送队列满（主机没读） | 用 `tests/serial_cap.py` 或 demo_server 持续读取 |

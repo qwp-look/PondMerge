@@ -521,7 +521,7 @@ inline bool desc_block_consistent(ObjectDesc const& d) {
 Status check_ref(RawRef const& ref, uint32_t access_size, uint32_t access_align,
                  RefCheck& rc, bool require_running, void** out_addr) {
     GlobalState& G = g();
-    if (!G.initialized) return Status::CorruptMetadata;
+    if (!G.initialized) return Status::NotInitialized;
     if (ref.index >= PM_MAX_OBJECTS || ref.generation == 0) return Status::InvalidRef;
     ObjectDesc& d = G.objects[ref.index];
     if (d.state != ObjState::Live) return Status::InvalidRef;
@@ -753,9 +753,9 @@ Status prev_link_ok(uint64_t boff, uint64_t start_off) {
 // (round-3 guide 3.1). O(free blocks). When `free_total_out` is non-null it
 // receives the sum of all binned block sizes.
 Status audit_pool_bins(Pool const& P, uint64_t* free_total_out) {
-    GlobalState const& G = g();
-    uint64_t const zbase = (uint64_t)(uintptr_t)G.zone;
-    uint64_t const start_off = (uint64_t)(uintptr_t)pool_start(P) - zbase;
+    // Pure-integer geometry: this audit runs on pools whose segment fields
+    // are not proven yet, so no pointer may be formed from them (A4-10).
+    uint64_t const start_off = pool_start_off(P);
     uint64_t const end_off = start_off + (uint64_t)pool_capacity(P);
     const uint32_t max_free_steps = (uint32_t)(pool_capacity(P) / PM_MIN_BLOCK) + 1;
 
@@ -1151,7 +1151,7 @@ Status init(Config const& cfg) {
 
 Status deinit() {
     GlobalState& G = g();
-    if (!G.initialized) return Status::InvalidPool;
+    if (!G.initialized) return Status::NotInitialized;
     // Object-less pools hold no resources beyond segment bookkeeping, which
     // dies with the zone; only live objects block a shutdown.
     if (G.live_object_count != 0) return Status::Busy;
@@ -1181,7 +1181,7 @@ GlobalStats global_stats() {
 // ---------------------------------------------------------------------------
 Status create_pool(PoolId& out, uint32_t segment_count) {
     GlobalState& G = g();
-    if (!G.initialized) return Status::CorruptMetadata;
+    if (!G.initialized) return Status::NotInitialized;
     if (segment_count == 0) return Status::NoSpace;
     // A count above the zone's segment count can never name a window here, so
     // refuse it before any geometry math (R56). Without this bound the run
@@ -1241,7 +1241,8 @@ Status create_pool(PoolId& out, uint32_t segment_count) {
 Status destroy_pool(PoolId id) {
     GlobalState& G = g();
     Pool* P = pool_at(id);
-    if (!G.initialized || !P) return Status::InvalidPool;
+    if (!G.initialized) return Status::NotInitialized;
+    if (!P) return Status::InvalidPool;
     if (P->live_objects != 0 || P->borrow_count != 0) return Status::Busy;
     if (P->state == PoolState::Compacting || P->state == PoolState::Merging ||
         P->state == PoolState::Splitting)
@@ -1300,8 +1301,9 @@ PoolStats get_stats(PoolId id) {
     // (task-book v2 section 9.2) instead of looping forever, and it must
     // refuse out-of-range cursors instead of dereferencing them. No bin can
     // hold more blocks than the pool has room for at minimum block size.
-    const uint64_t zbase = (uint64_t)(uintptr_t)g().zone;
-    const uint64_t start_off = (uint64_t)(uintptr_t)pool_start(*P) - zbase;
+    // Pure-integer geometry: get_stats runs before any proof of the pool's
+    // segment fields (A4-10).
+    const uint64_t start_off = pool_start_off(*P);
     const uint64_t end_off = start_off + pool_capacity(*P);
     const uint32_t max_steps = pool_capacity(*P) / PM_MIN_BLOCK + 1;
     // The SAME reject set, evaluated in 32-bit. Both bounds are in-zone offsets, so they fit in
@@ -1361,8 +1363,8 @@ PoolStats get_stats(PoolId id) {
 // into the weeds" class is caught before this point. The full audit still runs
 // at every maintenance entry and inside validate().
 static bool bins_bitmap_consistent(Pool const& P) {
-    uint64_t const zbase = (uint64_t)(uintptr_t)g().zone;
-    uint64_t const start_off = (uint64_t)(uintptr_t)pool_start(P) - zbase;
+    // Pure-integer geometry: this screen runs before the geometry proof (A4-10).
+    uint64_t const start_off = pool_start_off(P);
     uint64_t const end_off = start_off + (uint64_t)pool_capacity(P);
     for (uint32_t f = 0; f < FL_COUNT; ++f) {
         for (uint32_t s = 0; s < SL_COUNT; ++s) {
@@ -1402,7 +1404,7 @@ Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
     // reads as invalid everywhere.
     out = RawRef{};
     GlobalState& G = g();
-    if (!G.initialized) return Status::CorruptMetadata;
+    if (!G.initialized) return Status::NotInitialized;
     Pool* P = pool_at(pool_id);
     if (!P) return Status::InvalidPool;
     if (P->state != PoolState::Running) return Status::Busy;
@@ -1533,7 +1535,7 @@ Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
 // ---------------------------------------------------------------------------
 Status free(RawRef const& ref) {
     GlobalState& G = g();
-    if (!G.initialized) return Status::CorruptMetadata;
+    if (!G.initialized) return Status::NotInitialized;
     // Only a root reference (offset 0) may release an object; sub-object
     // views from pm_ptr::at() must never destroy the parent (task-book 3.7).
     if (ref.offset != 0) return Status::InvalidRef;
@@ -2019,7 +2021,8 @@ CompactionAdvice poll_compaction_advice(PoolId pool_id, CompactionRequest const*
 Status compact(PoolId id) {
     GlobalState const& G = g();
     Pool* P = pool_at(id);
-    if (!G.initialized || !P) return Status::InvalidPool;
+    if (!G.initialized) return Status::NotInitialized;
+    if (!P) return Status::InvalidPool;
     // Decide the whole state transition under the same lock borrow_begin
     // uses (task-book section 4), then run the maintenance body outside the
     // lock during the quiescent window.
@@ -2068,7 +2071,7 @@ Status compact(PoolId id) {
 // ---------------------------------------------------------------------------
 Status merge(PoolId source_id, PoolId target_id) {
     GlobalState& G = g();
-    if (!G.initialized) return Status::CorruptMetadata;
+    if (!G.initialized) return Status::NotInitialized;
     if (source_id == target_id) return Status::InvalidPool;
 
     // Arming (validity, adjacency, state, borrows) happens under the same
@@ -2258,7 +2261,7 @@ fail_restore:
 // ---------------------------------------------------------------------------
 Status split(PoolId source_id, uint32_t new_pool_segments, PoolId& out_new) {
     GlobalState& G = g();
-    if (!G.initialized) return Status::CorruptMetadata;
+    if (!G.initialized) return Status::NotInitialized;
 
     // Arming under the borrow lock (task-book v2 section 5): state, borrow
     // count, segment math AND the new pool slot are claimed atomically, so
@@ -2503,13 +2506,16 @@ fail_restore:
 // ---------------------------------------------------------------------------
 Status validate(PoolId id) {
     GlobalState const& G = g();
-    if (!G.initialized) return Status::CorruptMetadata;
+    if (!G.initialized) return Status::NotInitialized;
     Pool const* P = pool_at(id);
     if (!P) return Status::InvalidPool;
 
     const uint64_t zbase = (uint64_t)(uintptr_t)G.zone;
     const uint32_t capacity = pool_capacity(*P);
-    const uint64_t start_off = (uint64_t)(uintptr_t)pool_start(*P) - zbase;
+    // Pure-integer geometry: validate() is the auditor of last resort and
+    // runs on pools whose segment fields are not proven yet (A4-10); only
+    // descriptor addresses (real pointers, integer-converted) use zbase.
+    const uint64_t start_off = pool_start_off(*P);
     const uint64_t end_off = start_off + capacity;
 
     // [off, off+len) lies inside the pool byte range. len is added in 64-bit
