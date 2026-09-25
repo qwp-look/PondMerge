@@ -129,9 +129,9 @@ best-fit **两轴都更差**。设备侧那个 ~20×/周期的差距**已实测�
 
 | 要知道什么 | 去哪 |
 |---|---|
-| 最新一轮的完整交接（维护路径算法重构轮） | `docs/HANDOVER_v17.md` |
+| 最新一轮的完整交接（设备验收恢复轮） | `docs/HANDOVER_v18.md` |
 | 全部实测数字、仪器限制、负结果 | `bench/RESULTS.md` |
 | 基准方法、公平性规则、引用数字的必备条件 | `bench/README.md` |
 | 不变式与证据（代码位置 + 证明 + 测试） | `docs/AUDIT_LEDGER.md` |
 | 用户侧集成（4 种方式）与元数据预算 | `README.md` |
-| 各轮收口报告 | `docs/HANDOVER_v2–v17.md` |
+| 各轮收口报告 | `docs/HANDOVER_v2–v18.md` |

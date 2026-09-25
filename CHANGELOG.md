@@ -44,6 +44,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **The S3 acceptance firmware runs again, with the suite's zone in the
+  module's octal PSRAM** (see `docs/HANDOVER_v18.md`). The 256 KiB zone the
+  suite pins cannot share static DRAM with the runtime any more, so the
+  build system passes `-DPM_ZONE_ATTR=EXT_RAM_BSS_ATTR` when the sdkconfig
+  allows external `.bss` — decided by CMake, not the preprocessor, so
+  cppcheck keeps a single configuration. Device result: suite 1,140,828 +
+  dual-core concurrency 28 + model 466,859 checks, 0 failures, with the
+  suite count matching the host 256-object run bit for bit. The PSRAM mode
+  must be OCTAL on n16r8 boards: QUAD aborts in `quad_psram` and the crash
+  loop eventually takes the USB-Serial-JTAG off the bus (measured).
+
+- **Suite tests R46/R54/R55 are now portable to any `PM_MAX_OBJECTS >= 256`.**
+  R46 hard-coded `refs[900]` (out of bounds of the test's own array at the
+  device's 256), and R54/R55 filled a 2-segment pool with 512 minimal blocks
+  (unsatisfiable below 512 slots). On the device these turned into a
+  deterministic boot loop: leaked live objects made `deinit()` report `Busy`
+  and the runner aborted. The geometry is now derived from `PM_MAX_OBJECTS`
+  (512 -> 2 segments, 256 -> 1 segment, exact 16 B-block fill preserved);
+  below 256 the suite refuses to compile. These tests had never run on the
+  device since they were added — the host default of 1024 hid all three.
+
 - **Two red-test groups for the alloc refusal diagnosis (R54-R55).** R54 pins
   both halves of the trade: a chain damaged beyond its head is still refused
   (now `NoSpace`) and is still reported by `validate()`, while a bitmap bit
