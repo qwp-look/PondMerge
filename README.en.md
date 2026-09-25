@@ -297,9 +297,9 @@ test `tests/concurrency_esp32.cpp`, which is never compiled on the host.
 
 | gate | result |
 |---|---|
-| Host Debug, 10000 ops | 5,432,827 checks, 0 failures |
-| Host Release, 10000 ops | 5,432,834 checks, 0 failures |
-| ASan + UBSan, 3000 ops | 1,527,686 checks, 0 failures |
+| Host Debug, 10000 ops | 5,454,163 checks, 0 failures |
+| Host Release, 10000 ops | 5,454,170 checks, 0 failures |
+| ASan + UBSan, 3000 ops | 1,553,174 checks, 0 failures |
 | Reference-model differential (independent oracle, fixed seed) | 466,859 checks, 0 failures |
 | cppcheck (warning/style/performance) | exit 0 |
 | TLSF configuration matrix | PASSED |

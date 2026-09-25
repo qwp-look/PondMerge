@@ -23,7 +23,7 @@ OS 线程）的**用户态托管内存系统**。在一段固定 Auto Zone 上�
 | 跑可视化 Demo（浏览器 + 设备） | [examples/](examples/) 与 [docs/DEMO_REQUIREMENTS.md](docs/DEMO_REQUIREMENTS.md) |
 | 审计与不变量证据 | [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) |
 | **实测性能数字与仪器限制** | [bench/RESULTS.md](bench/RESULTS.md) |
-| 历史轮次报告 | [docs/HANDOVER_v18.md](docs/HANDOVER_v18.md)（含 v2–v17 索引） |
+| 历史轮次报告 | [docs/HANDOVER_v20.md](docs/HANDOVER_v20.md)（含 v2–v19 索引） |
 
 ## 目录结构
 
@@ -367,22 +367,23 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 ### 当前验收状态
 
 > host 三行由 `scripts/gates.sh` 每轮收口复验，最新数字见
-> [docs/HANDOVER_v18.md](docs/HANDOVER_v18.md)；下表是当前轮的记录（v18 实测，
-> 2026-09-25，`21f94da` 上 11/11 门禁复验）。
+> [docs/HANDOVER_v20.md](docs/HANDOVER_v20.md)；下表是当前轮的记录（v20 实测，
+> 2026-09-25，host 默认几何 4 KiB；设备构建为 1 KiB 几何，见 v20 §2）。
 
 | 档位 | 结果 |
 |---|---|
-| Host Debug（10000 op） | 5,432,827 checks, 0 failures |
-| Host Release（10000 op） | 5,432,834 checks, 0 failures |
-| ASan/UBSan（3000 op） | 1,531,838 checks, 0 failures |
+| Host Debug（10000 op） | 5,454,163 checks, 0 failures |
+| Host Release（10000 op） | 5,454,170 checks, 0 failures |
+| ASan/UBSan（3000 op） | 1,553,174 checks, 0 failures |
 | 参考模型对拍 | 466,859 checks, 0 failures |
 | cppcheck（warning/style/performance） | exit 0，三类计数 0/0/0 |
 | 配置矩阵 | PASSED |
 | 协议回归 / HTTP 回归 | 104 / 27 checks, 0 failures |
 | `src/core.cpp` 覆盖率 | 92.51% 行 / 75.58% 分支执行（Debug 档；Release 档 92.58% 行 / 77.30% 分支选取；下限 85% 强制。下降原因见 HANDOVER_v17 §5） |
 | libFuzzer（有界运行） | 无崩溃、无 sanitizer 发现 |
-| ESP32-S3 (n16r8) 实机，App version `v1.0.0-28-g60b079c` | 套件 **1,140,849**（R1–R57 全量，zone 在 PSRAM）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures；与 host 256 对象档逐位一致 |
-| 经典 ESP32 (D0WDQ6 v1.1) 实机，App version `v1.0.0-31-g6d83194` | 双核并发 28 + 模型 466,859 checks，0 failures；两次复位重跑计数一致。**套件未运行**（见下；该目标无 PSRAM，DRAM 装不下 256 KiB zone） |
+| ESP32-S3 (n16r8) 实机（v20 前基线，App version `v1.0.0-28-g60b079c`） | 套件 **1,140,849**（R1–R57，zone 256 KiB 在 PSRAM）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures |
+| 经典 ESP32 (D0WDQ6 v1.1) 实机（v20 前基线，App version `v1.0.0-31-g6d83194`） | 双核并发 28 + 模型 466,859 checks，0 failures；套件未运行（v20 前该目标编不进套件） |
+| **v20 夹具参数化后**：经典 ESP32 (D0WDQ6 v1.1)，App version `v1.0.0-32` | **套件首次在经典 ESP32 上运行：939,054 checks**（R1–R57，zone 64 KiB = 64 段 × 1 KiB，静态 DRAM）+ 双核并发 28 + 模型 466,859，全部 0 failures；与 host 同配置同几何**逐位一致** |
 
 > 经典 ESP32 的记录已于 2026-09-25 在当前提交（`6d83194`）上重取（v19 收口）：
 > 此前它停在 `v1.0.0-6`，晚于 v17 算法重构的适用性只能靠推断；现在这条推断已由
@@ -393,23 +394,25 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 > 静态 DRAM 放不下 256 KiB zone，固件链接失败（v17 §7），v18 把 zone 移入 PSRAM
 > 并修掉三个测试的尺寸假设后才恢复。**教训：新增的套件测试若从未上过设备，README
 > 的设备行必须标注断档区间，而不是默认连续。**
-
-> **两个目标平台跑的不是同一组测试，而且这一点会打印出来。** 验收套件把 zone
-> 绑死在 64 段上——测试 [10] 断言"16 个池 × 4 段正好填满 zone"，测试 [2] 要求一个
-> 32 段的池——所以它的 zone 尺寸是**断言的一部分**，不能缩小。经典 ESP32 的静态
-> DRAM 总量约 200 KiB，放不下 256 KiB 的 zone（实测链接失败：
-> `region 'dram0_0_seg' overflowed by 126,744 bytes`）。因此该目标的固件**不编译
-> 套件**，只跑并发与 model 两组，并在串口上以 `=== suite SKIPPED (not run, not
-> passed) ===` 明确声明——跳过绝不会被写成"通过"。分叉在
-> `esp32/main/CMakeLists.txt` 里由 `CONFIG_IDF_TARGET` 驱动。
 >
-> S3 从 v18 起把 zone 放进 **PSRAM**（`EXT_RAM_BSS_ATTR`，由
-> `esp32/main/CMakeLists.txt` 在 sdkconfig 允许时传入；PSRAM 模式必须是
+> **v20 终结了断档的根源**：夹具几何参数化（`PM_TEST_SEG_BYTES`，64 段 × 1 KiB =
+> 64 KiB zone）后，套件对两个目标都完整可编可跑——经典 ESP32 的 SKIPPED 时代
+> 结束，S3 也回到内部 DRAM（PSRAM 不再是套件的依赖，v18 预告的"内存等级"代价
+> 随之消除）。
+
+> **两个目标平台现在跑同一组测试、同一几何**（v20 起）：套件的段**数量**仍是 64
+> ——测试 [10] 断言"16 个池 × 4 段正好填满 zone"，测试 [2] 要求一个 32 段的池——
+> 但段**尺寸**变成了编译期旋钮 `PM_TEST_SEG_BYTES`（设备构建 = 1 KiB，zone
+> 64 KiB；host 默认 4 KiB，套件在两种几何下都验证通过）。历史背景：v17/v18 期间
+> 套件曾把 zone 钉死在 64×4 KiB = 256 KiB，经典 ESP32 因此编不进套件（链接溢出
+> 126,744 B，SKIPPED 时代），S3 则把 zone 挪进了 OCTAL PSRAM（PSRAM 模式必须是
 > **OCTAL**——n16r8 是八线件，配 QUAD 会 abort 并最终把 USB 拖下线，实测）。
-> 这保住了套件在 S3 上的存在，但有一个**必须写明的代价**（v17 §7 预告过）：验收
-> 夹具不再是"内部 SRAM"场景——正确性验收不受影响，**但它不再代表 bench 所测的
-> 内存等级**；基准数字（`bench/RESULTS.md`）全部来自独立夹具的内部 RAM，与本表
-> 的正确性记录是两回事。
+> v20 的参数化把这两个权宜都退役了：两个目标都在**内部 DRAM** 上跑全套件，验收
+> 夹具重新代表 bench 所测的内存等级。
+>
+> 历史教训保留：夹具的每个字节级断言都必须从几何常量推导——v20 为此扫掉了
+> 约 30 处字面量（16,376 B 窗口、3584 B 边界跨越、6016/8192 偏移……），全部改为
+> `PM_TEST_SEG_BYTES` 的表达式，并在 1 KiB / 4 KiB 两种几何下分别全绿。
 >
 > 这条分叉的**直接动因**是项目的锁语义声明：Host 的 `PM_LOCK` 是空操作，SMP 证据
 > 只能来自双核设备测试，而在此之前它只在**一颗**芯片上成立过。经典 ESP32 是**双核
@@ -449,9 +452,10 @@ ESP32 demo（固定脚本场景、只读展示；设备端整理由固件触发�
 ## ESP32 上机（两个目标）
 
 基础配置在 `esp32/sdkconfig.defaults`（面向 ESP32-S3，也是 `idf.py build` 的默认
-目标；**PSRAM 必须是 OCTAL 模式**——n16r8 板载八线 PSRAM，配 QUAD 会 init 失败
-进入重启循环并把 USB-Serial-JTAG 拖下线，v18 实测；S3 的套件固件依赖 PSRAM 放置
-256 KiB 的 zone，见验收表下方的说明）。第二个目标通过 `SDKCONFIG_DEFAULTS` 追加
+目标；v20 起套件夹具是 64 KiB zone（1 KiB 段），不再依赖 PSRAM。历史教训保留：
+这块板如果启用 PSRAM，模式必须是 **OCTAL**——n16r8 是八线件，配 QUAD 会 init
+失败进入重启循环并把 USB-Serial-JTAG 拖下线，v18 实测）。第二个目标通过
+`SDKCONFIG_DEFAULTS` 追加
 自己的覆盖文件——ESP-IDF **不会**自动读 `sdkconfig.defaults.<target>`，而且
 defaults 列表里靠后的文件**改不动** `CONFIG_IDF_TARGET`（它对 target 采用首个
 匹配），所以切换必须显式 `set-target`：
@@ -473,22 +477,22 @@ idf.py -B build build
 idf.py -B build -p /dev/ttyUSB0 flash monitor       # UART0 + CH340 桥接
 ```
 
-实机记录（S3 在 `21f94da` 上跑过，复位重跑两次计数一致；经典 ESP32 见验收表
-下方的说明——本轮未接，记录仍停在旧提交）：
+实机记录（S3 基线 `21f94da`；经典 ESP32 于 v20 在当前提交上重取，复位重跑一致）：
 
 ```
-ESP32-S3 (n16r8) · /dev/ttyACM0（USB-Serial-JTAG）· v1.0.0-22-g21f94da · zone 在 PSRAM
-  suite（基础 13 组 + R1–R55，2000 ops）：1,140,828 checks, 0 failures PASSED
+经典 ESP32 (D0WDQ6 v1.1) · /dev/ttyUSB0（CH340，160 MHz）· v1.0.0-32（v20，当前）
+  suite（基础 13 组 + R1–R57，2000 ops，zone 64 KiB）：939,054 checks, 0 failures PASSED
   双核并发（200 轮 pause/compact/resume + 双核 borrower）：28 checks, 0 failures
   参考模型对拍（4000 ops）：466,859 checks, 0 failures PASSED
 
-经典 ESP32 (D0WDQ6 v1.1) · /dev/ttyUSB0（CH340，160 MHz）· v1.0.0-6（旧）
-  === suite SKIPPED (not run, not passed) ===（该档无 PSRAM，DRAM 装不下 256 KiB zone）
-  双核并发：28 checks, 0 failures PASSED
-    rounds: borrow_a ok=4992 busy=640 | borrow_b ok=4149 busy=1219
-    maintainer: pause=200(already 0) compact ok=170 busy=30 resume=200
+ESP32-S3 (n16r8) · /dev/ttyACM0（USB-Serial-JTAG）· v1.0.0-28-g60b079c（v20 前基线，zone 256 KiB 在 PSRAM）
+  suite（基础 13 组 + R1–R55，2000 ops）：1,140,849 checks, 0 failures PASSED
+  双核并发：28 checks, 0 failures
   参考模型对拍（4000 ops）：466,859 checks, 0 failures PASSED
 ```
+
+> S3 在 v20 几何（64 KiB zone、纯 DRAM）下的构建已验证可链接（无 PSRAM），
+> 板子回连后重烧刷写即可补上该几何的实机行。
 
 三个平台（host、S3、经典 ESP32）的参考模型对拍都是**同一个 466,859 checks**：
 这是同一份确定性差分测试在三种架构上逐项走完了同样多的判定。并发的
@@ -532,4 +536,4 @@ advice 即断言诊断）；`PM_DEBUG=0` 时断言编译为空，但 generation�
 | docs/架构说明.md | 目标架构契约 |
 | docs/PondMerge_v1_代码指导书.md | 接口与内存布局的原始设计 |
 | docs/PondMerge_v1_repair_task.md / v2 | 第一/二轮修复任务书 |
-| docs/HANDOVER_v2–v18.md | 各轮收口报告（v18 为最新：设备验收恢复轮——OCTAL PSRAM 与套件可移植性） |
+| docs/HANDOVER_v2–v20.md | 各轮收口报告（v20 为最新：夹具几何参数化轮——经典 ESP32 首跑全套件） |

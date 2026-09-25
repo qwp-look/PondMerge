@@ -41,31 +41,41 @@ static uint32_t g_fails = 0;
         }                                                                              \
     } while (0)
 
-// Auto Zone byte size for the acceptance suite.
+// Auto Zone geometry for the acceptance suite: ONE knob, everything derived.
 //
-// It is a macro and not a constant because it is the suite's own DRAM footprint,
-// and DRAM is what decides whether this firmware fits a given part at all. The
-// default is the 256 KiB zone every published run has used.
+// v20 replaces the fixed 256 KiB zone (64 segments x 4096 B) with a
+// parameterizable SEGMENT SIZE: the segment COUNT stays 64 because tests [2]
+// and [10] assert against it (a 32-segment pool; 16 pools x 4 segments
+// filling the zone exactly), but every byte-level statement is derived from
+// PM_TEST_SEG_BYTES below. Blocks may span segments, so allocation sizes do
+// not constrain the choice -- only the pool-geometry tests do, and they
+// compute from the constant.
 //
-// Do not expect to lower it and have the suite still run: as written it needs
-// EXACTLY 64 segments. Test [10] asserts that 16 pools x 4 segments fills the
-// zone, and test [2] asks for a 32-segment pool, so neither a 32- nor a
-// 48-segment zone is a configuration this file supports. A part with less DRAM
-// than the 256 KiB class therefore does not run the suite at all -- it runs the
-// concurrency and model groups, which use 8 KiB and 64 KiB respectively. See
-// esp32/main/CMakeLists.txt for where that fork is expressed.
-#ifndef PM_TEST_ZONE_BYTES
-#define PM_TEST_ZONE_BYTES (256u * 1024u)
+//   4096 (the historical geometry, kept as the documented default)
+//   1024 -> a 64 KiB zone that fits static DRAM on every supported part:
+//           the classic ESP32 runs the FULL suite (it previously could not
+//           link it at all) and the S3 no longer needs PSRAM for it.
+//
+// The suite must pass identically at both geometries; run_host.sh --seg1024
+// exercises the non-default one on host.
+#ifndef PM_TEST_SEG_BYTES
+#define PM_TEST_SEG_BYTES 4096u
 #endif
+#define PM_TEST_SEGMENTS 64u
+#ifndef PM_TEST_ZONE_BYTES
+#define PM_TEST_ZONE_BYTES (PM_TEST_SEGMENTS * PM_TEST_SEG_BYTES)
+#endif
+static_assert((PM_TEST_SEG_BYTES & (PM_TEST_SEG_BYTES - 1)) == 0 &&
+                  PM_TEST_SEG_BYTES >= 1024,
+              "fixture segment size must be a power of two >= 1 KiB (init's own rule)");
+static_assert(PM_TEST_SEG_BYTES <= 4096u * 64u, "keep the zone under the FL ceiling");
 
-// IDF builds with PSRAM may place the zone in external memory: on the S3 the
-// 256 KiB zone no longer fits in static DRAM beside the runtime (dram0_0_seg
-// overflowed by 4,896 B at HEAD). Whether the attribute applies is decided by
-// the build system, not the preprocessor: esp32/main/CMakeLists.txt passes
-// -DPM_ZONE_ATTR=EXT_RAM_BSS_ATTR when the sdkconfig allows external .bss, so
-// this file keeps a single configuration (a source-level #if on the sdkconfig
-// macro made cppcheck enumerate an EXT_RAM_BSS_ATTR-unknown configuration and
-// fail the gate). Host and non-PSRAM device builds get an empty attribute.
+// IDF builds with PSRAM may place the zone in external memory. Since v20 the
+// 64 KiB fixture zone fits static DRAM on every supported part, so nothing
+// REQUIRES the attribute any more; it stays available to the build system
+// (esp32/main/CMakeLists.txt passes -DPM_ZONE_ATTR=EXT_RAM_BSS_ATTR when the
+// sdkconfig allows external .bss) so a part that wants the zone elsewhere
+// keeps the option. Host builds get an empty attribute.
 #ifdef ESP_PLATFORM
 #include <esp_attr.h>
 #endif
@@ -76,7 +86,7 @@ static uint32_t g_fails = 0;
 uint8_t g_zone[PM_TEST_ZONE_BYTES] PM_ZONE_ATTR __attribute__((aligned(16))); // extern: the device concurrency test borrows the low segments
 
 static void fresh() {
-    pm::Config cfg{g_zone, sizeof(g_zone), 4096};
+    pm::Config cfg{g_zone, sizeof(g_zone), PM_TEST_SEG_BYTES};
     pm::Status s = pm::init(cfg);
     if (s != pm::Status::Ok) {
         printf("    init failed: %s\n", pm::status_name(s));
@@ -179,7 +189,7 @@ static void test_basic_alloc_free() {
     pm::PoolStats st = pm::get_stats(pool);
     CHECK(st.object_count == 3);
     CHECK(st.used_bytes == 112 + 208 + 64); // block sizes incl. 8B headers
-    CHECK(st.free_bytes == 4 * 4096 - (112 + 208 + 64));
+    CHECK(st.free_bytes == 4 * PM_TEST_SEG_BYTES - (112 + 208 + 64));
 
     // Same-size alloc right after a free reuses the slot (LIFO free list),
     // with a bumped generation.
@@ -198,7 +208,7 @@ static void test_basic_alloc_free() {
     st = pm::get_stats(pool);
     CHECK(st.object_count == 0);
     CHECK(st.used_bytes == 0);
-    CHECK(st.largest_free_block == 4 * 4096);
+    CHECK(st.largest_free_block == 4 * PM_TEST_SEG_BYTES);
     VALIDATE(pool);
     done();
 }
@@ -581,14 +591,20 @@ static void test_pool_merge() {
 static void test_pool_split() {
     printf("  [9] pool split\n");
     fresh();
+    // All block sizes below are derived from the fixture segment size so the
+    // scenarios hold at every geometry: one block == one segment for the 4/4
+    // split, and the straddle cases place their blocks relative to the
+    // segment boundary the split cuts at (2 segments).
+    const uint32_t SEG = PM_TEST_SEG_BYTES;
     pm::PoolId s{};
     CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
 
-    // 8 x 3584B movables pack 4 below / 4 above the 4-segment boundary.
+    // 8 x (SEG-8)B movables: each block is exactly one segment, so the split
+    // packs 4 below / 4 above the 4-segment boundary at every geometry.
     pm::RawRef objs[8];
     for (uint32_t i = 0; i < 8; ++i) {
-        CHECK_ST(pm::alloc(s, 3584, 8, 0, i, objs[i]), pm::Status::Ok);
-        fill(objs[i], 3584, 700 + i);
+        CHECK_ST(pm::alloc(s, SEG - 8, 8, 0, i, objs[i]), pm::Status::Ok);
+        fill(objs[i], SEG - 8, 700 + i);
     }
     pm::PoolId n{};
     CHECK_ST(pm::split(s, 4, n), pm::Status::Ok);
@@ -606,10 +622,10 @@ static void test_pool_split() {
         pm::RawRef cross = objs[i];
         cross.pool_hint = pm::CROSS_HINT;
         void* p = nullptr;
-        CHECK_ST(pm::borrow_begin(cross, 3584, 1, p), pm::Status::Ok);
+        CHECK_ST(pm::borrow_begin(cross, SEG - 8, 1, p), pm::Status::Ok);
         pm::borrow_end(cross);
-        verify(cross, 3584, 700 + i);
-        pm::Status ls = pm::borrow_begin(objs[i], 3584, 1, p);
+        verify(cross, SEG - 8, 700 + i);
+        pm::Status ls = pm::borrow_begin(objs[i], SEG - 8, 1, p);
         if (moved_pool) {
             CHECK(ls == pm::Status::PoolChanged); // local ref: object changed pool
         } else {
@@ -628,26 +644,28 @@ static void test_pool_split() {
     CHECK_ST(pm::destroy_pool(n), pm::Status::Ok);
 
     // A pinned object straddling the segment boundary refuses the split; the
-    // source pool stays intact and running.
+    // source pool stays intact and running. Layout: big's block is [0, SEG),
+    // the pinned block starts at SEG and ends at 2*SEG+8 -- across the
+    // 2-segment boundary a split at 4 would cut at.
     pm::PoolId t{};
     CHECK_ST(pm::create_pool(t, 4), pm::Status::Ok);
     pm::RawRef big{}, pin{};
-    CHECK_ST(pm::alloc(t, 8000, 8, 0, 1, big), pm::Status::Ok);
-    fill(big, 8000, 4242);
-    CHECK_ST(pm::alloc(t, 1024, 8, pm::PM_PINNED, 2, pin), pm::Status::Ok); // spans 8 KiB
+    CHECK_ST(pm::alloc(t, SEG - 8, 8, 0, 1, big), pm::Status::Ok);
+    fill(big, SEG - 8, 4242);
+    CHECK_ST(pm::alloc(t, SEG, 8, pm::PM_PINNED, 2, pin), pm::Status::Ok); // block [SEG, 2*SEG+8)
     pm::PoolId nx{};
     CHECK_ST(pm::split(t, 2, nx), pm::Status::PinnedConflict);
     CHECK_ST(pm::validate(t), pm::Status::Ok); // untouched and still Running
     CHECK_ST(pm::resume(t), pm::Status::Ok);   // no-op when Running
-    verify(big, 8000, 4242);
+    verify(big, SEG - 8, 4242);
     CHECK_ST(pm::free(big), pm::Status::Ok);
     CHECK_ST(pm::free(pin), pm::Status::Ok);
     VALIDATE(t);
 
-    // A movable straddling the boundary with no room above is NoSpace
-    // (crossing block 12008B > upper capacity 8192B).
-    CHECK_ST(pm::alloc(t, 3000, 8, 0, 3, big), pm::Status::Ok);
-    CHECK_ST(pm::alloc(t, 12000, 8, 0, 4, pin), pm::Status::Ok); // spans 8 KiB, movable
+    // A movable straddling the boundary with no room above is NoSpace: its
+    // block (2*SEG+8 B) is larger than the upper side's whole capacity (2*SEG).
+    CHECK_ST(pm::alloc(t, SEG - 8, 8, 0, 3, big), pm::Status::Ok);
+    CHECK_ST(pm::alloc(t, 2 * SEG, 8, 0, 4, pin), pm::Status::Ok); // block [SEG, 3*SEG+8), crosses
     CHECK_ST(pm::split(t, 2, nx), pm::Status::NoSpace);
     CHECK_ST(pm::validate(t), pm::Status::Ok);
     CHECK_ST(pm::free(big), pm::Status::Ok);
@@ -673,23 +691,30 @@ static void test_exhaustion() {
     pm::PoolId extra{};
     CHECK_ST(pm::create_pool(extra, 1), pm::Status::NoSpace);
 
-    // Pool capacity exhaustion + reuse after free (pool = 16 KiB).
+    // Pool capacity exhaustion + reuse after free (each pool = 4 segments).
+    // The probe payload is derived so exactly 15 blocks fit 4 segments at any
+    // geometry. Block sizes round up to 8 (PM_ALIGNMENT): with B the rounded
+    // block size, 15*B <= 4*SEG < 16*B must hold, so B lands in (SEG/4, 4*SEG/15].
+    const uint32_t PB =
+        ((4 * PM_TEST_SEG_BYTES / 15) & ~(uint32_t)7u) - 8;
     pm::RawRef refs[16];
     uint32_t kept = 0;
     for (uint32_t i = 0; i < 16; ++i) {
-        if (pm::alloc(pools[0], 1024, 8, 0, i, refs[kept]) == pm::Status::Ok) ++kept;
+        if (pm::alloc(pools[0], PB, 8, 0, i, refs[kept]) == pm::Status::Ok) ++kept;
     }
-    CHECK(kept == 15); // 16384 / 1032B blocks
+    CHECK(kept == 15); // 15*(PB+8) <= 4*SEG < 16*(PB+8)
     pm::RawRef r2{};
     pm::RawRef probe{};
     // The NoSpace probes get their own output slot: since the round-5 fix a
     // failed alloc clears its out reference (R30), so probing into `r2`
     // would wipe the successful allocation it still has to release below.
-    CHECK_ST(pm::alloc(pools[0], 1024, 8, 0, 99, probe), pm::Status::NoSpace);
+    CHECK_ST(pm::alloc(pools[0], PB, 8, 0, 99, probe), pm::Status::NoSpace);
     CHECK(probe.generation == 0);
     CHECK_ST(pm::free(refs[3]), pm::Status::Ok);
-    CHECK_ST(pm::alloc(pools[0], 1024, 8, 0, 98, r2), pm::Status::Ok);
-    CHECK_ST(pm::alloc(pools[0], 4096, 8, 0, 97, probe), pm::Status::NoSpace);
+    CHECK_ST(pm::alloc(pools[0], PB, 8, 0, 98, r2), pm::Status::Ok);
+    // A request one block larger than the freed slot's block can never fit
+    // the coalesced-with-neighbours hole (its neighbours are live).
+    CHECK_ST(pm::alloc(pools[0], PB + 16, 8, 0, 97, probe), pm::Status::NoSpace);
     CHECK(probe.generation == 0);
     VALIDATE(pools[0]);
 
@@ -744,10 +769,13 @@ static void test_size_alignment_edges() {
     CHECK_ST(pm::alloc(pool, 10, 8, 0, 1, r), pm::Status::Ok);
     CHECK_ST(pm::free(r), pm::Status::Ok);
 
-    // Max object in the pool; one block too much fails.
-    CHECK_ST(pm::alloc(pool, 16384 - 256, 8, 0, 2, r), pm::Status::Ok);
+    // Max object in the pool (4 segments minus one header, 8-aligned); one
+    // block too much fails.
+    CHECK_ST(pm::alloc(pool, 4 * PM_TEST_SEG_BYTES - 256, 8, 0, 2, r),
+             pm::Status::Ok);
     CHECK_ST(pm::free(r), pm::Status::Ok);
-    CHECK_ST(pm::alloc(pool, 16384, 8, 0, 2, r), pm::Status::NoSpace);
+    CHECK_ST(pm::alloc(pool, 4 * PM_TEST_SEG_BYTES, 8, 0, 2, r),
+             pm::Status::NoSpace);
     VALIDATE(pool);
     done();
 }
@@ -907,7 +935,9 @@ static void test_slot_rollback_after_failed_allocs() {
     printf("  [R1] failed allocs do not leak descriptor slots\n");
     fresh();
     pm::PoolId pool{};
-    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    // Room for PM_MAX_OBJECTS minimal blocks at this fixture's geometry.
+    CHECK_ST(pm::create_pool(pool, PM_MAX_OBJECTS * 16 / PM_TEST_SEG_BYTES),
+             pm::Status::Ok);
     // Valid requests the pool cannot serve: each one used to consume a slot.
     for (uint32_t i = 0; i < 1500; ++i) {
         pm::RawRef r{};
@@ -957,7 +987,8 @@ static void test_tlsf_same_bin_first_fit() {
     CHECK_ST(pm::alloc(pool, 252, 8, 0, 1, a), pm::Status::Ok);  // block 260
     CHECK_ST(pm::alloc(pool, 24, 8, 0, 2, x), pm::Status::Ok);   // block 32
     CHECK_ST(pm::alloc(pool, 282, 8, 0, 3, b), pm::Status::Ok);  // block 290
-    CHECK_ST(pm::alloc(pool, 6000, 8, 0, 4, y), pm::Status::Ok); // block 6008
+    CHECK_ST(pm::alloc(pool, 1024, 8, 0, 4, y), pm::Status::Ok); // block 1032:
+                                                                 // a far higher bin
     // Free b first, then a: both blocks land in bin (fl=8, sl=0), with the
     // SMALLER block at the list head.
     CHECK_ST(pm::free(b), pm::Status::Ok);
@@ -972,7 +1003,7 @@ static void test_tlsf_same_bin_first_fit() {
     CHECK_ST(pm::free(x), pm::Status::Ok);
     CHECK_ST(pm::free(y), pm::Status::Ok);
     pm::PoolStats st = pm::get_stats(pool);
-    CHECK(st.largest_free_block == 2 * 4096);
+    CHECK(st.largest_free_block == 2 * PM_TEST_SEG_BYTES);
     VALIDATE(pool);
     done();
 }
@@ -1359,18 +1390,19 @@ static void test_quiescent_window_contract() {
 static void test_split_layout_details() {
     printf("  [R11] split layout: pinned stay, sides repartition\n");
     fresh();
+    const uint32_t MB = PM_TEST_SEG_BYTES - 128; // 8 movables + 2 pins fit 8 segs
     pm::PoolId s{};
     CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
     pm::RawRef pin_low{}, m[8]{}, pin_high{};
     CHECK_ST(pm::alloc(s, 64, 8, pm::PM_PINNED, 1, pin_low), pm::Status::Ok);
     for (uint32_t i = 0; i < 4; ++i) { // lower group
-        CHECK_ST(pm::alloc(s, 3584, 8, 0, 10 + i, m[i]), pm::Status::Ok);
-        fill(m[i], 3584, 60 + i);
+        CHECK_ST(pm::alloc(s, MB, 8, 0, 10 + i, m[i]), pm::Status::Ok);
+        fill(m[i], MB, 60 + i);
     }
     CHECK_ST(pm::alloc(s, 128, 8, pm::PM_PINNED, 2, pin_high), pm::Status::Ok);
     for (uint32_t i = 4; i < 8; ++i) { // upper group
-        CHECK_ST(pm::alloc(s, 3584, 8, 0, 10 + i, m[i]), pm::Status::Ok);
-        fill(m[i], 3584, 60 + i);
+        CHECK_ST(pm::alloc(s, MB, 8, 0, 10 + i, m[i]), pm::Status::Ok);
+        fill(m[i], MB, 60 + i);
     }
     fill(pin_low, 64, 91);
     fill(pin_high, 128, 92);
@@ -1395,9 +1427,9 @@ static void test_split_layout_details() {
         pm::RawRef cross = m[i];
         cross.pool_hint = pm::CROSS_HINT;
         void* p = nullptr;
-        CHECK_ST(pm::borrow_begin(cross, 3584, 1, p), pm::Status::Ok);
+        CHECK_ST(pm::borrow_begin(cross, MB, 1, p), pm::Status::Ok);
         pm::borrow_end(cross);
-        verify(cross, 3584, 60 + i);
+        verify(cross, MB, 60 + i);
         bool in_new = desc_pool(m[i]) == n;
         if (in_new) {
             pm::RawRef c2 = m[i]; c2.pool_hint = pm::CROSS_HINT;
@@ -1501,21 +1533,22 @@ static void test_split_crossing_order() {
     pm::PoolId s{};
     CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
 
-    // Layout (pool = 32 KiB, boundary = 16 KiB):
-    //   L [0,16376) fills the lower region
-    //   C [16376,16484) crosses the boundary (x=8 below, y=92 above)
-    //   h [16484,16508) small block, freed to make a 24B upper hole
-    //   u1 [16508,20092)  u2 [20092,23676)
+    // Layout (pool = 8 segments, boundary = 4 segments): L fills the lower
+    // region minus one header, C crosses the boundary, h is a freed 24 B
+    // upper hole, u1/u2 are upper movables sized to repack above the boundary.
+    const uint32_t SEG = PM_TEST_SEG_BYTES;
+    const uint32_t LP = 4 * SEG - 16;         // L payload: block ends at 4*SEG-8
+    const uint32_t UP = 2 * SEG - 72;         // u1/u2 payload
     pm::RawRef L{}, C{}, h{}, u1{}, u2{};
-    CHECK_ST(pm::alloc(s, 16368, 8, 0, 1, L), pm::Status::Ok);
-    fill(L, 16368, 1);
+    CHECK_ST(pm::alloc(s, LP, 8, 0, 1, L), pm::Status::Ok);
+    fill(L, LP, 1);
     CHECK_ST(pm::alloc(s, 100, 8, 0, 2, C), pm::Status::Ok);
     fill(C, 100, 2);
     CHECK_ST(pm::alloc(s, 16, 8, 0, 3, h), pm::Status::Ok);
-    CHECK_ST(pm::alloc(s, 3584, 8, 0, 4, u1), pm::Status::Ok);
-    fill(u1, 3584, 4);
-    CHECK_ST(pm::alloc(s, 3584, 8, 0, 5, u2), pm::Status::Ok);
-    fill(u2, 3584, 5);
+    CHECK_ST(pm::alloc(s, UP, 8, 0, 4, u1), pm::Status::Ok);
+    fill(u1, UP, 4);
+    CHECK_ST(pm::alloc(s, UP, 8, 0, 5, u2), pm::Status::Ok);
+    fill(u2, UP, 5);
     CHECK_ST(pm::free(h), pm::Status::Ok); // 24B hole between C and u1
     VALIDATE(s);
 
@@ -1531,10 +1564,10 @@ static void test_split_crossing_order() {
         cross.pool_hint = pm::CROSS_HINT;
         verify(cross, sz, seed);
     };
-    vfy(L, 16368, 1);
+    vfy(L, LP, 1);
     vfy(C, 100, 2);
-    vfy(u1, 3584, 4);
-    vfy(u2, 3584, 5);
+    vfy(u1, UP, 4);
+    vfy(u2, UP, 5);
     CHECK(desc_pool(L) == s);
     CHECK(desc_pool(C) == n); // crossing object adopted the new pool
     CHECK(desc_pool(u1) == n);
@@ -1574,13 +1607,16 @@ static void test_init_lifecycle() {
 
     // Uninitialized: every invalid config must be refused and must leave no
     // half-initialized state behind (the following valid init succeeds).
-    pm::Config bad1{g_zone, sizeof(g_zone), 1024}; // 256 segments > PM_MAX_SEGMENTS
+    // Zone size claiming one segment beyond PM_MAX_SEGMENTS: refused without
+    // touching the (shorter) real buffer -- a pure refusal probe.
+    pm::Config bad1{g_zone, (PM_MAX_SEGMENTS + 1u) * PM_TEST_SEG_BYTES,
+                    PM_TEST_SEG_BYTES};
     CHECK_ST(pm::init(bad1), pm::Status::NoSpace);
     CHECK_ST(pm::init(pm::Config{nullptr, 4096, 4096}), pm::Status::InvalidAlignment);
-    CHECK_ST(pm::init(pm::Config{g_zone, 512, 4096}), pm::Status::InvalidAlignment);
+    CHECK_ST(pm::init(pm::Config{g_zone, 512, PM_TEST_SEG_BYTES}), pm::Status::InvalidAlignment);
     CHECK_ST(pm::init(pm::Config{g_zone, sizeof(g_zone), 6144}), pm::Status::InvalidAlignment); // not a power of two
-    CHECK_ST(pm::init(pm::Config{g_zone, 2048, 4096}), pm::Status::InvalidAlignment);
-    pm::Config cfg{g_zone, sizeof(g_zone), 4096};
+    CHECK_ST(pm::init(pm::Config{g_zone, 512, PM_TEST_SEG_BYTES}), pm::Status::InvalidAlignment); // zone < segment
+    pm::Config cfg{g_zone, sizeof(g_zone), PM_TEST_SEG_BYTES};
     CHECK_ST(pm::init(cfg), pm::Status::Ok); // state was never touched above
 
     // Initialized with a live object: any re-init is refused, state intact.
@@ -1596,7 +1632,8 @@ static void test_init_lifecycle() {
         CHECK(*acc.value == 0x1234); // object untouched
     }
     VALIDATE(pool);
-    CHECK_ST(pm::init(pm::Config{g_zone, sizeof(g_zone), 1024}), pm::Status::Busy);
+    CHECK_ST(pm::init(pm::Config{g_zone, sizeof(g_zone), PM_TEST_SEG_BYTES / 2}),
+             pm::Status::Busy); // re-init, geometry now irrelevant
 
     // Clean shutdown + fresh start: brand-new generations, zeroed stats.
     CHECK_ST(pm::pm_destroy(made.value), pm::Status::Ok);
@@ -1632,16 +1669,18 @@ static void test_split_boundary_geometries() {
     {
         fresh();
         pm::PoolId s{};
-        CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok); // 32 KiB, boundary 16 KiB
+        CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok); // boundary at 4 segments
+        const uint32_t LP = 4 * PM_TEST_SEG_BYTES - 16;  // block ends 8 before it
+        const uint32_t UP = 2 * PM_TEST_SEG_BYTES - 72;  // two blocks + X fit above
         pm::RawRef L{}, X{}, u1{}, u2{};
-        CHECK_ST(pm::alloc(s, 16368, 8, 0, 1, L), pm::Status::Ok);  // [0,16376)
-        CHECK_ST(pm::alloc(s, 16, 8, 0, 2, X), pm::Status::Ok);     // [16376,16400)
-        CHECK_ST(pm::alloc(s, 3584, 8, 0, 3, u1), pm::Status::Ok);  // [16400,19992)
-        CHECK_ST(pm::alloc(s, 3584, 8, 0, 4, u2), pm::Status::Ok);  // [19992,23584)
-        fill(L, 16368, 11);
+        CHECK_ST(pm::alloc(s, LP, 8, 0, 1, L), pm::Status::Ok);  // crosses? no: ends 8 early
+        CHECK_ST(pm::alloc(s, 16, 8, 0, 2, X), pm::Status::Ok);  // [4*SEG-8, 4*SEG+16) crosses
+        CHECK_ST(pm::alloc(s, UP, 8, 0, 3, u1), pm::Status::Ok);
+        CHECK_ST(pm::alloc(s, UP, 8, 0, 4, u2), pm::Status::Ok);
+        fill(L, LP, 11);
         fill(X, 16, 22);
-        fill(u1, 3584, 33);
-        fill(u2, 3584, 44);
+        fill(u1, UP, 33);
+        fill(u2, UP, 44);
         VALIDATE(s);
 
         pm::PoolId n{};
@@ -1653,16 +1692,17 @@ static void test_split_boundary_geometries() {
         pm::RawRef cX = X; cX.pool_hint = pm::CROSS_HINT;
         pm::RawRef c1 = u1; c1.pool_hint = pm::CROSS_HINT;
         pm::RawRef c2 = u2; c2.pool_hint = pm::CROSS_HINT;
-        verify(cL, 16368, 11);
+        verify(cL, LP, 11);
         verify(cX, 16, 22);
-        verify(c1, 3584, 33);
-        verify(c2, 3584, 44);
+        verify(c1, UP, 33);
+        verify(c2, UP, 44);
         CHECK(desc_pool(L) == s);
         CHECK(desc_pool(X) == n && desc_pool(u1) == n && desc_pool(u2) == n);
         // Packed from the boundary in address order, with no holes.
-        CHECK(desc_block_start_off(X) == 16384);
-        CHECK(desc_block_start_off(u1) == 16384 + 24);
-        CHECK(desc_block_start_off(u2) == 16384 + 24 + 3592);
+        const uint32_t B = 4 * PM_TEST_SEG_BYTES;
+        CHECK(desc_block_start_off(X) == B);
+        CHECK(desc_block_start_off(u1) == B + 24);
+        CHECK(desc_block_start_off(u2) == B + 24 + (UP + 8));
         CHECK_ST(pm::free(cL), pm::Status::Ok);
         CHECK_ST(pm::free(cX), pm::Status::Ok);
         CHECK_ST(pm::free(c1), pm::Status::Ok);
@@ -1677,14 +1717,17 @@ static void test_split_boundary_geometries() {
         fresh();
         pm::PoolId s{};
         CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
+        const uint32_t TP = 2 * PM_TEST_SEG_BYTES - 8; // block = 2 segments
         pm::RawRef o[4];
         uint64_t off0[4];
         for (uint32_t i = 0; i < 4; ++i) {
-            CHECK_ST(pm::alloc(s, 8184, 8, 0, i, o[i]), pm::Status::Ok); // block 8192
-            fill(o[i], 8184, 100 + i);
+            CHECK_ST(pm::alloc(s, TP, 8, 0, i, o[i]), pm::Status::Ok);
+            fill(o[i], TP, 100 + i);
             off0[i] = desc_block_start_off(o[i]);
         }
-        CHECK(off0[0] == 0 && off0[1] == 8192 && off0[2] == 16384 && off0[3] == 24576);
+        CHECK(off0[0] == 0 && off0[1] == 2 * PM_TEST_SEG_BYTES &&
+              off0[2] == 4 * PM_TEST_SEG_BYTES &&
+              off0[3] == 6 * PM_TEST_SEG_BYTES);
         VALIDATE(s);
 
         pm::PoolId n{};
@@ -1693,7 +1736,7 @@ static void test_split_boundary_geometries() {
         VALIDATE(n);
         for (uint32_t i = 0; i < 4; ++i) {
             pm::RawRef c = o[i]; c.pool_hint = pm::CROSS_HINT;
-            verify(c, 8184, 100 + i);
+            verify(c, TP, 100 + i);
             CHECK(desc_block_start_off(o[i]) == off0[i]); // already packed
         }
         CHECK(desc_pool(o[0]) == s && desc_pool(o[1]) == s);
@@ -1715,11 +1758,12 @@ static void test_split_boundary_geometries() {
         fresh();
         pm::PoolId s{};
         CHECK_ST(pm::create_pool(s, 8), pm::Status::Ok);
+        const uint32_t LP = 4 * PM_TEST_SEG_BYTES - 16; // block 4*SEG-8
         pm::RawRef L{}, X{};
-        CHECK_ST(pm::alloc(s, 16368, 8, 0, 1, L), pm::Status::Ok); // [0,16376)
-        CHECK_ST(pm::alloc(s, 16368, 8, 0, 2, X), pm::Status::Ok); // [16376,32752)
-        fill(L, 16368, 55);
-        fill(X, 16368, 66);
+        CHECK_ST(pm::alloc(s, LP, 8, 0, 1, L), pm::Status::Ok);
+        CHECK_ST(pm::alloc(s, LP, 8, 0, 2, X), pm::Status::Ok);
+        fill(L, LP, 55);
+        fill(X, LP, 66);
         VALIDATE(s);
 
         pm::PoolId n{};
@@ -1728,10 +1772,10 @@ static void test_split_boundary_geometries() {
         VALIDATE(n);
         pm::RawRef cL = L; cL.pool_hint = pm::CROSS_HINT;
         pm::RawRef cX = X; cX.pool_hint = pm::CROSS_HINT;
-        verify(cL, 16368, 55);
-        verify(cX, 16368, 66);
+        verify(cL, LP, 55);
+        verify(cX, LP, 66);
         CHECK(desc_pool(X) == n);
-        CHECK(desc_block_start_off(X) == 16384); // moved right by one header
+        CHECK(desc_block_start_off(X) == 4 * PM_TEST_SEG_BYTES); // moved right by one header
         // 8 B of tail slack in each pool; validate() must accept both.
         pm::PoolStats ss = pm::get_stats(s), sn = pm::get_stats(n);
         CHECK(ss.fragment_bytes == 8 && ss.free_bytes == 8);
@@ -2711,7 +2755,7 @@ static void test_free_physical_header_faults() {
     CHECK(g_destroy_calls == dc + 1);
     CHECK_ST(pm::free(pad2), pm::Status::Ok);
     pm::PoolStats st = pm::get_stats(pool);
-    CHECK(st.largest_free_block == 1 * 4096); // everything coalesced back
+    CHECK(st.largest_free_block == PM_TEST_SEG_BYTES); // everything coalesced back
     VALIDATE(pool);
     CHECK_ST(pm::destroy_pool(pool), pm::Status::Ok);
     done();
@@ -2988,7 +3032,10 @@ static void test_state_publication() {
         pm::PoolId s{};
         CHECK_ST(pm::create_pool(s, 4), pm::Status::Ok);
         pm::RawRef big{}, pin{};
-        CHECK_ST(pm::alloc(s, 8000, 8, 0, 1, big), pm::Status::Ok);
+        // big's block ends 8 before the 2-segment boundary, so the pinned
+        // block (1,032 B) straddles it and every split at 2 refuses.
+        CHECK_ST(pm::alloc(s, 2 * PM_TEST_SEG_BYTES - 16, 8, 0, 1, big),
+                 pm::Status::Ok);
         CHECK_ST(pm::alloc(s, 1024, 8, pm::PM_PINNED, 2, pin), pm::Status::Ok);
         uint32_t live_pools = 0;
         for (uint32_t i = 0; i < 16; ++i)
@@ -3210,9 +3257,10 @@ static void test_round4_fault_matrix() {
         fresh();
         pm::PoolId pool{};
         CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        const uint32_t LOHI = 2 * PM_TEST_SEG_BYTES - 48; // two blocks + r fit
         pm::RawRef lo{}, hi{};
-        CHECK_ST(pm::alloc(pool, 3584, 8, 0, 1, lo), pm::Status::Ok);
-        CHECK_ST(pm::alloc(pool, 3584, 8, 0, 2, hi), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, LOHI, 8, 0, 1, lo), pm::Status::Ok);
+        CHECK_ST(pm::alloc(pool, LOHI, 8, 0, 2, hi), pm::Status::Ok);
         using namespace pm::internal;
         uint32_t const saved_next = g().objects[lo.index].addr_next;
         g().objects[lo.index].addr_next = lo.index; // self-cycle
@@ -3315,6 +3363,11 @@ static void test_compaction_advice() {
     printf("  [R31] compaction advice: read-only, verdicts, thresholds\n");
 
     using Verdict = pm::CompactionVerdict;
+    // Scenario (3) request sizes, derived from the fixture geometry: REQ
+    // overshoots one hole (SEG/2) but fits the two holes combined (SEG); BIG
+    // exceeds every reachable free byte.
+    const uint32_t SEG3_REQ = PM_TEST_SEG_BYTES - 32;
+    const uint32_t SEG3_BIG = PM_TEST_SEG_BYTES + 64;
     pm::CompactionThresholds const def = pm::get_compaction_thresholds();
     CHECK(def.fragment_ratio_permille == 100 && def.fragment_min_bytes == 512);
 
@@ -3323,10 +3376,11 @@ static void test_compaction_advice() {
         fresh();
         pm::PoolId pool{};
         CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        const uint32_t OP1 = 4 * PM_TEST_SEG_BYTES / 5 - 32; // 5 fit 4 segs
         pm::RawRef o[5];
         for (uint32_t i = 0; i < 5; ++i) {
-            CHECK_ST(pm::alloc(pool, 1000, 8, 0, i, o[i]), pm::Status::Ok);
-            fill(o[i], 1000, 500 + i);
+            CHECK_ST(pm::alloc(pool, OP1, 8, 0, i, o[i]), pm::Status::Ok);
+            fill(o[i], OP1, 500 + i);
         }
         CHECK_ST(pm::free(o[1]), pm::Status::Ok);
         CHECK_ST(pm::free(o[3]), pm::Status::Ok);
@@ -3334,14 +3388,17 @@ static void test_compaction_advice() {
 
         pm::RawRef const refs[5] = {o[0], o[2], o[4], o[1], o[3]};
         using namespace pm::internal;
-        snap_all(pool, pool, refs, 5, seg_base(g().pools[pool].segment_first), 4 * 4096);
+        snap_all(pool, pool, refs, 5, seg_base(g().pools[pool].segment_first),
+                 4 * PM_TEST_SEG_BYTES);
         pm::CompactionRequest req{600, 8, 0, 42};
         pm::CompactionAdvice a1 = pm::analyze_compaction(pool);
         pm::CompactionAdvice a2 = pm::analyze_compaction(pool, &req);
         bool changed = true;
         pm::CompactionAdvice a3 = pm::poll_compaction_advice(pool, &req, &changed);
         (void)a1; (void)a2; (void)a3;
-        check_all_unchanged(pool, pool, refs, 5, seg_base(g().pools[pool].segment_first), 4 * 4096);
+        check_all_unchanged(pool, pool, refs, 5,
+                            seg_base(g().pools[pool].segment_first),
+                            4 * PM_TEST_SEG_BYTES);
         CHECK_ST(pm::validate(pool), pm::Status::Ok);
         CHECK_ST(pm::free(o[0]), pm::Status::Ok);
         CHECK_ST(pm::free(o[2]), pm::Status::Ok);
@@ -3353,16 +3410,19 @@ static void test_compaction_advice() {
     {
         fresh();
         pm::PoolId pool{};
-        CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok); // 16 KiB
-        // Four 3000 B objects + a filler that consumes the tail, so the only
-        // free space after the frees below is the two 3008 B holes.
+        CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        // Four SEG/2 B objects (holes of SEG/2 = 125 permille of capacity,
+        // above the 100 permille default) + a filler that consumes the tail,
+        // so the only free space after the frees below is the two holes.
+        const uint32_t OP2 = PM_TEST_SEG_BYTES / 2 - 8;
         pm::RawRef o[4], filler{};
         for (uint32_t i = 0; i < 4; ++i) {
-            CHECK_ST(pm::alloc(pool, 3000, 8, 0, i, o[i]), pm::Status::Ok);
-            fill(o[i], 3000, 500 + i);
+            CHECK_ST(pm::alloc(pool, OP2, 8, 0, i, o[i]), pm::Status::Ok);
+            fill(o[i], OP2, 500 + i);
         }
-        uint32_t const used = 4 * 3008;
-        CHECK_ST(pm::alloc(pool, 4 * 4096 - used - 16, 8, 0, 9, filler),
+        uint32_t const used = 4 * (OP2 + 8);
+        CHECK_ST(pm::alloc(pool, 4 * PM_TEST_SEG_BYTES - used - 16, 8, 0, 9,
+                           filler),
                  pm::Status::Ok);
         // (a) packed pool: no free space at all -> NO_ACTION, and the
         //     trivially exact move estimate is 0.
@@ -3370,7 +3430,7 @@ static void test_compaction_advice() {
         CHECK(a.verdict == Verdict::NO_ACTION);
         CHECK(a.estimated_moved_objects == 0 && a.estimated_moved_bytes == 0);
         CHECK(a.caller_must_establish_quiescence == 0);
-        CHECK(a.capacity == 4 * 4096 && a.live_objects == 5);
+        CHECK(a.capacity == 4 * PM_TEST_SEG_BYTES && a.live_objects == 5);
         CHECK(a.stats_valid == 1 && a.has_pinned_objects == 0);
 
         // (b) two 3008 B holes: stranded 3008 B = 183 permille >= defaults
@@ -3383,12 +3443,16 @@ static void test_compaction_advice() {
         // Round-9: the estimate is now EXACT (the packing simulation uses
         // compact's own cursor/barrier rules): o[2] and the filler relocate.
         CHECK(a.estimated_moved_objects == 2);
-        CHECK(a.estimated_moved_bytes == 3008 + 4352);
-        CHECK(a.free_bytes == 2 * 3008 && a.largest_free_block == 3008);
+        // Estimate convention (verified at both geometries): the sum of the
+        // moved blocks' sizes plus one header -- the simulated cursor walks
+        // the hole the first mover fills with its payload-only image.
+        CHECK(a.estimated_moved_bytes == 4 * PM_TEST_SEG_BYTES - 3 * (OP2 + 8));
+        CHECK(a.free_bytes == 2 * OP2 + 16 &&
+              a.largest_free_block == OP2 + 8);
 
         // (c) active borrow -> BLOCKED (advice never hides the blocker).
         void* p = nullptr;
-        CHECK_ST(pm::borrow_begin(o[0], 3000, 1, p), pm::Status::Ok);
+        CHECK_ST(pm::borrow_begin(o[0], OP2, 1, p), pm::Status::Ok);
         a = pm::analyze_compaction(pool);
         CHECK(a.verdict == Verdict::COMPACT_BLOCKED);
         CHECK(a.borrow_count == 1);
@@ -3404,12 +3468,13 @@ static void test_compaction_advice() {
             g().pools[pool].state = saved;
         }
 
-        // (e) request that fits a 3008 B hole right now -> NO_ACTION.
-        pm::CompactionRequest req{600, 8, 0, 7};
+        // (e) request that fits a SEG/2 hole right now -> NO_ACTION.
+        pm::CompactionRequest req{OP2 - 24, 8, 0, 7};
         a = pm::analyze_compaction(pool, &req);
         CHECK(a.verdict == Verdict::NO_ACTION);
         CHECK(a.request_can_fit_now == 1);
-        CHECK(a.expected_request_size == 600 && a.expected_request_alignment == 8);
+        CHECK(a.expected_request_size == OP2 - 24 &&
+              a.expected_request_alignment == 8);
 
         CHECK_ST(pm::free(o[0]), pm::Status::Ok);
         CHECK_ST(pm::free(o[2]), pm::Status::Ok);
@@ -3422,25 +3487,27 @@ static void test_compaction_advice() {
         fresh();
         pm::PoolId pool{};
         CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        const uint32_t OP3 = PM_TEST_SEG_BYTES / 2 - 8;
         pm::RawRef o[4], filler{};
         for (uint32_t i = 0; i < 4; ++i) {
-            CHECK_ST(pm::alloc(pool, 3000, 8, 0, i, o[i]), pm::Status::Ok);
+            CHECK_ST(pm::alloc(pool, OP3, 8, 0, i, o[i]), pm::Status::Ok);
         }
-        CHECK_ST(pm::alloc(pool, 4 * 4096 - 4 * 3008 - 16, 8, 0, 9, filler),
+        CHECK_ST(pm::alloc(pool, 4 * PM_TEST_SEG_BYTES - 4 * (OP3 + 8) - 16,
+                           8, 0, 9, filler),
                  pm::Status::Ok);
         CHECK_ST(pm::free(o[1]), pm::Status::Ok);
         CHECK_ST(pm::free(o[3]), pm::Status::Ok);
-        // 4000 B request: does not fit a 3008 B hole, but the stranded
-        // 6016 B would cover it after compaction -> RECOMMENDED.
-        pm::CompactionRequest req{4000, 8, 0, 8};
+        // A request bigger than one hole (SEG/2) but smaller than the two
+        // stranded holes combined (SEG) fits after compaction -> RECOMMENDED.
+        pm::CompactionRequest req{SEG3_REQ, 8, 0, 8};
         pm::CompactionAdvice a = pm::analyze_compaction(pool, &req);
         CHECK(a.verdict == Verdict::COMPACT_RECOMMENDED);
         CHECK(a.request_can_fit_now == 0);
         CHECK(a.request_can_fit_after_compaction_estimate == 1);
         CHECK(a.caller_must_establish_quiescence == 1);
-        // 15000 B request: free_bytes ~ 6016 -- can never fit ->
+        // A request above the total free bytes can never fit ->
         // UNLIKELY_TO_HELP (no fake optimism).
-        pm::CompactionRequest big{15000, 8, 0, 9};
+        pm::CompactionRequest big{SEG3_BIG, 8, 0, 9};
         a = pm::analyze_compaction(pool, &big);
         CHECK(a.verdict == Verdict::COMPACT_UNLIKELY_TO_HELP);
         CHECK(a.request_can_fit_after_compaction_estimate == 0);
@@ -3501,14 +3568,15 @@ static void test_compaction_advice() {
         fresh();
         pm::PoolId pool{};
         CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+        const uint32_t OP6 = 4 * PM_TEST_SEG_BYTES / 5 - 32; // 5 fit 4 segs
         pm::RawRef o[5];
         for (uint32_t i = 0; i < 5; ++i) {
-            CHECK_ST(pm::alloc(pool, 1000, 8, 0, i, o[i]), pm::Status::Ok);
+            CHECK_ST(pm::alloc(pool, OP6, 8, 0, i, o[i]), pm::Status::Ok);
         }
         CHECK_ST(pm::free(o[1]), pm::Status::Ok);
         CHECK_ST(pm::free(o[3]), pm::Status::Ok);
-        // State: two 1008 B holes + the 11344 B tail; stranded 2016 B
-        // (123 permille) -> above the default thresholds.
+        // State: two (OP6+8) B holes + the tail; the stranded bytes sit above
+        // the default thresholds (100 permille / 512 B).
 
         // (a) suppression: the first poll after init always reports (the
         //     advice cache starts empty); an unchanged state is suppressed.
@@ -3540,7 +3608,7 @@ static void test_compaction_advice() {
         // Re-fragment: refill the packed area and free alternating objects.
         pm::RawRef n[5];
         for (uint32_t i = 0; i < 5; ++i) {
-            CHECK_ST(pm::alloc(pool, 1000, 8, 0, 20 + i, n[i]), pm::Status::Ok);
+            CHECK_ST(pm::alloc(pool, OP6, 8, 0, 20 + i, n[i]), pm::Status::Ok);
         }
         CHECK_ST(pm::free(n[1]), pm::Status::Ok);
         CHECK_ST(pm::free(n[3]), pm::Status::Ok);
@@ -3797,16 +3865,17 @@ static void test_advice_estimate_and_counters() {
     //     at the pool START, so every remaining object must relocate.
     fresh();
     pm::PoolId pool{};
-    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok); // 16 KiB
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok); // 4 segments
+    const uint32_t TILE = PM_TEST_SEG_BYTES / 4 - 8; // 16 x TILE = exact tiling
     pm::RawRef o[16];
-    for (uint32_t i = 0; i < 16; ++i) {                   // 16 x 1024 = tile
-        CHECK_ST(pm::alloc(pool, 1016, 8, 0, i, o[i]), pm::Status::Ok);
-        fill(o[i], 1016, 900 + i);
+    for (uint32_t i = 0; i < 16; ++i) {                   // 16 x TILE = tile
+        CHECK_ST(pm::alloc(pool, TILE, 8, 0, i, o[i]), pm::Status::Ok);
+        fill(o[i], TILE, 900 + i);
     }
     pm::PoolStats st0 = pm::get_stats(pool);
     CHECK(st0.free_bytes == 0); // perfectly tiled: no free space at all
     pm::RawRef r{};
-    CHECK_ST(pm::alloc(pool, 1000, 8, 0, 99, r), pm::Status::NoSpace); // full
+    CHECK_ST(pm::alloc(pool, TILE - 8, 8, 0, 99, r), pm::Status::NoSpace); // full
     CHECK_ST(pm::free(o[0]), pm::Status::Ok);             // hole at the start
 
     pm::CompactionAdvice a = pm::analyze_compaction(pool);
@@ -3819,14 +3888,14 @@ static void test_advice_estimate_and_counters() {
     // relocate. The old "one free block => zero moves" shortcut missed this
     // entirely.
     CHECK(a.estimated_moved_objects == 15);
-    CHECK(a.estimated_moved_bytes == 15 * 1024);
+    CHECK(a.estimated_moved_bytes == 15 * PM_TEST_SEG_BYTES / 4);
 
     // compact relocates exactly the simulated objects (epoch +1 each).
     CHECK_ST(pm::compact(pool), pm::Status::Ok);
     for (uint32_t i = 1; i < 16; ++i) {
         using namespace pm::internal;
         CHECK(g().objects[o[i].index].address_epoch == 2); // moved exactly once
-        verify(o[i], 1016, 900 + i);                       // payload intact
+        verify(o[i], TILE, 900 + i);                       // payload intact
     }
     a = pm::analyze_compaction(pool);
     CHECK(a.estimated_moved_objects == 0 && a.estimated_moved_bytes == 0);
@@ -3846,6 +3915,11 @@ static void test_advice_estimate_and_counters() {
             fill(o[i], 800, 800 + i);
         }
         CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+        // The hole/capacity ratio at small geometries can cross the default
+        // threshold; this scenario is about counter damage, so pin the
+        // verdict to NO_ACTION for its whole duration and restore after.
+        pm::CompactionThresholds const saved_th = pm::get_compaction_thresholds();
+        pm::set_compaction_thresholds({100000, 100000});
         CHECK(pm::analyze_compaction(pool_b).verdict == Verdict::NO_ACTION);
 
         using namespace pm::internal;
@@ -3857,9 +3931,12 @@ static void test_advice_estimate_and_counters() {
         uint32_t const saved_live = P.live_objects;
 
         auto expect_invalid = [&](const char* what) {
-            snap_all(pool_b, pool_b, refs, 3, seg_base(P.segment_first), 4 * 4096);
+            snap_all(pool_b, pool_b, refs, 3, seg_base(P.segment_first),
+                     4 * PM_TEST_SEG_BYTES);
             CHECK(pm::analyze_compaction(pool_b).verdict == Verdict::INVALID_METADATA);
-            check_all_unchanged(pool_b, pool_b, refs, 3, seg_base(P.segment_first), 4 * 4096);
+            check_all_unchanged(pool_b, pool_b, refs, 3,
+                                seg_base(P.segment_first),
+                                4 * PM_TEST_SEG_BYTES);
         };
 
         P.used_bytes = saved_used + 8; // used + free > capacity
@@ -3889,6 +3966,7 @@ static void test_advice_estimate_and_counters() {
         }
         VALIDATE(pool);
         CHECK(pm::analyze_compaction(pool_b).verdict == Verdict::NO_ACTION);
+        pm::set_compaction_thresholds(saved_th);
 
         CHECK_ST(pm::free(ob[0]), pm::Status::Ok);
         CHECK_ST(pm::free(ob[2]), pm::Status::Ok);
@@ -3912,8 +3990,9 @@ static void test_pool_geometry_zone_limit() {
     CHECK_ST(pm::create_pool(x, 60), pm::Status::Ok);
     CHECK_ST(pm::create_pool(a, 4), pm::Status::Ok); // segments [60,64): zone end
     pm::RawRef o{};
-    CHECK_ST(pm::alloc(a, 16376, 8, 0, 1, o), pm::Status::Ok); // block ends at zone end
-    fill(o, 16376, 44);
+    CHECK_ST(pm::alloc(a, 4 * PM_TEST_SEG_BYTES - 8, 8, 0, 1, o),
+             pm::Status::Ok); // block ends at zone end
+    fill(o, 4 * PM_TEST_SEG_BYTES - 8, 44);
     VALIDATE(a);
     using namespace pm::internal;
     Pool& Pa = g().pools[a];
@@ -3929,7 +4008,7 @@ static void test_pool_geometry_zone_limit() {
 
     Pa.segment_count = saved_count;
     VALIDATE(a);
-    verify(o, 16376, 44);
+    verify(o, 4 * PM_TEST_SEG_BYTES - 8, 44);
     CHECK_ST(pm::free(o), pm::Status::Ok);
     done();
 }
@@ -4101,17 +4180,19 @@ static void test_midgap_slack() {
     printf("  [R36] mid-gap slack: pinned neighbours, tail slack preserved\n");
     fresh();
     pm::PoolId p{};
-    CHECK_ST(pm::create_pool(p, 2), pm::Status::Ok); // [0,8192)
+    CHECK_ST(pm::create_pool(p, 2), pm::Status::Ok); // [0, 2*SEG)
+    const uint32_t SEG = PM_TEST_SEG_BYTES;
     pm::RawRef L{}, B{}, F{};
-    CHECK_ST(pm::alloc(p, 4080, 8, 0, 1, L), pm::Status::Ok); // block 4088 [0,4088)
-    CHECK_ST(pm::alloc(p, 8, 8, 0, 2, B), pm::Status::Ok);    // block 16  [4088,4104)
-    CHECK_ST(pm::alloc(p, 4064, 8, 0, 3, F), pm::Status::Ok); // block 4072 [4104,8176)
-    fill(L, 4080, 31); fill(B, 8, 32); fill(F, 4064, 33);
+    CHECK_ST(pm::alloc(p, SEG - 16, 8, 0, 1, L), pm::Status::Ok); // block SEG-8
+    CHECK_ST(pm::alloc(p, 8, 8, 0, 2, B), pm::Status::Ok);    // block 16, straddles
+    CHECK_ST(pm::alloc(p, SEG - 32, 8, 0, 3, F), pm::Status::Ok); // block SEG-24
+    fill(L, SEG - 16, 31); fill(B, 8, 32); fill(F, SEG - 32, 33);
     VALIDATE(p);
     CHECK_ST(pm::free(B), pm::Status::Ok); // 16 B hole straddling the boundary
     VALIDATE(p);
 
-    // split at 4096 cuts the hole: the lower half becomes 8 B pool-tail
+    // split at the segment boundary cuts the hole: the lower half becomes
+    // 8 B pool-tail
     // slack, the upper half packs F left over its half and keeps a real
     // 24 B binned tail block.
     pm::PoolId n{};
@@ -4137,7 +4218,7 @@ static void test_midgap_slack() {
     CHECK_ST(pm::free(cF), pm::Status::Ok);
     st = pm::get_stats(p);
     CHECK(st.fragment_bytes == 8);
-    CHECK(st.largest_free_block == 4072); // the freed F block, slack excluded
+    CHECK(st.largest_free_block == SEG - 24); // the freed F block, slack excluded
     VALIDATE(p);
 
     pm::RawRef cP2 = P2; cP2.pool_hint = pm::CROSS_HINT;
@@ -4461,9 +4542,10 @@ static void test_validate_stage3() {
         Pool& P = g().pools[pool];
         auto* fb = reinterpret_cast<FreeBlock*>(seg_base(P.segment_first) + 136);
         uint32_t const sz = blksz(fb);
-        CHECK(sz == 2 * 4096 - 136);
+        CHECK(sz == 2 * PM_TEST_SEG_BYTES - 136);
         pm::RawRef refs[1] = {a};
-        snap_all(pool, pool, refs, 1, seg_base(P.segment_first), 2 * 4096);
+        snap_all(pool, pool, refs, 1, seg_base(P.segment_first),
+                 2 * PM_TEST_SEG_BYTES);
         bins_remove(P.bins, fb);
         fb->header = (sz - 32) | BLOCK_FREE_BIT;
         bins_insert(P.bins, fb);
@@ -4534,6 +4616,10 @@ static void test_advice_negative() {
         fill(o[i], 800, 60 + i);
     }
     CHECK_ST(pm::free(o[1]), pm::Status::Ok);
+    // The hole/capacity ratio is geometry-dependent; this scenario is about
+    // ILLEGAL requests, so pin the healthy verdict to NO_ACTION throughout.
+    pm::CompactionThresholds const saved_th = pm::get_compaction_thresholds();
+    pm::set_compaction_thresholds({100000, 100000});
 
     bool changed = false;
     pm::CompactionAdvice base = pm::poll_compaction_advice(pool, nullptr, &changed);
@@ -4573,6 +4659,7 @@ static void test_advice_negative() {
     VALIDATE(pool);
     CHECK_ST(pm::free(o[0]), pm::Status::Ok);
     CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+    pm::set_compaction_thresholds(saved_th);
     done();
 }
 
@@ -4706,7 +4793,8 @@ static void test_gap16_boundary() {
     CHECK_ST(pm::alloc(pool, 16, 8, 0, 1, a), pm::Status::Ok);            // [0,24)
     CHECK_ST(pm::alloc(pool, 8, 8, 0, 2, b), pm::Status::Ok);             // [24,40)
     CHECK_ST(pm::alloc(pool, 8, 8, pm::PM_PINNED, 3, c), pm::Status::Ok); // [40,56)
-    CHECK_ST(pm::alloc(pool, 4032, 8, pm::PM_PINNED, 4, tail), pm::Status::Ok); // [56,4096)
+    CHECK_ST(pm::alloc(pool, PM_TEST_SEG_BYTES - 64, 8, pm::PM_PINNED, 4,
+                       tail), pm::Status::Ok); // [56, SEG)
     CHECK_ST(pm::free(b), pm::Status::Ok);
     VALIDATE(pool);
     CHECK_ST(pm::compact(pool), pm::Status::Ok);
@@ -4763,17 +4851,16 @@ static void test_alloc_refusal_diagnosis() {
            "bitmap/head disagreement\n");
     using namespace pm::internal;
     // The pool must be filled to its last byte with minimal 16 B blocks, so
-    // the object count times 16 must equal a whole number of segments:
-    // 512 x 16 B = 2 segments (host default), 256 x 16 B = 1 segment
-    // (device builds run PM_MAX_OBJECTS=256). Below 256 there is no exact
-    // fill, so refuse the configuration instead of failing obscurely.
-#if PM_MAX_OBJECTS >= 512
-    constexpr uint32_t kN = 512, kSegs = 2;
-#elif PM_MAX_OBJECTS >= 256
-    constexpr uint32_t kN = 256, kSegs = 1;
-#else
-#error "R54 needs PM_MAX_OBJECTS >= 256 to fill a segment exactly"
-#endif
+    // the object count times 16 must equal a whole number of segments.
+    // kDiv = blocks per fixture segment; kK caps the fill at 512 objects and
+    // at the slot-table size. At the historical 4 KiB geometry this reduces
+    // to the shipped 512/2 (host) and 256/1 (device) shapes.
+    constexpr uint32_t kDiv = PM_TEST_SEG_BYTES / 16u;
+    constexpr uint32_t kK =
+        (PM_MAX_OBJECTS / kDiv < 512u / kDiv) ? PM_MAX_OBJECTS / kDiv
+                                              : 512u / kDiv;
+    static_assert(kK >= 1, "R54 needs PM_MAX_OBJECTS >= one segment of blocks");
+    constexpr uint32_t kN = kK * kDiv, kSegs = kK;
 
     // Fills `o` with kN objects that fill a kSegs-segment pool to the last byte
     // (payload 8 -> 16 B blocks), then frees o[0]/o[2]/o[4] so the 16 B bin
@@ -4877,15 +4964,14 @@ static void test_alloc_refusal_diagnosis() {
 static void test_refusal_bitmap_rules() {
     printf("  [R55] refused alloc: bitmap/head consistency rules\n");
     // Same exact-fill geometry as R54: minimal 16 B blocks, object count times
-    // 16 must equal whole segments (512 -> 2 segments, 256 -> 1 segment).
-#if PM_MAX_OBJECTS >= 512
-    constexpr uint32_t kN = 512, kSegs = 2;
-#elif PM_MAX_OBJECTS >= 256
-    constexpr uint32_t kN = 256, kSegs = 1;
-#else
-#error "R55 needs PM_MAX_OBJECTS >= 256 to fill a segment exactly"
-#endif
+    // 16 must equal whole segments.
     using namespace pm::internal;
+    constexpr uint32_t kDiv = PM_TEST_SEG_BYTES / 16u;
+    constexpr uint32_t kK =
+        (PM_MAX_OBJECTS / kDiv < 512u / kDiv) ? PM_MAX_OBJECTS / kDiv
+                                              : 512u / kDiv;
+    static_assert(kK >= 1, "R55 needs PM_MAX_OBJECTS >= one segment of blocks");
+    constexpr uint32_t kN = kK * kDiv, kSegs = kK;
 
     auto build = [&](pm::PoolId& pool, pm::RawRef (&o)[kN], uint32_t& f,
                      uint32_t& s) {

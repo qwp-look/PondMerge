@@ -24,11 +24,7 @@ CONFIG_COMPILER_CXX_EXCEPTIONS=n
 CONFIG_COMPILER_CXX_RTTI=n
 CONFIG_MAIN_TASK_STACK_SIZE=16384
 
-# The S3 acceptance firmware outgrew static DRAM (dram0_0_seg overflowed by
-# 4,896 B at HEAD): the suite's 256 KiB zone cannot be shrunk because the
-# suite's own assertions pin it, so it moves to the module's octal PSRAM via
-# EXT_RAM_BSS_ATTR (tests/suite.cpp).
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCTAL=y
-CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# v20: the fixture zone shrank to 64 KiB (1 KiB segments), so the acceptance
+# firmware fits static DRAM again -- no PSRAM is required for the suite. The
+# PM_ZONE_ATTR plumbing stays available (see tests/suite.cpp) for integrations
+# that want the zone elsewhere.

@@ -77,7 +77,7 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra \
 真实场景集成参考是 `examples/sensor_pipeline.cpp`（host/设备同一份源码，
 设备工程在 `examples/sensor_pipeline_esp32/`）——写新集成时先读它。
 
-全部通过应看到 **5,432,827 (Debug) / 5,432,834 (Release) / 1,531,838 (San，
+全部通过应看到 **5,454,163 (Debug) / 5,454,170 (Release) / 1,553,174 (San，
 3000 ops) checks, 0 failures**，模型对拍 **466,859**。CI（`.github/workflows/ci.yml`）
 在每次 push 上跑这十一项 + 消费路径冒烟 + 基准构建。
 
@@ -129,9 +129,9 @@ best-fit **两轴都更差**。设备侧那个 ~20×/周期的差距**已实测�
 
 | 要知道什么 | 去哪 |
 |---|---|
-| 最新一轮的完整交接（设备验收恢复轮） | `docs/HANDOVER_v18.md` |
+| 最新一轮的完整交接（夹具几何参数化轮） | `docs/HANDOVER_v20.md` |
 | 全部实测数字、仪器限制、负结果 | `bench/RESULTS.md` |
 | 基准方法、公平性规则、引用数字的必备条件 | `bench/README.md` |
 | 不变式与证据（代码位置 + 证明 + 测试） | `docs/AUDIT_LEDGER.md` |
 | 用户侧集成（4 种方式）与元数据预算 | `README.md` |
-| 各轮收口报告 | `docs/HANDOVER_v2–v18.md` |
+| 各轮收口报告 | `docs/HANDOVER_v2–v20.md` |
