@@ -181,6 +181,7 @@ def restart_host(host_path):
     doubles per consecutive death that never produced a new session, so a
     crashing or missing binary rate-limits itself instead of spin-restarting;
     every attempt is logged so the UI shows why the source flapped."""
+    global PROC
     while True:
         with STATE_LOCK:
             fails = RESTART["fails"]
@@ -193,7 +194,13 @@ def restart_host(host_path):
             del STATE["log"][:-200]
         time.sleep(delay)   # daemon pump thread; no lock held while waiting
         try:
-            spawn_host(host_path)
+            # Rebind the GLOBAL, not just the local: send() and the op
+            # handler's poll check go through PROC, and a stale corpse there
+            # means every command after an auto-restart writes into a dead
+            # pipe and flips the UI back to "disconnected" -- the restarted
+            # process runs but nothing can reach it (found in the field:
+            # ready DID restore connected, the first button click broke it).
+            PROC = spawn_host(host_path)
             return
         except Exception as e:
             with STATE_LOCK:
@@ -684,10 +691,17 @@ function renderLog(log){
   box.textContent = '';
   for (const r of log.slice(-40).reverse()){
     const line = el('div');
-    const ev = EVENTS[r.event] || r.event || JSON.stringify(r);
+    let ev, dt;
+    if (r.t === 'result'){
+      ev = '结果 · ' + (r.op || '?');
+      dt = r.status + (r.why ? ' — ' + r.why : '') +
+           (r.object_id !== undefined ? ' — 新对象 id ' + r.object_id : '');
+    } else {
+      ev = EVENTS[r.event] || r.event || r.t;
+      dt = r.detail || r.why || '';
+    }
     line.appendChild(el('span', 'ev', '[' + ev + '] '));
-    if (r.detail) line.appendChild(el('span', 'dt', r.detail));
-    if (r.why) line.appendChild(el('span', 'dt', r.why));
+    if (dt) line.appendChild(el('span', 'dt', dt));
     box.appendChild(line);
   }
 }
