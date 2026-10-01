@@ -180,14 +180,22 @@ block_size/flags/epoch。ESP32（display-only）模式下所有变更按钮禁�
 
 ### Host
 
-- `protocol_smoke.py`：**95 项检查全部通过**——协议合法性、record 类型、
-  status、seq 单调、object_id 稳定、generation 搬迁不变、epoch 搬迁递增、
-  payload_digest 一致、行分帧（边界/超长/CRLF/EOF）、解析器边界（嵌套/数组/
-  十六进制/浮点/负数/重复键/超长 key/value）、15 类非法输入的
+> 计数说明：下述 95/15 是 2026-09-12 首轮验收的历史读数；随安全加固（v1.1.0
+> 的 CSRF/Host 头/Content-Length 回归）与协议分帧用例扩充，当前门禁口径为
+> **protocol 104 项 / HTTP 27 项**（与 CONTRIBUTING §3、ci.yml 一致）。
+
+- `protocol_smoke.py`：**当前 104 项检查全部通过**（首轮 95 项）——协议合法性、
+  record 类型、status、seq 单调、object_id 稳定、generation 搬迁不变、epoch
+  搬迁递增、payload_digest 一致、行分帧（边界/超长/CRLF/EOF）、解析器边界
+  （嵌套/数组/十六进制/浮点/负数/重复键/超长 key/value）、15 类非法输入的
   INVALID_REQUEST 与前后场景签名不变。
-- `http_smoke.py`：**15 项检查全部通过**——并发 POST 无响应错配、seq 单调、
-  维护 diff 不变量、慢轮询不阻塞 pump、demo 进程退出 → degraded、
-  display-only 拒绝（pty 伪串口）。
+- `http_smoke.py`：**当前 27 项检查全部通过**（首轮 15 项）——并发 POST 无响应
+  错配、seq 单调、维护 diff 不变量、慢轮询不阻塞 pump、demo 进程退出 →
+  degraded（v1.2.0 起自动重启）、display-only 拒绝（pty 伪串口）。
+
+> UI 备注（2026-10-01）：页面按本文件 §6/§7 重写为中文界面——§6 要求的
+> align 输入、静默期模拟复选框（纯标注）与整理前后对比表自此真实存在；
+> 着色约定与悬停详情保持不变。
 
 ### ESP32-S3（demo 固件）
 
