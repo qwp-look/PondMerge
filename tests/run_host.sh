@@ -8,24 +8,53 @@
 #   tests/run_host.sh --coverage      line/branch coverage of the core under
 #                                     the suite, Debug AND Release passes
 #   tests/run_host.sh --fuzz [secs]   build and run the libFuzzer target
-# Every mode except --cppcheck/--configs/--coverage/--fuzz runs tests/suite.cpp
+#   tests/run_host.sh --fuzz-debug [secs]  same, PM_DEBUG=1: the Debug assert
+#                                     layer is itself under test (the fuzz
+#                                     target only issues valid calls, so an
+#                                     abort there is a real bug)
+#   tests/run_host.sh --seg1024 [ops] the fixture's 1 KiB geometry on host
+#                                     (PM_TEST_SEG_BYTES=1024, Debug build)
+#   tests/run_host.sh --seg1024-release [ops]  ... in Release
+# Every mode except --cppcheck/--configs/--coverage/--fuzz* runs tests/suite.cpp
 # AND the reference model in tests/model.cpp.
+#
+# The compiler is ${CXX:-g++} everywhere except the fuzz modes, which need
+# clang's libFuzzer and take ${FUZZ_CXX:-clang++} so an exported CXX=g++ from
+# the environment cannot silently break them.
 set -e
 cd "$(dirname "$0")/.."
 mkdir -p build
+CXX=${CXX:-g++}
 CXXFLAGS="-std=c++17 -Wall -Wextra -Wno-unused-parameter -Iinclude -Isrc"
 case "$1" in
 --release)
-    g++ $CXXFLAGS -O3 -DNDEBUG -DPM_DEBUG=0 \
+    "$CXX" $CXXFLAGS -O3 -DNDEBUG -DPM_DEBUG=0 \
         src/core.cpp tests/suite.cpp tests/model.cpp tests/main.cpp \
         -o build/pondmerge_tests_release
     exec ./build/pondmerge_tests_release "${2:-10000}"
     ;;
 --san)
-    g++ $CXXFLAGS -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -static-libasan \
+    "$CXX" $CXXFLAGS -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -static-libasan \
         src/core.cpp tests/suite.cpp tests/model.cpp tests/main.cpp \
         -o build/pondmerge_tests_san
     exec ./build/pondmerge_tests_san "${2:-3000}"
+    ;;
+--seg1024|--seg1024-release)
+    # The non-default fixture geometry, exercised on host exactly as the device
+    # runs it (esp32/main builds PM_TEST_SEG_BYTES=1024). suite.cpp's own
+    # comment points here; the arm exists since v1.2 -- before that the flag
+    # silently fell through to the ops argument and ran the DEFAULT geometry.
+    seg_flags="-DPM_TEST_SEG_BYTES=1024u"
+    if [ "$1" = "--seg1024-release" ]; then
+        "$CXX" $CXXFLAGS $seg_flags -O3 -DNDEBUG -DPM_DEBUG=0 \
+            src/core.cpp tests/suite.cpp tests/model.cpp tests/main.cpp \
+            -o build/pondmerge_tests_seg1024_release
+        exec ./build/pondmerge_tests_seg1024_release "${2:-10000}"
+    fi
+    "$CXX" $CXXFLAGS $seg_flags -g -O1 \
+        src/core.cpp tests/suite.cpp tests/model.cpp tests/main.cpp \
+        -o build/pondmerge_tests_seg1024
+    exec ./build/pondmerge_tests_seg1024 "${2:-10000}"
     ;;
 --cppcheck)
     # Print the version first: cppcheck's check set has changed across releases
@@ -46,7 +75,7 @@ case "$1" in
     # (PM_DEBUG=0). The second pass exists because R25's negative paths are
     # compiled only under Release -- a Debug-only coverage gate structurally
     # cannot see them, so "the suite covers it" would be false comfort. gcov
-    # rather than llvm-cov because the project builds with g++. Each pass gets
+    # rather than llvm-cov because the project builds with $CXX (g++ by default). Each pass gets
     # a private object directory (build/cov, build/cov_rel) so the .gcno/.gcda
     # files neither litter build/ nor collide between passes.
     #
@@ -55,6 +84,10 @@ case "$1" in
     # pass unnoticed; it is deliberately below the measured value rather than
     # equal to it, so ordinary edits do not trip it.
     COVERAGE_MIN_LINES=${COVERAGE_MIN_LINES:-85}
+    # The branch floor (branches taken at least once) is gated like the line
+    # floor. It used to be printed only, which meant a branch silently rotting
+    # to 0% would pass the gate.
+    COVERAGE_MIN_BRANCH=${COVERAGE_MIN_BRANCH:-75}
     coverage_pass() {
         pm_debug=$1; covdir=$2; label=$3; ops=$4
         rm -rf "build/$covdir"
@@ -76,11 +109,11 @@ case "$1" in
             # `gcov -o build/cov src/core.cpp` looks for.
             obj="build/$covdir/$(basename "$src").o"
             case "$src" in
-                src/core) g++ $CXXFLAGS -O0 -g --coverage -DPM_DEBUG="$pm_debug" -c "$src.cpp" -o "$obj" ;;
-                *)        g++ $CXXFLAGS -O0 -g -DPM_DEBUG="$pm_debug" -c "$src.cpp" -o "$obj" ;;
+                src/core) "$CXX" $CXXFLAGS -O0 -g --coverage -DPM_DEBUG="$pm_debug" -c "$src.cpp" -o "$obj" ;;
+                *)        "$CXX" $CXXFLAGS -O0 -g -DPM_DEBUG="$pm_debug" -c "$src.cpp" -o "$obj" ;;
             esac
         done
-        g++ --coverage -o "build/$covdir/run" build/"$covdir"/*.o
+        "$CXX" --coverage -o "build/$covdir/run" build/"$covdir"/*.o
         ./build/"$covdir"/run "$ops" > "build/$covdir"/run.log 2>&1
         tail -4 "build/$covdir"/run.log
         # Run gcov from INSIDE the pass directory: it writes one .gcov file per
@@ -107,32 +140,50 @@ case "$1" in
             cat "build/$covdir/gcov.txt"
             exit 1
         fi
-        echo "core.cpp [$label]: ${pct}% lines, ${brt}% branches taken  (line floor ${COVERAGE_MIN_LINES}%)"
+        echo "core.cpp [$label]: ${pct}% lines, ${brt}% branches taken  (line floor ${COVERAGE_MIN_LINES}%, branch floor ${COVERAGE_MIN_BRANCH}%)"
         awk -v p="$pct" -v f="$COVERAGE_MIN_LINES" 'BEGIN { exit (p+0 >= f+0) ? 0 : 1 }' || {
             echo "FAIL: core.cpp line coverage below the floor ($label)"; exit 1; }
+        if [ -z "$brt" ]; then
+            echo "FAIL: gcov produced no branch-coverage line for core.cpp ($label)"; exit 1
+        fi
+        awk -v p="$brt" -v f="$COVERAGE_MIN_BRANCH" 'BEGIN { exit (p+0 >= f+0) ? 0 : 1 }' || {
+            echo "FAIL: core.cpp branch coverage below the floor ($label)"; exit 1; }
     }
     coverage_pass 1   cov      "Debug, PM_DEBUG=1"   "${2:-3000}"
     coverage_pass 0   cov_rel  "Release, PM_DEBUG=0" "${2:-3000}"
     echo "coverage PASSED"
     ;;
---fuzz)
-    # libFuzzer needs clang. PM_DEBUG=0 on purpose: in Debug a caller bug aborts
-    # by design and libFuzzer would report that as a crash (see fuzz/fuzz_pm.cpp).
-    CXX=${CXX:-clang++}
-    "$CXX" -std=c++17 -g -O1 -DPM_DEBUG=0 -Iinclude -Isrc \
+--fuzz|--fuzz-debug)
+    # libFuzzer needs clang (FUZZ_CXX, NOT CXX -- an exported CXX=g++ must not
+    # silently break this mode). Corpus and artifacts live under build/ so a
+    # CI cache can persist the corpus between runs and a failed run keeps its
+    # crash reproducer.
+    FUZZ_CXX=${FUZZ_CXX:-clang++}
+    if [ "$1" = "--fuzz-debug" ]; then
+        # PM_DEBUG=1 puts the library's own assert layer under fuzz: the target
+        # only issues VALID calls, so a Debug abort is a real library bug.
+        dbg="-DPM_DEBUG=1"
+    else
+        # PM_DEBUG=0 on purpose for the default mode: in Debug a caller bug
+        # aborts by design and libFuzzer would report that as a crash (see
+        # fuzz/fuzz_pm.cpp).
+        dbg="-DPM_DEBUG=0"
+    fi
+    "$FUZZ_CXX" -std=c++17 -g -O1 $dbg -Iinclude -Isrc \
         -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
         fuzz/fuzz_pm.cpp src/core.cpp -o build/fuzz_pm
-    mkdir -p build/fuzz_artifacts
+    mkdir -p build/fuzz_artifacts build/fuzz_corpus
     # -use_value_profile: without it the run plateaus at ~780 features almost
     # immediately, because edge coverage does not reward reaching deeper states.
     # With it the same budget yields ~3400 features and a substantially larger
     # corpus. -max_len bounds the work per input.
     exec ./build/fuzz_pm -max_total_time="${2:-60}" -use_value_profile=1 \
         -max_len=512 -print_final_stats=1 \
-        -artifact_prefix=build/fuzz_artifacts/
+        -artifact_prefix=build/fuzz_artifacts/ \
+        build/fuzz_corpus
     ;;
 *)
-    g++ $CXXFLAGS -g -O1 \
+    "$CXX" $CXXFLAGS -g -O1 \
         src/core.cpp tests/suite.cpp tests/model.cpp tests/main.cpp \
         -o build/pondmerge_tests
     exec ./build/pondmerge_tests "${1:-10000}"
