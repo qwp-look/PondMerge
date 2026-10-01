@@ -2,7 +2,10 @@ name: CI
 
 # Every job below runs a gate that this repository already ships and that has
 # been verified locally; CI exists to make those gates automatic on every change
-# rather than depending on someone remembering to run them.
+# rather than depending on someone remembering to run them. The idf-build job
+# extends that idea to the product's actual target platform: until v1.2, the
+# Xtensa side compiled only on the maintainer's workstation, so a commit that
+# broke esp32/ or examples/sensor_pipeline_esp32 could pass every host gate.
 
 on:
   push:
@@ -22,6 +25,7 @@ jobs:
   host-acceptance:
     name: host acceptance (${{ matrix.mode }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -32,14 +36,62 @@ jobs:
             cmd: tests/run_host.sh --release 10000
           - mode: sanitizers
             cmd: tests/run_host.sh --san 3000
+          - mode: seg1024-geometry
+            # The fixture's 1 KiB geometry -- the same one the devices run --
+            # exercised on host. (This used to be a documented flag that
+            # silently did nothing: --seg1024 fell through to the ops argument
+            # and ran the DEFAULT geometry with the stress work parsed away.)
+            cmd: tests/run_host.sh --seg1024-release 10000
     steps:
       - uses: actions/checkout@v4
       - name: ${{ matrix.cmd }}
         run: ${{ matrix.cmd }}
 
+  host-alternate-compiler:
+    name: host acceptance (clang, Debug)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure clang is present
+        run: |
+          command -v clang++ >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y clang
+          }
+          clang++ --version | head -1
+      # Only g++ ever built the library in CI until v1.2; clang is what the
+      # fuzz target already uses, and the two compilers disagree in useful
+      # places (warning sets, builtin handling in fl_index/bins_find).
+      - run: CXX=clang++ tests/run_host.sh 3000
+
+  host-32bit:
+    name: host acceptance (32-bit build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install 32-bit toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib
+      # The library's stated home is a 32-bit MCU, but until v1.2 every host
+      # job compiled it as x86-64 -- where ObjectDesc's pointer field is 8 B
+      # and the whole metadata layout is larger. A -m32 compile-and-run of the
+      # config smoke proves the core builds and runs with 4-byte pointers and
+      # smaller size_t (no CI runner can flash an Xtensa board, so this is the
+      # closest host-side proxy).
+      - name: Build and run the config smoke with -m32
+        run: |
+          g++ -m32 -std=c++17 -Wall -Wextra -Werror -O1 -DPM_DEBUG=1 \
+              -Iinclude -Isrc src/core.cpp tests/config_smoke.cpp \
+              -o build/config_smoke_m32
+          ./build/config_smoke_m32
+
   static-analysis:
     name: static analysis (cppcheck)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install cppcheck
@@ -52,22 +104,26 @@ jobs:
   config-matrix:
     name: TLSF configuration matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: tests/run_host.sh --configs
 
   coverage:
-    name: core line coverage
+    name: core coverage (line + branch floors)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      # Fails below the floor set in tests/run_host.sh (COVERAGE_MIN_LINES), so
-      # a change that silently stops exercising code cannot pass unnoticed.
+      # Fails below the floors set in tests/run_host.sh (COVERAGE_MIN_LINES,
+      # COVERAGE_MIN_BRANCH), so a change that silently stops exercising code
+      # cannot pass unnoticed.
       - run: tests/run_host.sh --coverage 3000
 
   fuzz:
     name: libFuzzer (bounded)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Ensure clang is present
@@ -77,14 +133,63 @@ jobs:
             sudo apt-get install -y clang
           }
           clang++ --version | head -1
+      # The corpus is persisted between runs: libFuzzer replays it and extends
+      # it, so coverage accumulates instead of restarting from zero every run.
+      - uses: actions/cache@v4
+        with:
+          path: build/fuzz_corpus
+          key: fuzz-corpus-${{ runner.os }}-v1
       # Bounded rather than open-ended: CI is a regression net, not a fuzzing
-      # campaign. A crash or sanitizer finding makes the job fail and leaves the
-      # reproducer in build/fuzz_artifacts/.
+      # campaign. A crash or sanitizer finding makes the job fail; the
+      # reproducer lands in build/fuzz_artifacts/ and is uploaded below so the
+      # artifact survives the job (the comment used to claim this without
+      # actually doing it).
       - run: tests/run_host.sh --fuzz 120
+      # The Debug build's assert layer is itself under test: the fuzz target
+      # only issues valid calls, so a PM_ASSERT trip there is a real bug.
+      - run: tests/run_host.sh --fuzz-debug 60
+      - name: Upload fuzz artifacts (crash reproducers, if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: build/fuzz_artifacts/
+          if-no-files-found: ignore
+
+  idf-build:
+    name: esp-idf build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32s3, esp32]
+    steps:
+      - uses: actions/checkout@v4
+      # Compile-only acceptance of the product's target platform: the esp32/
+      # project builds the FULL suite + concurrency + model firmware (both
+      # targets run it on real boards since v20), through the in-repo IDF
+      # component wrapper. This job never flashes; device acceptance stays a
+      # maintainer task (scripts/device_run.sh).
+      - uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0
+          target: ${{ matrix.target }}
+          path: esp32
+      # The product-shaped example is built for the S3 as well; it consumes
+      # pondmerge through the same wrapper and its main/CMakeLists carries the
+      # PM_* limits that must stay in sync with the library build.
+      - if: matrix.target == 'esp32s3'
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0
+          target: esp32s3
+          path: examples/sensor_pipeline_esp32
 
   demo-protocol:
     name: demo protocol + HTTP smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Build the host demo
@@ -92,9 +197,9 @@ jobs:
           mkdir -p build
           g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc \
               examples/host_demo.cpp src/core.cpp -o build/host_demo
-      - name: Protocol regression (95 checks)
+      - name: Protocol regression (104 checks)
         run: python3 examples/protocol_smoke.py build/host_demo
-      - name: HTTP layer regression (15 checks)
+      - name: HTTP layer regression (27 checks)
         run: python3 examples/http_smoke.py build/host_demo
       - name: Sensor-pipeline example (integration reference, self-audited)
         run: |
@@ -115,6 +220,7 @@ jobs:
   consumer-smoke:
     name: cmake consumer (install + find_package)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Build, install, then consume via find_package
@@ -123,6 +229,7 @@ jobs:
   benchmarks:
     name: benchmarks build and run
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       # bench/ is not part of the library, but it is where every performance
@@ -130,14 +237,14 @@ jobs:
       # longer compiles or no longer runs is a claim that quietly stops being
       # true. This job is a correctness gate, not a performance gate: runners
       # are shared and noisy, so no threshold is asserted on any timing. What it
-      # does check is that all four benchmarks compile clean under -Werror, run
+      # does check is that all six benchmarks compile clean under -Werror, run
       # to completion, and pass their own internal consistency check.
       - name: Build (host, Release, -Werror)
         run: |
           set -e
           F="-std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra -Wno-unused-parameter -Werror -Iinclude -Isrc"
           mkdir -p build/bench
-          for b in alloc_latency validate_scaling fragmentation compaction_window; do
+          for b in alloc_latency validate_scaling fragmentation compaction_window host_insn churn_overhead; do
             g++ $F bench/$b.cpp src/core.cpp -o build/bench/$b
           done
       - name: Run, and require each benchmark to report a consistent structure
@@ -147,6 +254,9 @@ jobs:
           ./build/bench/validate_scaling | tee build/bench/validate.log
           ./build/bench/fragmentation | tee build/bench/frag.log
           ./build/bench/compaction_window | tee build/bench/cw.log
+          # host_insn and churn_overhead are instrument/breakdown utilities:
+          # they are built above (so they cannot rot unseen) but have no
+          # self-audit to assert here.
           # The fragmentation benchmark's own audit must pass in both variants,
           # and neither run may be confounded.
           ok_count=$(grep -cE "structure audit +: OK" build/bench/frag.log)
