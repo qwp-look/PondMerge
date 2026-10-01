@@ -9,6 +9,12 @@
 // the public API deliberately does not expose free-list internals, but a
 // diagnostic demo needs them. The demo never writes allocator metadata.
 //
+// SINGLE-THREAD CONTRACT: the demo protocol is one command in flight on one
+// stdin/stdout stream, so emit_snapshot() and flags_json() keep STATIC
+// scratch buffers. Multithreading this process requires removing those
+// statics first -- they are shared mutable state licensed only by this
+// contract, not a design choice.
+//
 // Build: see QUICKSTART.md. No dynamic allocation, no exceptions.
 #include "pondmerge/pondmerge.hpp"
 #include "../src/internal.h"
@@ -205,6 +211,7 @@ Entry* find_entry(uint32_t id) {
     return nullptr;
 }
 
+// static scratch, licensed by the single-thread protocol contract above
 char const* flags_json(uint16_t flags) {
     static char buf[16];
     snprintf(buf, sizeof(buf), "%u", (unsigned)flags);
@@ -241,7 +248,9 @@ void emit_snapshot() {
         // Layout = live blocks (order list, address-sorted) merged with the
         // free blocks (bins); everything between is slack.
         struct Blk { uint32_t off, size, kind, id, flags, gen, epoch; };
-        static Blk blk[2 * PM_MAX_OBJECTS + 8]; // demo-only scratch
+        // static scratch, licensed by the single-thread protocol contract
+        // (see file header) -- remove before any multithreading
+        static Blk blk[2 * PM_MAX_OBJECTS + 8];
         uint32_t n = 0;
         for (uint32_t idx = P.order_head; idx != NO_ORDER;
              idx = G.objects[idx].addr_next) {

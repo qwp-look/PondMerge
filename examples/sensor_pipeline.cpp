@@ -261,9 +261,10 @@ void evict_oldest() {
 // Returns: 1 = demand satisfied (maybe after compaction), 0 = not satisfied.
 int export_batch(pm::PoolId pool) {
     pm::CompactionRequest req{EXPORT_BYTES, 1, 0, 0, 0, 0}; // 0 limits = full pass
-    pm::pm_local_ptr<uint8_t> batch = pm::pm_alloc_buffer(pool, EXPORT_BYTES,
-                                                          pm::PM_MOVABLE).value;
-    if (batch.valid()) { g_c.exports_ok++; (void)pm::pm_destroy(batch); return 1; }
+    // The Result is the contract: check ok() before touching the pointer --
+    // an unchecked .value hides the failure Status behind a default ptr.
+    auto batch = pm::pm_alloc_buffer(pool, EXPORT_BYTES, pm::PM_MOVABLE);
+    if (batch.ok()) { g_c.exports_ok++; (void)pm::pm_destroy(batch.value); return 1; }
 
     // Read-only advice first, as a product would do. The request is passed so
     // the advice can say whether the demand WOULD fit after a compaction.
@@ -295,8 +296,8 @@ int export_batch(pm::PoolId pool) {
     // References were stable across the moves -- checked, not assumed.
     audit_all("compaction");
 
-    batch = pm::pm_alloc_buffer(pool, EXPORT_BYTES, pm::PM_MOVABLE).value;
-    if (batch.valid()) { g_c.exports_rescued++; (void)pm::pm_destroy(batch); return 1; }
+    batch = pm::pm_alloc_buffer(pool, EXPORT_BYTES, pm::PM_MOVABLE);
+    if (batch.ok()) { g_c.exports_rescued++; (void)pm::pm_destroy(batch.value); return 1; }
     g_c.exports_failed++;
     return 0;
 }
@@ -374,7 +375,7 @@ int pm_sensor_pipeline_run() {
             if (s.ok()) {
                 if (auto acc = s->try_borrow(); acc.ok()) stamp(*acc.value, 'W');
                 if ((rng() % 100u) < 85u) {
-                    if (g_hist_n == KEEP_MAX) drop_history(0);
+                    if (g_hist_n == KEEP_MAX) evict_oldest();       // cap: evict oldest
                     g_hist[g_hist_n].as_wave = s.value;
                     g_hist[g_hist_n].kind = 'W';
                     g_hist[g_hist_n].seq = g_seq;

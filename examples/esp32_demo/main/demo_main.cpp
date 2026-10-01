@@ -44,11 +44,20 @@ Entry* find_entry(uint32_t id) {
     return nullptr;
 }
 
+void emit_result(char const* op, pm::Status st) {
+    printf("{\"t\":\"result\",\"protocol\":1,\"op\":\"%s\",\"status\":\"%s\"}\n",
+           op, pm::status_name(st));
+}
+
+// One answer per operation is the demo protocol: a failed alloc must emit
+// its Status like any other result -- a silently skipped step would leave
+// the display-only UI (and the scene log) without any trace of it.
 bool alloc_obj(pm::PoolId pool, uint32_t size, uint16_t flags, uint32_t seed) {
     for (auto& e : g_entries) {
         if (e.live) continue;
         pm::RawRef ref{};
-        if (pm::alloc(pool, size, 8, flags, 0, ref) != pm::Status::Ok) return false;
+        pm::Status st = pm::alloc(pool, size, 8, flags, 0, ref);
+        if (st != pm::Status::Ok) { emit_result("alloc", st); return false; }
         void* p = nullptr;
         if (pm::borrow_begin(ref, size, 1, p) == pm::Status::Ok) {
             memset(p, (int)(seed & 0xFF), size);
@@ -57,6 +66,7 @@ bool alloc_obj(pm::PoolId pool, uint32_t size, uint16_t flags, uint32_t seed) {
         e.live = true; e.id = g_next_id++; e.ref = ref; e.size = size;
         return true;
     }
+    emit_result("alloc", pm::Status::NoSpace);   // table full is still an answer
     return false;
 }
 
@@ -184,11 +194,6 @@ void emit_snapshot() {
         first_adv = false;
     }
     printf("]}\n");
-}
-
-void emit_result(char const* op, pm::Status st) {
-    printf("{\"t\":\"result\",\"protocol\":1,\"op\":\"%s\",\"status\":\"%s\"}\n",
-           op, pm::status_name(st));
 }
 
 void emit_advice(pm::PoolId pool, uint32_t size) {

@@ -3,7 +3,8 @@
 
 Two sources, one UI:
   --host  [path]   spawn the C++ demo process (examples/host_demo) and talk
-                   to it over stdin/stdout (default: build/host_demo)
+                   to it over stdin/stdout (default: build/host_demo,
+                   resolved from this script's location, not the CWD)
   --serial PORT    attach an ESP32-S3 running the demo firmware and stream
                    its JSON Lines over USB-Serial-JTAG (display-only)
 
@@ -20,6 +21,7 @@ through the PondMerge public API in the source process.
 """
 import argparse
 import json
+import os
 import subprocess
 import threading
 import time
@@ -27,6 +29,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_COMMAND_BYTES = 1024
 RESPONSE_TIMEOUT = 3.0
+
+# demo process auto-restart (HOST mode): first retry 1 s after the death is
+# seen, doubling per consecutive death that never produced a new session
+RESTART_BACKOFF_S = 1.0
+RESTART_BACKOFF_MAX_S = 30.0
+
+# repo root derived from this script's location: the --host default must not
+# depend on the directory the server happens to be started from
+DEFAULT_HOST = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "build", "host_demo")
 
 STATE = {
     "snapshot": None,
@@ -48,6 +61,7 @@ STATE_LOCK = threading.Lock()   # guards STATE only -- never held during I/O
 COMMAND_LOCK = threading.Lock() # serializes send -> wait-for-result
 SERIAL = None
 PROC = None
+RESTART = {"fails": 0}          # consecutive demo deaths without a new session
 
 
 def _log_protocol_error_locked(what):
@@ -81,6 +95,7 @@ def push(rec, expected_source):
             STATE["last_seq"] = None
             STATE["connected"] = True
             STATE["degraded"] = False
+            RESTART["fails"] = 0    # a live session: the demo is healthy again
             if rec.get("commit"):
                 STATE["build_id"] = rec["commit"]
         return True
@@ -152,7 +167,42 @@ def snapshot_diff(prev, nxt, op):
     return diff
 
 
-def pump_host(proc):
+def spawn_host(host_path):
+    """Spawn the C++ demo process and start its pump thread. Returns the new
+    Popen (the initial PROC in main, or the auto-restart chain)."""
+    proc = subprocess.Popen([host_path], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True, bufsize=1)
+    pump_host(proc, host_path)
+    return proc
+
+
+def restart_host(host_path):
+    """Bring the demo process back after the pump saw it die. The delay
+    doubles per consecutive death that never produced a new session, so a
+    crashing or missing binary rate-limits itself instead of spin-restarting;
+    every attempt is logged so the UI shows why the source flapped."""
+    while True:
+        with STATE_LOCK:
+            fails = RESTART["fails"]
+            # cap the shift as well as the delay: fails is unbounded
+            delay = min(RESTART_BACKOFF_S * (2 ** min(fails, 16)),
+                        RESTART_BACKOFF_MAX_S)
+            RESTART["fails"] = fails + 1
+            STATE["log"].append({"t": "info", "event": "restart-scheduled",
+                                 "detail": "%s in %ds" % (host_path, delay)})
+            del STATE["log"][:-200]
+        time.sleep(delay)   # daemon pump thread; no lock held while waiting
+        try:
+            spawn_host(host_path)
+            return
+        except Exception as e:
+            with STATE_LOCK:
+                STATE["log"].append({"t": "info", "event": "restart-failed",
+                                     "detail": repr(e)})
+                del STATE["log"][:-200]
+
+
+def pump_host(proc, host_path):
     def run():
         for line in proc.stdout:
             line = line.strip()
@@ -174,10 +224,13 @@ def pump_host(proc):
                 proc.wait(timeout=1)
             except Exception:
                 pass
+        if host_path:   # the UI outlives the demo: schedule a restart
+            restart_host(host_path)
     threading.Thread(target=run, daemon=True).start()
 
 
 def pump_serial():
+    last_err = None
     while True:
         try:
             line = SERIAL.readline().decode("utf-8", "replace").strip()
@@ -188,7 +241,16 @@ def pump_serial():
                     push(json.loads(line), "ESP32")
                 except json.JSONDecodeError:
                     log_protocol_error("bad_json")
-        except Exception:
+        except Exception as e:
+            # a failing port must not disappear into this except: surface
+            # each distinct failure in the UI log (deduped -- the port error
+            # repeats identically, and the log is a 200-record ring)
+            if repr(e) != last_err:
+                last_err = repr(e)
+                with STATE_LOCK:
+                    STATE["log"].append({"t": "info", "event": "serial-error",
+                                         "detail": last_err})
+                    del STATE["log"][:-200]
             time.sleep(0.5)
             with STATE_LOCK:
                 STATE["connected"] = False
@@ -198,8 +260,23 @@ def pump_serial():
 def send(cmd):
     line = json.dumps(cmd, separators=(",", ":")) + "\n"
     if SERIAL is not None:
-        SERIAL.write(line.encode())
-        return True
+        payload = line.encode()
+        try:
+            n = SERIAL.write(payload)
+            SERIAL.flush()  # wait until the bytes really left for the device
+        except Exception:
+            with STATE_LOCK:
+                STATE["connected"] = False
+                STATE["degraded"] = True
+            return False
+        # pyserial returns the byte count (None on ports that cannot report
+        # one): anything short of the whole line is a failed send, not success
+        ok = n is None or n == len(payload)
+        if not ok:
+            with STATE_LOCK:
+                STATE["connected"] = False
+                STATE["degraded"] = True
+        return ok
     try:
         PROC.stdin.write(line)  # text=True: str, not bytes
         PROC.stdin.flush()
@@ -506,8 +583,9 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global STATE
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", nargs="?", const="build/host_demo",
-                    default=None)
+    ap.add_argument("--host", nargs="?", const=DEFAULT_HOST, default=DEFAULT_HOST,
+                    help="path to the host_demo process (default: "
+                         "build/host_demo under the repository root)")
     ap.add_argument("--serial", default=None)
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
@@ -520,10 +598,8 @@ def main():
         threading.Thread(target=pump_serial, daemon=True).start()
     else:
         global PROC
-        PROC = subprocess.Popen([args.host], stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, text=True, bufsize=1)
         STATE["source"] = "HOST"
-        pump_host(PROC)
+        PROC = spawn_host(args.host)
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"demo UI: http://127.0.0.1:{args.port}/  (Ctrl-C to stop)")
