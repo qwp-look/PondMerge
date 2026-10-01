@@ -3,7 +3,7 @@
 All notable changes to PondMerge are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] - 2026-10-01
 
 ### Added
 
@@ -21,6 +21,91 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the enum) reports a malformed target alignment. Verified by R58/R59/R60 and
   by the model differential running random partial compacts against its
   independent oracle.
+- **`compact(pool, req, &target_met)`** -- optional third parameter reporting
+  whether the plan actually reached its target. `true` = the plan stopped at a
+  prefix after which the requested allocation would succeed (including
+  "already satisfiable, zero moves" and the target-less full form); `false` =
+  the budget was spent first, a pinned barrier ended the plan, or the pool
+  packed out without the target firing. `false` is a plan outcome, not a
+  failure: the compaction still succeeded and moved what it moved. Before
+  this, a caller could not distinguish "budget spent, target met" from
+  "budget spent, target unmet" without re-running `analyze_compaction`.
+  Written on every return; failure returns always write `false`. Pinned by
+  R62.
+- **The IDF component exposes its sizing through Kconfig** (`CONFIG_PM_*`,
+  new root `Kconfig`) and -- both in the repo-root component and the
+  in-repo wrapper -- propagates the `PM_*` sizing macros as PUBLIC compile
+  definitions. Consumer TUs (pm_ptr's inline templates, static_asserts on
+  `PM_MAX_OBJECTS`) now see the exact values the core was compiled with by
+  construction; previously the definitions were PRIVATE and every consumer
+  hand-copied `-DPM_MAX_OBJECTS=256` (four call sites in-tree), where one
+  stale copy was a silent ODR violation instead of a build error. Verified
+  via compile_commands.json: core/main/suite compile with identical macro
+  sets across all three in-repo IDF projects.
+
+### Fixed
+
+- **`alloc` re-proves the free block's window on the success path** (R61).
+  `bins_find` screens its cursors against the ZONE only -- it has no pool
+  context -- so a bin head damaged by an external writer could hand this
+  pool a block from another pool's window, and the split/header writes of a
+  successful alloc would corrupt it; `check_ref`'s pool-range proof would
+  only have named the damage on the NEXT borrow, after the write. The block
+  is now proven in-pool and free before anything is carved (O(1), same
+  discipline as `free`'s `free_block_binned`); refusal is `CorruptMetadata`
+  with the output reference cleared and no descriptor slot consumed.
+- **`tests/run_host.sh --seg1024` actually runs the 1 KiB geometry.** The
+  flag was documented in tests/suite.cpp's own comment but the runner had no
+  such branch: it fell through to the ops argument, `atoi("--seg1024")`
+  parsed it as 0 ops, and the run "passed" with the DEFAULT geometry, the
+  stress work parsed away and the model reduced to a handful of checks
+  (measured: 288,943 + 3 checks, exit 0). The runner now has the branch
+  (Debug and Release forms), and the suite binary refuses non-numeric or
+  zero ops arguments outright instead of reporting a false green.
+- **The demo host process auto-restarts** (with bounded backoff) instead of
+  staying degraded forever after a crash; serial-pump errors are logged
+  instead of swallowed, `send()` in SERIAL mode reports short writes/
+  failures honestly, and `--host` resolves its default relative to the
+  repository root, not the caller's cwd.
+- **The sensor-pipeline example evicts the genuinely oldest entry in the
+  Wave ring** (it used `drop_history(0)`, which after a swap-remove is NOT
+  the oldest -- the comment above the call already said so), and checks its
+  `Result` before touching `.value`.
+- **bench_timer.h bridges mcycle gaps from the wall clock.** The ESP32 cycle
+  counter is 32-bit; two timer reads more than one wrap period apart
+  (~17.9 s at 240 MHz) silently lost whole laps and under-reported every
+  later interval. An implausible delta (>= half a wrap) is now bridged from
+  esp_timer's 64-bit wall clock, and the single-threaded contract of the
+  accumulation is stated where the statics live.
+
+### Changed
+
+- **Host gates count their work.** `scripts/gates.sh` parses the "N checks"
+  summaries and enforces floors (Debug/Release >= 5,000,000, San >= 1,400,000,
+  seg1024 >= 4,000,000, model >= 400,000) instead of trusting the exit code;
+  a silently shrunken run -- the class of accident above -- now fails
+  loudly. The demo binary is rebuilt on every gates run instead of reused
+  when present. Gate 12/12 runs the seg1024 geometry; the bench build gate
+  now also compiles `host_insn` and `churn_overhead`, which nothing had
+  compiled on host before.
+- **CI gained the platform surface the product actually ships on**: ESP-IDF
+  build jobs for esp32s3 and esp32 (plus the sensor-pipeline example), a
+  32-bit (`-m32`) host build of the config smoke, a clang Debug pass, the
+  seg1024 geometry, a Debug-mode fuzz pass (the assert layer under fuzz),
+  per-job timeouts, a persisted fuzz corpus and artifact upload on fuzz
+  failure. Until now the Xtensa side compiled only on the maintainer's
+  workstation, every host job was x86-64 g++, and the fuzz crash reproducer
+  was claimed to survive but was never uploaded.
+- **Branch coverage is gated** (floor 75%) alongside the line floor; it used
+  to be printed only. `run_host.sh` accepts `CXX`/`FUZZ_CXX` overrides
+  instead of hardcoding g++/clang++.
+- **`scripts/device_run.sh` is machine-portable**: openocd auto-detected from
+  the espressif tool directory (env-overridable, like the ports and the IDF
+  activation script), the reader process is killed per-port instead of by
+  script name (two boards no longer kill each other's capture), and the
+  crash verdict no longer depends on an S3-only ROM banner -- IDF panic
+  strings ('Guru Meditation Error' / 'abort() was called') are matched on
+  both targets, which fixes silent missed crashes on the classic ESP32.
 
 ## [1.1.0] - 2026-09-25
 
