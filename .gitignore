@@ -19,3 +19,4 @@ examples/*/dependencies.lock
 *.gcov
 *.gcda
 *.gcno
+__pycache__/

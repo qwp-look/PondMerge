@@ -23,7 +23,7 @@ OS 线程）的**用户态托管内存系统**。在一段固定 Auto Zone 上�
 | 跑可视化 Demo（浏览器 + 设备） | [examples/](examples/) 与 [docs/DEMO_REQUIREMENTS.md](docs/DEMO_REQUIREMENTS.md) |
 | 审计与不变量证据 | [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) |
 | **实测性能数字与仪器限制** | [bench/RESULTS.md](bench/RESULTS.md) |
-| 历史轮次报告 | [docs/HANDOVER_v20.md](docs/HANDOVER_v20.md)（含 v2–v19 索引） |
+| 历史轮次报告 | [docs/HANDOVER_v20.md](docs/HANDOVER_v20.md)（最新一轮；v2–v19 各轮文档同在 docs/ 目录） |
 
 ## 目录结构
 
@@ -36,7 +36,7 @@ src/
     internal.h      内部结构（Pool / ObjectDesc / TlsfBins / FreeBlock）
     core.cpp        核心实现（单一翻译单元）
 tests/
-    suite.cpp       验收测试套件（基础 1–13 + R1–R55，host 与 ESP32 共用）
+    suite.cpp       验收测试套件（基础 1–13 + R1–R60，host 与 ESP32 共用）
     model.cpp       参考模型对拍（固定 seed，独立预言机；host）
     concurrency_esp32.cpp  双核借用/暂停/整理锁边界测试（仅 ESP32 构建）
     main.cpp        主机 runner（套件 + 模型）
@@ -56,8 +56,8 @@ examples/           Demo、真实场景参考与协议回归
     host_demo.cpp       Host demo 进程（stdin 命令 -> stdout JSON 快照）
     demo_server.py      HTTP 服务 + 浏览器 UI（--host 子进程 / --serial 设备）
     esp32_demo/         ESP32 demo 固件（独立 IDF 工程，固定脚本场景）
-    protocol_smoke.py   Demo 协议回归（95 项检查，无浏览器依赖）
-    http_smoke.py       HTTP 层回归（15 项检查）
+    protocol_smoke.py   Demo 协议回归（104 项检查，无浏览器依赖）
+    http_smoke.py       HTTP 层回归（27 项检查）
     owner_probe.cpp     Advice owner 门控违约诊断示例
 bench/              可复现基准 + 实测结果（见 README.md 与 RESULTS.md）
     bench_timer.h       计时仪器：按批计时 + 自报 + 拒绝不可支持的逐次计时
@@ -251,12 +251,9 @@ if (a.verdict == pm::CompactionVerdict::COMPACT_RECOMMENDED) { /* 安排静默�
 pm::set_compaction_thresholds({100, 512});   // 碎片阈值（可查询可配置）
 
 // 部分整理（v1.2；详见 COMPACTION_POLICY.md）：目标 + 预算的有界整理
-pm::CompactionRequest part{};
-part.requested_size = 4096;                  // 整理到 4 KiB 连续空间可分配
-part.max_move_bytes = 8192;                  // 搬移预算 8 KiB
-pm::compact(pool, &part);
-pm::CompactionRequest part{};                // v1.2 部分整理：目标 + 预算
-part.requested_size = 4096; part.max_move_bytes = 8192;
+pm::CompactionRequest part{};                // 零值字段 = 无对应限制
+part.requested_size = 4096;                  // 目标：整理到 4 KiB 连续空间可分配
+part.max_move_bytes = 8192;                  // 预算：搬移不超过 8 KiB（块字节口径）
 pm::compact(pool, &part);                    // 有界暂停，见 COMPACTION_POLICY.md
 ```
 
@@ -352,8 +349,8 @@ tests/run_host.sh --configs    # 配置矩阵（等价于 tests/config_matrix.sh
 
 g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc \
     examples/host_demo.cpp src/core.cpp -o build/host_demo   # Host Demo 进程
-python3 examples/protocol_smoke.py build/host_demo            # 协议回归（95 项）
-python3 examples/http_smoke.py build/host_demo                # HTTP 层回归（15 项）
+python3 examples/protocol_smoke.py build/host_demo            # 协议回归（104 项）
+python3 examples/http_smoke.py build/host_demo                # HTTP 层回归（27 项）
 ```
 
 ### 测试组
@@ -369,30 +366,34 @@ python3 examples/http_smoke.py build/host_demo                # HTTP 层回归�
 | R35（第九轮） | 建议估算精确性（池首空闲块场景）+ 计数器审计故障注入 |
 | R54–R55（第十五轮） | alloc 拒绝诊断的两半：R54 = 深层链损坏仍被拒绝但改报 `NoSpace`（且 `validate()` 仍报损坏）+ 位图/头不一致仍为 `CorruptMetadata`；R55 = 位图/头一致性检查的其余两条规则（头部游标出池、层级位与子级位不一致） |
 | R36–R53（第十四轮，R45 空缺） | 元数据筛查缺陷修复的红测：alloc 的 order_head 界（R38）、check_ref 链接界（R39）、create_pool 段窗口证明（R43）、池几何 zone 上限（R44）、mid-gap slack、post-deinit 拒绝、重复 live 地址、split/free 故障注入、耗尽矩阵、validate 第三段、advice 负路径、Paused 恢复、零长尾访问、generation 回绕、16 B gap 边界、溢出带 |
+| R56–R57（第十七轮） | create_pool 段数上界：超过 zone 段数的计数经 `(int32_t)` 符号回绕成"找到"的 run → 域外写（host 实锤 SIGSEGV），现以 zone 侧单界拒绝且系统完好（R56）；validate 拒绝敌意 free 布局：物理相邻的入箱空闲块、以及入箱空闲块数超过 live+1（后者旧实现落入二次回退且误答 Ok，现 O(n) 拒绝）（R57） |
+| R58–R60（v1.2.0 部分整理） | 部分整理三模式：R58 = 搬移预算被精确尊重（块粒度截断、未搬对象 epoch 不变、池保持一致）；R59 = 目标已满足 → 零搬迁、零 epoch 外 churn；R60 = 目标+预算组合（增量收益、预算截断、非法目标对齐 → `InvalidRequest`）；另有模型差分的随机部分整理（随机预算/目标，预言机校验 `bytes_moved ≤ 预算`） |
 | 参考模型 | 固定 seed 随机 alloc/free/compact/merge/split，独立预言机校验 live 数、payload、池归属、字节账目与可分配性 |
 | 双核并发（设备） | 借用/暂停/整理的 SMP 锁边界（`tests/concurrency_esp32.cpp`） |
-| 协议/HTTP 冒烟 | `examples/protocol_smoke.py`（95 项）、`examples/http_smoke.py`（15 项） |
+| 协议/HTTP 冒烟 | `examples/protocol_smoke.py`（104 项）、`examples/http_smoke.py`（27 项） |
 
 ### 当前验收状态
 
 > host 三行由 `scripts/gates.sh` 每轮收口复验，最新数字见
-> [docs/HANDOVER_v20.md](docs/HANDOVER_v20.md)；下表是当前轮的记录（v20 实测，
-> 2026-09-25，host 默认几何 4 KiB；设备构建为 1 KiB 几何，见 v20 §2）。
+> [docs/HANDOVER_v20.md](docs/HANDOVER_v20.md)；下表是当前轮的记录（**v1.2.0 实测，
+> 2026-10-01**，host 默认几何 4 KiB，另含 seg1024 一行；设备构建为 1 KiB 几何，
+> 见 v20 §2。v20（2026-09-25）的历史记录在其下方保留并标注版本）。
 
 | 档位 | 结果 |
 |---|---|
-| Host Debug（10000 op） | 5,454,163 checks, 0 failures |
-| Host Release（10000 op） | 5,454,170 checks, 0 failures |
-| ASan/UBSan（3000 op） | 1,553,174 checks, 0 failures |
-| 参考模型对拍 | 466,859 checks, 0 failures |
+| Host Debug（10000 op） | 5,485,093 checks, 0 failures |
+| Host Release（10000 op） | 5,485,100 checks, 0 failures |
+| Host Release，seg1024 几何（10000 op） | 4,178,295 checks, 0 failures（gates 第 12 项，下限 4,000,000） |
+| ASan/UBSan（3000 op） | 1,584,104 checks, 0 failures |
+| 参考模型对拍 | 465,124 checks, 0 failures（v1.2 的随机部分整理改变了模型的操作流，计数由 v20 的 466,859 变为 465,124，三平台仍同数） |
 | cppcheck（warning/style/performance） | exit 0，三类计数 0/0/0 |
 | 配置矩阵 | PASSED |
 | 协议回归 / HTTP 回归 | 104 / 27 checks, 0 failures |
-| `src/core.cpp` 覆盖率 | 96.75% 行 / 80.07% 分支执行（Debug 档；Release 档 96.91% 行 / 82.06% 分支选取；下限 85% 强制。v17 降至 92.5%、R56/R57 与 v20 拉回，逐行归账见 AUDIT_LEDGER §7.1） |
+| `src/core.cpp` 覆盖率 | 96.81% 行 / 80.35% 分支执行（Debug 档；Release 档 96.96% 行 / 82.27% 分支选取；下限 行 85% / 分支 75% 强制，v1.2.0 起分支也设门。R56/R57、v20 与 R61/R62 拉回，逐行归账见 AUDIT_LEDGER §7.1） |
 | libFuzzer（有界运行） | 无崩溃、无 sanitizer 发现 |
-| **v20 夹具参数化后（当前几何：64 段 × 1 KiB = 64 KiB zone，静态 DRAM，无 PSRAM）** ||
-| ESP32-S3 (n16r8) 实机，App version `v1.0.0-33-g079e4e5` | 套件 **939,054**（R1–R57 全量）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures；复位重跑计数一致 |
-| 经典 ESP32 (D0WDQ6 v1.1) 实机，App version `v1.0.0-32` | 套件 **939,054**（首次在经典 ESP32 上运行）+ 双核并发 28 + 模型 466,859 checks，全部 0 failures |
+| **设备（几何：64 段 × 1 KiB = 64 KiB zone，静态 DRAM，无 PSRAM）** ||
+| ESP32-S3 (n16r8) 实机，App version `v1.2.0`（2026-10-01） | 套件 **946,944**（基础 13 组 + R1–R62 全量）+ 双核并发 28 + 模型 465,124 checks，全部 0 failures |
+| 历史（v20 基线，2026-09-25）：S3 `v1.0.0-33-g079e4e5` 与经典 ESP32 `v1.0.0-32` | 两板各套件 **939,054**（R1–R57）+ 并发 28 + 模型 466,859，0 failures——经典 ESP32 首次全套件即在此轮；v1.2.0 的设备复测目前覆盖 S3（经典 ESP32 重烧后应补一行） |
 | 历史（v20 前基线，256 KiB zone）：S3 `v1.0.0-28` 套件 1,140,849；经典 ESP32 `v1.0.0-31` 套件未运行（编不进）——详见 HANDOVER_v18/v19 |
 
 > 经典 ESP32 的记录已于 2026-09-25 在当前提交（`6d83194`）上重取（v19 收口）：
@@ -479,7 +480,7 @@ rm -f sdkconfig && idf.py set-target esp32s3
 idf.py -B build build
 idf.py -B build -p /dev/ttyACM0 flash monitor      # USB-Serial-JTAG
 
-# 经典 ESP32（并发 + model；套件不编译，原因见验收表下方说明）
+# 经典 ESP32（套件 + 并发 + model；v20 起同样跑完整套件，历史见验收表下方说明）
 rm -f sdkconfig
 SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32" \
     idf.py set-target esp32
@@ -490,23 +491,25 @@ idf.py -B build -p /dev/ttyUSB0 flash monitor       # UART0 + CH340 桥接
 实机记录（S3 基线 `21f94da`；经典 ESP32 于 v20 在当前提交上重取，复位重跑一致）：
 
 ```
-ESP32-S3 (n16r8) · /dev/ttyACM0（USB-Serial-JTAG）· v1.0.0-33-g079e4e5（v20，当前，zone 64 KiB 纯 DRAM）
-  suite（基础 13 组 + R1–R57，2000 ops）：939,054 checks, 0 failures PASSED
+ESP32-S3 (n16r8) · /dev/ttyACM0（USB-Serial-JTAG）· v1.2.0（2026-10-01，zone 64 KiB 纯 DRAM）
+  suite（基础 13 组 + R1–R62，2000 ops）：946,944 checks, 0 failures PASSED
   双核并发：28 checks, 0 failures
-  参考模型对拍（4000 ops）：466,859 checks, 0 failures PASSED
+  参考模型对拍（4000 ops）：465,124 checks, 0 failures PASSED
 
-经典 ESP32 (D0WDQ6 v1.1) · /dev/ttyUSB0（CH340，160 MHz）· v1.0.0-32（v20，当前）
-  suite（基础 13 组 + R1–R57，2000 ops，zone 64 KiB）：939,054 checks, 0 failures PASSED
+历史（v20，2026-09-25）：
+  ESP32-S3 · v1.0.0-33-g079e4e5 / 经典 ESP32 · v1.0.0-32（两板同几何同配置）
+  suite（基础 13 组 + R1–R57，2000 ops）：两板均 939,054 checks, 0 failures PASSED
   双核并发：28 checks, 0 failures
-  参考模型对拍（4000 ops）：466,859 checks, 0 failures PASSED
+  参考模型对拍（4000 ops）：两板均 466,859 checks, 0 failures PASSED
 ```
 
-> S3 的 1 KiB 几何实机行已补齐（2026-09-25 晚）：三平台在**同一几何、同一配置**
-> 下的套件计数逐位一致（939,054），model 同为 466,859——"三平台同数"叙事在
-> 新几何下完整保持。
+> "三平台同数"叙事的两个时点：v20 时（939,054 / 466,859）三平台同数；v1.2.0 的
+> 随机部分整理改变了模型操作流（466,859 → 465,124）且套件加入 R61/R62
+> （939,054 → 946,944），host 与 S3 在 v1.2.0 上再次同数，经典 ESP32 等板子回连
+> 重烧后补一行——这段话就是按"必须实测、不许推断"的规矩留的缺口。
 
-三个平台（host、S3、经典 ESP32）的参考模型对拍都是**同一个 466,859 checks**：
-这是同一份确定性差分测试在三种架构上逐项走完了同样多的判定。并发的
+三个平台（host、S3、经典 ESP32）的参考模型对拍是**同一个 check 数**（当前
+465,124）：这是同一份确定性差分测试在三种架构上逐项走完了同样多的判定。并发的
 rounds 计数则每次运行都不同（调度相关），而 **28 checks 恒为 0 failures**——这正是
 该测试要的性质：被核验的性质稳定，调度才是可变的。
 
@@ -544,7 +547,7 @@ advice 即断言诊断）；`PM_DEBUG=0` 时断言编译为空，但 generation�
 | [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) | 审计账本：不变量 → 代码位置 → 证明 → 测试 |
 | [bench/README.md](bench/README.md) | 基准方法、公平性规则、**计时仪器规则**与引用数字的必备条件 |
 | [bench/RESULTS.md](bench/RESULTS.md) | 全部实测数字、仪器限制、负结果、方案 A 的 A/B |
-| docs/架构说明.md | 目标架构契约 |
+| docs/PondMerge_v1_架构说明.md | 目标架构契约 |
 | docs/PondMerge_v1_代码指导书.md | 接口与内存布局的原始设计 |
 | docs/PondMerge_v1_repair_task.md / v2 | 第一/二轮修复任务书 |
 | docs/HANDOVER_v2–v20.md | 各轮收口报告（v20 为最新：夹具几何参数化轮——经典 ESP32 首跑全套件） |

@@ -14,7 +14,7 @@ compact/merge/split。核心约束：**C++17 子集，无异常、无 RTTI、无
 | | ESP32-S3 (n16r8) | 经典 ESP32 (D0WDQ6) |
 |---|---|---|
 | 核 | LX7，双核 | LX6，双核 |
-| 验收 | suite + concurrency + model | concurrency + model（**suite 不编译**，原因见下） |
+| 验收 | suite + concurrency + model | suite + concurrency + model（两块板都在 v20 的 64 段 × 1 KiB 夹具几何上跑**完整** suite；v19 之前经典 ESP32 编不进 suite，见下） |
 
 ## 2. 铁律（违反任何一条都会破坏这个项目最值钱的东西）
 
@@ -41,11 +41,11 @@ compact/merge/split。核心约束：**C++17 子集，无异常、无 RTTI、无
 
 ## 3. 怎么跑验证（host，改任何东西之后）
 
-一把全跑（十一项，等价于下面逐条命令；CI 的 `benchmarks` job 是其中第 11 项
+一把全跑（十二项，等价于下面逐条命令；CI 的 `benchmarks` job 是其中第 11 项
 的来源）：
 
 ```sh
-scripts/gates.sh                # 全部十一项；输出折叠，失败时保留末 30 行
+scripts/gates.sh                # 全部十二项；输出折叠，失败时保留末 30 行
 scripts/gates.sh -v             # 不折叠输出
 ```
 
@@ -58,7 +58,7 @@ tests/run_host.sh --san      # ASan+UBSan
 tests/run_host.sh --cppcheck # 静态检查（用 2.19.0 校准过；换版本先看
                              # tests/run_host.sh --cppcheck 分支的版本注释）
 tests/run_host.sh --configs  # TLSF 配置矩阵
-tests/run_host.sh --coverage # 覆盖率（Debug + Release 两档，行覆盖下限 85%）
+tests/run_host.sh --coverage # 覆盖率（Debug + Release 两档，行 85% / 分支 75% 下限）
 tests/run_host.sh --fuzz     # libFuzzer 有界运行
 g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -Isrc \
     examples/host_demo.cpp src/core.cpp -o build/host_demo
@@ -71,15 +71,25 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude -Isrc \
 g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra \
     -Wno-unused-parameter -Werror -Iinclude -Isrc \
     bench/$b.cpp src/core.cpp -o build/bench_$b     # b ∈ {alloc_latency,
-    validate_scaling, fragmentation, compaction_window}（CI 的 benchmarks job）
+    validate_scaling, fragmentation, compaction_window, host_insn,
+    churn_overhead}（CI 的 benchmarks job）
+tests/run_host.sh --seg1024-release                  # 第 12 项：1 KiB 夹具几何
+                                                     # （设备侧同一几何；见下）
 ```
+
+**检查数下限**：`gates.sh` 对套件/模型项不只看退出码，还解析 "N checks" 并
+执行下限（Debug/Release ≥ 5,000,000、San ≥ 1,400,000、seg1024 ≥ 4,000,000、
+模型 ≥ 400,000）——下限远低于实测值，正常改动不会触发；它会响亮拦下的是
+"运行静默缩水"（ops 被解析成 0、stress 段被砍、跑错几何）这类**退出码全绿但
+什么都没测**的事故（--seg1024 在成为真分支之前就是这么个幽灵选项）。
 
 真实场景集成参考是 `examples/sensor_pipeline.cpp`（host/设备同一份源码，
 设备工程在 `examples/sensor_pipeline_esp32/`）——写新集成时先读它。
 
-全部通过应看到 **5,454,163 (Debug) / 5,454,170 (Release) / 1,553,174 (San，
-3000 ops) checks, 0 failures**，模型对拍 **466,859**。CI（`.github/workflows/ci.yml`）
-在每次 push 上跑这十一项 + 消费路径冒烟 + 基准构建。
+全部通过应看到 **5,485,093 (Debug) / 5,485,100 (Release) / 1,584,104 (San，
+3000 ops) checks, 0 failures**，模型对拍 **465,124**（seg1024 几何 Release 档
+4,178,295）。CI（`.github/workflows/ci.yml`）在每次 push 上跑这十二项 +
+clang / -m32 / ESP-IDF 双目标编译 + 消费路径冒烟 + 基准构建。
 
 ## 4. 怎么跑设备端（需要真实硬件）
 
@@ -92,7 +102,7 @@ g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -Wall -Wextra \
 
 两个 IDF 工程，**都支持两个目标**：
 
-- `esp32/` — 验收固件（suite + concurrency + model / 只后两组）
+- `esp32/` — 验收固件（suite + concurrency + model；v20 起两个目标跑同一份完整套件）
 - `bench/esp32/` — 性能基准（与 host 同一份源码；S3 与经典 ESP32 两种 sizing）
 
 ```sh
@@ -117,10 +127,17 @@ idf.py -p /dev/ttyUSB0 flash          # UART0 经 CH340 桥接
 `CONFIG_IDF_TARGET`**（target 用首个匹配猜测）。两个坑的细节写在
 `esp32/sdkconfig.defaults.esp32` 与 `bench/esp32/sdkconfig.defaults.esp32` 里。
 
-**为什么经典 ESP32 不跑 suite**：suite 把 zone 尺寸写在自己的断言里
-（测试 [10] `CHECK(made == 16)`、测试 [2] 要 32 段池），而该芯片静态 DRAM
-只有约 200 KiB，链接实测 `dram0_0_seg overflowed by 126744 bytes`。
-固件会打印 `=== suite SKIPPED (not run, not passed) ===`——**跳过绝不写成通过**。
+**经典 ESP32 与 suite（v20 起）**：v20 把套件夹具几何参数化（`PM_TEST_SEG_BYTES`，
+64 段 × 1 KiB = 64 KiB zone）之后，**两块板跑的是同一个完整套件**（各 939,054
+checks，0 failures；详见 README「当前验收状态」）。验收固件里"哪些组编进哪块板"
+的分叉已随 v20 删除，两个 IDF 工程对两个目标都构建同一份套件源码。
+
+> **历史（v19 之前）**：旧夹具把 zone 钉死在 64 段 × 4 KiB = 256 KiB（测试 [10]
+> `CHECK(made == 16)`、测试 [2] 要 32 段池都写在自己的断言里），而该芯片静态
+> DRAM 只有约 200 KiB，链接实测 `dram0_0_seg overflowed by 126744 bytes`——
+> suite 当时编不进经典 ESP32，固件会打印
+> `=== suite SKIPPED (not run, not passed) ===`（**跳过绝不写成通过**）。
+> 这段分叉已被 v20 的参数化终结，只作追溯保留。
 
 ## 5. 改性能相关代码之前
 

@@ -13,9 +13,12 @@
 #   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32" \
 #       idf.py set-target esp32 build
 #
-# The classic ESP32 entry point does not run the acceptance suite; it cannot,
-# because the suite pins its zone to 64 segments inside its own assertions. See
-# esp32/main/CMakeLists.txt and esp32/sdkconfig.defaults.esp32.
+# Since v20 (PM_TEST_SEG_BYTES=1024 fixture geometry, 64 segments x 1 KiB) the
+# classic ESP32 runs the FULL acceptance suite too -- both targets build and run
+# the same suite (see esp32/main/CMakeLists.txt and README.md "当前验收状态").
+# This file now only carries target differences (S3-facing defaults: console,
+# flash size, FreeRTOS tick/clock, exceptions/RTTI off); the classic ESP32's own
+# overrides live in sdkconfig.defaults.esp32.
 CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

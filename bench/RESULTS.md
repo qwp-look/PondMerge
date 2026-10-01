@@ -177,6 +177,12 @@ The per-operation cost is what the pair column gives.
 
 ## 2. `validate` is quadratic; that is measured, not restated
 
+> **Historical note (added at v1.2)**: everything in this section predates the
+> round-15 linearisation of `validate()`. The current implementation is
+> **O((live + free) log(live + free))** -- fitted exponent **0.98**, see §8
+> (maintenance-path review) and §5.9 (in-repo re-run). The quadratic fallback
+> itself was removed in R57 (v19). The data below is kept only for traceability.
+
 `validate()` is documented `O((live + free)^2)`. It is read-only and idempotent,
 so it can simply be called K times per interval with no state to restore; K is
 chosen from a single probe call so each row costs about the same wall time.

@@ -75,7 +75,7 @@ init(cfg) → create_pool → alloc/对象操作 → 维护（compact/merge/spli
 | `compact(pool, &req)` | 同上 | v1.2 部分整理：目标/预算见 COMPACTION_POLICY.md；**装不进屏障时截断成功而非拒绝** | 同上 | 同上，搬移 ≤ 预算 |
 | `merge(s,t)` | 两池 Running/Paused | 规划失败两池逐字节不变 | target Running（epoch+1），source Empty | O(objects + free + moved)，另加 O(objects log objects) 恢复地址序 |
 | `split(s,n)` | Running/Paused | 零改动；新池槽位回收 | 两池 Running；新池 epoch=1 | O(objects + moved)，另加 O(objects log objects) 恢复地址序 |
-| `validate` | 任意非 Empty | — | Ok / CorruptMetadata | O((live+free)²) |
+| `validate` | 任意非 Empty | — | Ok / CorruptMetadata | O((live+free) log(live+free))——v19 起线性化；旧的二次回退已在 R57 删除（入箱空闲块数超过 live+1 本身即损坏，O(n) 直接拒绝） |
 
 - 结构（四阶段）：加锁 arming → 只读审计+规划（scratch）→ 不可失败执行 →
   单锁最终提交。pinned/DMA/external 对象地址不变。
@@ -134,9 +134,12 @@ Host 运行不能证明锁语义，SMP 证据来自双核设备测试（`tests/c
   fragment_bytes、object_count、borrow_count、structure_epoch、objects_moved、
   bytes_moved、compact_time_us。
 - `GlobalStats`：高水位统计 + `metadata_bytes`——库自有静态对象的总量
-  （GlobalState + 维护计划 scratch + 整理建议状态），按 C++ 类型计算。实测与链接器
-  看到的真实 `.bss` 相差 ±8 字节。公式与分档表见 `README.md` 的"元数据（静态 RAM）
-  预算"一节：**默认 1024 对象约 113.5 KiB（116,236 B），MCU 上务必下调 `PM_MAX_OBJECTS`。**
+  （GlobalState + 维护计划 scratch + 整理建议状态），按 C++ 类型计算的**上界估计**。
+  链接器实际放置的 `.bss` 可因 GCC 的节放置（toplevel reorder / 节锚定）与对齐
+  与该计数相差最高约 1 KiB；2026-09-25 在 512/8 与 1024/16 档实测到 `.bss` 反而
+  **更小 2–4 KB**——预算按"宁可多算 4 KiB"来留，以 `README.md` 的实测表为准。
+  公式与分档表见 `README.md` 的"元数据（静态 RAM）预算"一节：**默认 1024 对象约
+  113.5 KiB（116,236 B），MCU 上务必下调 `PM_MAX_OBJECTS`。**
   注意那条公式是 **x86-64** 的闭式；`ObjectDesc` 里含一个指针，32 位目标上更小
   （ESP32-S3 实测 256 对象 / 16 池 = **30,729 B**，每对象约 90 B 而非 98 B）。
   **算 RAM 预算请直接读运行时的 `metadata_bytes`**，它在任何 ABI 上都精确。
@@ -149,14 +152,18 @@ Host 运行不能证明锁语义，SMP 证据来自双核设备测试（`tests/c
 | free | O(1 + 邻块空闲 bin 链长) |
 | compact / split | O(objects + moved bytes) + O(objects log objects) 恢复地址序 |
 | merge | O(objects + free blocks + moved bytes) |
-| validate | O((live + free)²) |
+| validate | O((live + free) log(live + free))（v19 起线性化，R57 删除二次回退） |
 | get_stats | O(free blocks) |
 | analyze_compaction | O(objects log objects + free blocks) |
 
 **关于 `alloc`**：早先它把描述符**按地址序插入** live 链，那一步被实测为 ≈100% 的
 alloc 成本且随 live 数线性增长。地址序只在维护路径上被需要，因此改为 alloc 做 O(1)
-追加、维护入口一次性重建地址序。实测 232 ns @256 → **38 ns**，799 ns @1024 → **38 ns**
-（`bench/RESULTS.md`）。**不变量搬迁与其检测边界变化见 `docs/AUDIT_LEDGER.md`**：
+追加、维护入口一次性重建地址序。实测（批计时差分法，同一基准源码编译到改动前/后
+两个 core 修订的 A/B）：live=16 时 58.0 → **38.0 ns**，live=1024 时 **844.2 →
+38.4 ns（22×）**（`bench/RESULTS.md` §1）。早期文档流传的"232 ns @256、
+799 ns @1024"出自一台被 RDTSC 陷阱拖垮的仪器（单次时钟读取 ~9,400 ns），已被
+重测取代——见 `docs/AUDIT_LEDGER.md` §8 第十一轮。
+**不变量搬迁与其检测边界变化见 `docs/AUDIT_LEDGER.md`**：
 alloc 不再检测 live 链损坏，该职责移到每个维护入口与 `validate()`。API 与错误码不变。
 
 固定元数据：描述符表、池表、bins、计划 scratch（s_plan/s_upper/s_barriers/

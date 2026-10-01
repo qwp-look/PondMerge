@@ -24,7 +24,12 @@
 
 执行 `compact()` 前仍必须走正式维护契约：状态、借用、外部静默期、返回值。
 
-## 2. 统一结论（五值）
+## 2. 统一结论（六值）
+
+> 数目注记：`pm::CompactionVerdict` 枚举实有 **6 个值**（`NO_ACTION` /
+> `COMPACT_RECOMMENDED` / `COMPACT_BLOCKED` / `COMPACT_UNLIKELY_TO_HELP` /
+> `INVALID_METADATA` / `INVALID_REQUEST`，见 `include/pondmerge/pondmerge.hpp`）；
+> 本节旧标题曾写"五值"，是 `INVALID_REQUEST`（第七轮补入）加入前留下的旧称。
 
 | verdict | 含义 | 调用方动作 |
 |---|---|---|
@@ -119,6 +124,10 @@ case pm::CompactionVerdict::INVALID_METADATA:
 case pm::CompactionVerdict::NO_ACTION:
     /* 直接分配 */
     break;
+case pm::CompactionVerdict::INVALID_REQUEST:
+    /* 调用方输入错误（size=0、对齐非法、溢出、超 FL 上限）：修正请求参数后
+       重新查询建议——这是重查请求，不是重试整理 */
+    break;
 }
 pm::validate(pool);  // 整理后可选的结构审计
 ```
@@ -132,6 +141,10 @@ pinned/DMA/external 对象是搬移屏障：整理会在其两侧分别打包。
 
 
 ## 部分整理（v1.2）
+
+> **版本状态注记**：本节所述的部分整理（`compact(pool, &req)` 与红测 R58–R60）
+> 属于 **v1.2.0（2026-10-01 发布）**；权威描述见
+> `CHANGELOG.md` 的 [1.2.0] 一节。本文只描述语义。
 
 `compact(pool, &req)` 在完整整理的语义之上增加两种**有界**模式，`req == nullptr`
 时与 `compact(pool)` 完全等价：
