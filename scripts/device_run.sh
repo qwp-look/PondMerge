@@ -36,11 +36,15 @@ if [ "$TARGET" != "s3" ] && [ "$TARGET" != "esp32" ]; then
 fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PORT=/dev/ttyACM0
-[ "$TARGET" = "esp32" ] && PORT=/dev/ttyUSB0
+# Ports and the openocd install are overridable for other machines/versions;
+# the defaults are this workstation's. The openocd glob picks the newest
+# toolchain version instead of a hard-coded release directory.
+PORT="${PM_S3_PORT:-/dev/ttyACM0}"
+[ "$TARGET" = "esp32" ] && PORT="${PM_ESP_PORT:-/dev/ttyUSB0}"
 CAP="/tmp/device_run_${TARGET}.log"
-OCD=/home/qwp/.espressif/tools/openocd-esp32/v0.12.0-esp32-20260424/openocd-esp32/bin/openocd
-OCDScripts=/home/qwp/.espressif/tools/openocd-esp32/v0.12.0-esp32-20260424/openocd-esp32/share/openocd/scripts
+IDF_ENV="${PM_IDF_ENV:-$HOME/esp/activate-idf.sh}"
+OCD="${PM_OPENOCD:-$(ls -1v "$HOME"/.espressif/tools/openocd-esp32/*/openocd-esp32/bin/openocd 2>/dev/null | tail -1)}"
+OCDScripts="${PM_OPENOCD_SCRIPTS:-$(dirname "$(dirname "$OCD")")/share/openocd/scripts}"
 
 log() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
 
@@ -70,26 +74,36 @@ EOF
 }
 
 start_reader() {
-    pkill -f pm_raw_reader.py 2>/dev/null; sleep 1
+    # Kill only OUR port's reader (the script name alone would kill a reader
+    # another target/board is using on this machine).
+    pkill -f "pm_raw_reader.py $PORT" 2>/dev/null; sleep 1
     rm -f "$CAP"
     python3 /tmp/pm_raw_reader.py "$PORT" "$CAP" 600 > /dev/null 2>&1 &
     sleep 1
     kill -0 %1 2>/dev/null
 }
 
-# ---- verdict: anchored to the LAST ROM banner; a reboot AFTER the app
-# banner is a crash, a reboot after "Returned from app_main" is the normal
-# end of a run (IDF restarts when main returns). ----
-verdict() {
-    # Anchored verdict: only content AFTER the app banner counts, and a crash
-    # is a ROM banner appearing AFTER that banner but BEFORE the normal
-    # completion ("Returned from app_main" -> IDF restarts the chip, which
-    # prints one more ROM banner -- that is the normal end of a run, not a
-    # crash). The openocd reset itself also echoes TWO banners (reset + boot),
-    # so position anchoring, not counting, is what works.
-    python3 - "$CAP" 480 <<'EOF'
+    # ---- verdict: anchored to the LAST ROM banner; a reboot AFTER the app
+    # banner is a crash, a reboot after "Returned from app_main" is the normal
+    # end of a run (IDF restarts when main returns). ----
+    verdict() {
+        # Anchored verdict: only content AFTER the app banner counts, and a crash
+        # is a reboot/panic appearing AFTER that banner but BEFORE the normal
+        # completion ("Returned from app_main" -> IDF restarts the chip, which
+        # prints one more ROM banner -- that is the normal end of a run, not a
+        # crash). The openocd reset itself also echoes TWO banners (reset + boot),
+        # so position anchoring, not counting, is what works.
+        #
+        # Crash signatures are target-specific ON PURPOSE: 'ESP-ROM:' banners
+        # exist on the S3 but NOT on the classic ESP32 (whose ROM prints
+        # 'rst:0x..' on every boot, including the normal end-of-run one -- a
+        # plain banner match there would report the SUCCESSFUL end as a
+        # crash). 'Guru Meditation Error' / 'abort() was called' are the
+        # panic strings IDF prints BEFORE any restart, on both targets, and
+        # never on a clean run.
+        python3 - "$CAP" "$TARGET" 480 <<'EOF'
 import sys, time
-path, timeout = sys.argv[1], float(sys.argv[2])
+path, target, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
 t0, last_size, last_growth = time.time(), -1, time.time()
 while time.time() - t0 < timeout:
     try:
@@ -102,7 +116,10 @@ while time.time() - t0 < timeout:
     t2 = data[app:]
     if '=== model PASSED' in t2 or 'Returned from app_main' in t2:
         print('RESULT: ALL PASSED'); sys.exit(0)
-    if 'ESP-ROM:esp32s3' in t2:
+    crash = 'Guru Meditation Error' in t2 or 'abort() was called' in t2
+    if not crash and target == 's3' and 'ESP-ROM:esp32s3' in t2:
+        crash = True
+    if crash:
         print('RESULT: REBOOT MID-RUN (crash)'); sys.exit(1)
     if 'FAIL' in t2:
         print('RESULT: FAIL SEEN'); sys.exit(1)
@@ -113,12 +130,12 @@ while time.time() - t0 < timeout:
     time.sleep(2)
 print('RESULT: TIMEOUT'); sys.exit(1)
 EOF
-}
+    }
 
 # ---- build ----
 if [ "$MODE" = "full" ]; then
     log "building for $TARGET"
-    ( source "$HOME/esp/activate-idf.sh" >/dev/null 2>&1
+    ( source "$IDF_ENV" >/dev/null 2>&1
       cd "$ROOT/esp32" || exit 1
       if [ ! -f sdkconfig ] || ! grep -q "CONFIG_IDF_TARGET=\"$TARGET\"" sdkconfig; then
           rm -f sdkconfig
@@ -136,7 +153,7 @@ if [ "$MODE" = "full" ]; then
     # ---- flash with retries (see header) ----
     local_ok=0
     for attempt in 1 2 3 4; do
-        ( source "$HOME/esp/activate-idf.sh" >/dev/null 2>&1
+        ( source "$IDF_ENV" >/dev/null 2>&1
           cd "$ROOT/esp32" || exit 1
           idf.py -B build -p "$PORT" flash >> /tmp/device_flash.log 2>&1
         ) && local_ok=1 && break
@@ -165,7 +182,7 @@ else
     # MODE=full, so the run below is already in flight; for capture-only,
     # pulse EN via esptool's reset (CH340 control lines work fine here).
     if [ "$MODE" = "capture" ]; then
-        ( source "$HOME/esp/activate-idf.sh" >/dev/null 2>&1
+        ( source "$IDF_ENV" >/dev/null 2>&1
           python -m esptool --chip esp32 -p "$PORT" --before default-reset \
               --after hard-reset chip-id >/dev/null 2>&1 )
     fi
