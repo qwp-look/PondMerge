@@ -388,6 +388,8 @@ tr:hover td{background:#141a24}
 #log{height:150px;overflow-y:scroll;background:#0d1117;border:1px solid var(--border);
      border-radius:8px;padding:8px 10px;font-family:var(--mono);font-size:11.5px}
 #log .ev{color:var(--accent)}#log .dt{color:var(--muted)}
+.autoline{font-size:12.5px;color:var(--accent);margin-top:6px;font-family:var(--mono);
+          min-height:1.2em;white-space:pre-wrap}
 .mono{font-family:var(--mono)}
 </style></head><body><div class="wrap">
 <header>
@@ -411,6 +413,10 @@ tr:hover td{background:#141a24}
 <div>
  <div class="card">
   <h2>控制台</h2>
+  <div class="group"><div class="gt">自动演示</div>
+   <button class="primary" id="autobtn" onclick="toggleAuto()">▶ 自动演示：填满 → 随机释放 → 合并/切分 → 整理</button>
+   <div id="autoline" class="autoline" style="display:none"></div>
+  </div>
   <div class="group"><div class="gt">对象操作</div>
    <label class="inline">池</label><input id="apool" value="0" size="2">
    <label class="inline">大小</label><input id="asize" value="300" class="wide">
@@ -524,7 +530,7 @@ function op(cmd, params){
     }
     showQuiescenceNote();
     return j;
-  }).then(refresh);
+  }).then(j => refresh().then(() => j));
 }
 function showQuiescenceNote(){
   const note = document.getElementById('resnote');
@@ -541,8 +547,160 @@ function showQuiescenceNote(){
   }
 }
 function sendQuit(){ op('quit'); }
+
+// ---- auto demo ------------------------------------------------------------
+// A four-act scripted tour driven through the SAME op() channel as the
+// buttons: fill every pool (each pool rolls a random "personality"), free a
+// random subset, restructure pools (merge over REAL adjacency read from the
+// snapshot; split a random pool), then compact each pool. Every step is an
+// ordinary protocol command, so refusals (NoSpace, PinnedConflict, pool-table
+// exhaustion) are part of the show, and the slide animation replays every
+// real compaction the library performs.
+let autoRun = false;
+let autoIds = [];   // object ids the auto demo allocated and has not freed
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function fetchState(){ return fetch('/api/state').then(r => r.json()); }
+function setAutoLine(text){
+  const el = document.getElementById('autoline');
+  el.style.display = 'block';
+  el.textContent = text;
+}
+const AUTO_LABEL = '▶ 自动演示：填满 → 随机释放 → 合并/切分 → 整理';
+function toggleAuto(){
+  if (autoRun){ autoRun = false; setAutoLine('⏹ 正在停止…'); return; }
+  runAuto();
+}
+function shuffle(a){
+  for (let i = a.length - 1; i > 0; --i){
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = a[i]; a[i] = a[j]; a[j] = t;
+  }
+}
+// merge() needs physically adjacent pools; the snapshot's segment windows
+// say exactly which pairs qualify.
+function adjacentPairs(pools){
+  const pairs = [];
+  for (const a of pools) for (const b of pools)
+    if (a.pool_id !== b.pool_id &&
+        a.segment_first + a.segment_count === b.segment_first)
+      pairs.push([a.pool_id, b.pool_id]);
+  return pairs;
+}
+async function runAuto(){
+  autoRun = true;
+  const btn = document.getElementById('autobtn');
+  btn.textContent = '⏹ 停止演示';
+  const dead = () => {
+    if (!autoRun){ setAutoLine('⏹ 自动演示已停止'); return true; }
+    return false;
+  };
+  try {
+    // Act 0: a clean stage.
+    setAutoLine('自动演示：重置场景…');
+    autoIds = [];
+    await op('reset');
+    await sleep(500);
+    if (dead()) return;
+
+    // Act 1: fill every pool. Each pool rolls a personality -- movable-heavy,
+    // mixed, or pinned-heavy. Pinned blocks make the later compaction
+    // honestly harder (barriers), which is the point of rolling.
+    const ROLES = [
+      {name: '可搬移为主', pin: 0.15, dma: 0.05},
+      {name: '混合',       pin: 0.40, dma: 0.05},
+      {name: '钉住为主',   pin: 0.80, dma: 0.05},
+    ];
+    let pools = [];
+    {
+      const s = await fetchState();
+      pools = (s.snapshot && s.snapshot.pools) || [];
+    }
+    for (const p of pools){
+      const role = ROLES[Math.floor(Math.random() * ROLES.length)];
+      let made = 0;
+      for (let i = 0; i < 80; ++i){
+        if (dead()) return;
+        const size = 8 * (16 + Math.floor(Math.random() * 170)); // 128..1448 B
+        const r = Math.random();
+        const flags = r < role.dma ? 6 : (r < role.dma + role.pin ? 2 : 0);
+        const j = await op('alloc', {pool: p.pool_id, size: size, align: 8, flags: flags});
+        if (j.status !== 'OK') break;   // NoSpace: this pool is full -- the real answer
+        if (j.result && j.result.object_id !== undefined)
+          autoIds.push(j.result.object_id);
+        made++;
+        setAutoLine('自动演示 1/4 填充：池 ' + p.pool_id + '（' + role.name +
+                    '）已分配 ' + made + ' 个对象');
+        await sleep(110);
+      }
+    }
+    if (dead()) return;
+
+    // Act 2: free a random subset in random order -- scattered holes.
+    shuffle(autoIds);
+    const nFree = Math.floor(autoIds.length * (0.35 + Math.random() * 0.25));
+    for (let i = 0; i < nFree; ++i){
+      if (dead()) return;
+      const id = autoIds.pop();
+      await op('free', {id: id});
+      setAutoLine('自动演示 2/4 随机释放：' + (i + 1) + ' / ' + nFree);
+      await sleep(150);
+    }
+    if (dead()) return;
+
+    // Act 3: restructure. Refusals (not adjacent, pinned across the split
+    // boundary, pool table full) are shown as they happen, never hidden.
+    for (let round = 0; round < 3; ++round){
+      if (dead()) return;
+      const s = await fetchState();
+      pools = (s.snapshot && s.snapshot.pools) || [];
+      const splittable = pools.filter(p => p.segment_count >= 3);
+      const mergeable = adjacentPairs(pools);
+      const roll = Math.random();
+      if (roll < 0.5 && mergeable.length){
+        const pair = mergeable[Math.floor(Math.random() * mergeable.length)];
+        setAutoLine('自动演示 3/4 池结构：合并 池 ' + pair[0] + ' → 池 ' + pair[1]);
+        await op('merge', {source: pair[0], target: pair[1]});
+      } else if (splittable.length){
+        const p = splittable[Math.floor(Math.random() * splittable.length)];
+        const segs = 1 + Math.floor(Math.random() * (p.segment_count - 1));
+        setAutoLine('自动演示 3/4 池结构：切分 池 ' + p.pool_id + '，切出 ' + segs + ' 段');
+        await op('split', {source: p.pool_id, segments: segs});
+      } else break;
+      await sleep(1000);
+    }
+    if (dead()) return;
+
+    // Act 4: compact every pool; the slide animation replays each one.
+    {
+      const s = await fetchState();
+      pools = (s.snapshot && s.snapshot.pools) || [];
+      for (const p of pools){
+        if (dead()) return;
+        setAutoLine('自动演示 4/4 整理：池 ' + p.pool_id);
+        await op('compact', {pool: p.pool_id});
+        await sleep(1150);
+      }
+    }
+    if (dead()) return;
+    const fin = await fetchState();
+    const fp = (fin.snapshot && fin.snapshot.pools) || [];
+    const stranded = fp.reduce(
+      (s, p) => s + Math.max(0, (p.free_bytes || 0) - (p.largest_free_block || 0)), 0);
+    setAutoLine('✅ 自动演示完成：' + fp.length + ' 个池 · 存活对象 ' +
+                ((fin.snapshot && fin.snapshot.objects.length) || 0) +
+                ' · 搁浅合计 ' + stranded.toLocaleString() + ' B');
+  } catch (e){
+    setAutoLine('自动演示异常：' + e);
+  } finally {
+    autoRun = false;
+    // a stop-then-restart race: only reset the label if no new run owns it
+    if (!autoRun)
+      document.getElementById('autobtn').textContent = AUTO_LABEL;
+  }
+}
 function refresh(){
-  fetch('/api/state').then(r=>r.json()).then(s=>{
+  // returns its promise: op() chains refresh() and re-yields the reply JSON
+  return fetch('/api/state').then(r=>r.json()).then(s=>{
     document.getElementById('src').textContent = s.source;
     document.getElementById('build').textContent = s.build_id || '-';
     document.getElementById('conn').textContent = s.connected ? '已连接' : '未连接';
