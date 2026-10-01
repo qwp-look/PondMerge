@@ -355,7 +355,15 @@ label.inline{font-size:12.5px;color:var(--muted);margin-right:4px}
       overflow:hidden;margin:4px 0 4px;position:relative;background:#0d1117}
 .blk{height:100%;box-sizing:border-box;border-right:1px solid var(--bg);
      overflow:hidden;font-size:10.5px;font-family:var(--mono);white-space:nowrap;
-     display:flex;align-items:center;justify-content:center;color:#fff;min-width:2px}
+     display:flex;align-items:center;justify-content:center;color:#fff;min-width:2px;
+     position:relative}
+.blk.moving{outline:2px solid #7dff9a;outline-offset:-2px;z-index:2;
+            box-shadow:0 0 12px rgba(125,255,154,.4)}
+.blk.arriving{animation:arrive .9s ease}
+.blk.bad{outline:2px solid var(--err);outline-offset:-2px}
+@keyframes arrive{from{opacity:0}to{opacity:1}}
+@media (prefers-reduced-motion: reduce){
+  .blk{transition:none !important;animation:none !important}}
 .MOVABLE{background:linear-gradient(180deg,#3a76d6,#2b5cb0)}
 .PINNED{background:linear-gradient(180deg,#d43a3a,#a32626)}
 .FREE{background:repeating-linear-gradient(45deg,#2a303b,#2a303b 6px,#232833 6px,#232833 12px);color:var(--muted)}
@@ -479,6 +487,7 @@ tr:hover td{background:#141a24}
 </div>
 <script>
 let last = null, prev = null, lastOp = null, lastQ = null, diffData = null;
+let animating = false, animToken = 0, lastAnimatedSeq = null;
 // All dynamic text goes through textContent (round-7 guide section 9): no
 // protocol field, build id or error detail is ever interpolated into HTML.
 const FMT = n => Number(n).toLocaleString('en-US');
@@ -502,6 +511,7 @@ function op(cmd, params){
   lastOp = cmd;
   lastQ = document.getElementById('qchk').checked;
   diffData = null; // the next maintenance op earns a fresh before/after diff
+  animating = false; animToken++; // a new command cancels any running slide
   return fetch('/api/op',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify(Object.assign({cmd:cmd}, params||{}))})
@@ -546,7 +556,7 @@ function refresh(){
     banner.style.display = ro ? 'block' : 'none';
     const sn = s.snapshot;
     if (!sn) return;
-    renderLanes(sn);
+    if (!animating) renderLanes(sn); // a running slide owns the lane visuals
     renderAdvice(sn);
     renderObjects(sn);
     document.getElementById('res').textContent =
@@ -563,19 +573,33 @@ function refresh(){
     renderLog(s.log);
     // The before/after diff is computed ONCE, from the pre-op snapshot, and
     // then stays visible until the next op() clears it -- a 400 ms flash
-    // would be unreadable.
-    const isMaint = lastOp === 'compact' || lastOp === 'merge' || lastOp === 'split';
-    if (isMaint && prev){
-      diffData = buildDiffText(sn, prev);
-      lastOp = null;
+    // would be unreadable. While the slide animation owns the diff box,
+    // neither the diff text nor prev may advance.
+    if (!animating){
+      const isMaint = lastOp === 'compact' || lastOp === 'merge' || lastOp === 'split';
+      if (isMaint && prev){
+        diffData = buildDiffText(sn, prev);
+        lastOp = null;
+      }
+      prev = sn;
+      const box = document.getElementById('diff');
+      if (diffData){
+        box.style.display = 'block';
+        box.textContent = '整理前后对比 — ' + diffData;
+      } else {
+        box.style.display = 'none';
+      }
     }
-    prev = sn;
-    const box = document.getElementById('diff');
-    if (diffData){
-      box.style.display = 'block';
-      box.textContent = '整理前后对比 — ' + diffData;
-    } else {
-      box.style.display = 'none';
+    // The slide animation is driven by the SERVER's verified move diff
+    // (last_diff): every entry was checked against the protocol invariants
+    // (generation and payload digest unchanged, address_epoch strictly
+    // increased), so the animation replays the library's REAL memmoves --
+    // not an invented transition. Keyed by snapshot seq so the persistent
+    // diff animates exactly once.
+    if (!animating && sn.seq !== lastAnimatedSeq &&
+        s.last_diff && (s.last_diff.moved || []).length){
+      lastAnimatedSeq = sn.seq;
+      startCompactionAnimation(sn, s.last_diff);
     }
   }).catch(()=>{
     document.getElementById('conn').textContent = '未连接';
@@ -610,6 +634,7 @@ function renderLanes(sn){
       const live = (b.kind === 'MOVABLE' || b.kind === 'PINNED');
       const d = el('div', 'blk ' + b.kind);
       d.style.width = Math.max(0.4, 100*b.size/cap).toFixed(2) + '%';
+      if (b.object_id !== undefined) d.dataset.oid = b.object_id;
       if (100*b.size/cap > 7){
         d.textContent = live ? ('#' + b.object_id + ' · ' + FMT(b.size) + 'B')
                              : (b.kind === 'FREE' ? '空闲 ' + FMT(b.size) + 'B' : b.kind);
@@ -642,6 +667,67 @@ function buildDiffText(sn, before){
               ' → ' + p.structure_epoch);
   }
   return rows.join('　|　');
+}
+// Replays the library's actual compaction on the lane: every entry of the
+// server's verified diff becomes one block sliding from its old offset to
+// its new one. Same-pool moves translate; cross-pool moves (merge/split)
+// fade in at their destination; a diff entry that failed the server-side
+// invariant check is outlined red instead of animated.
+function startCompactionAnimation(sn, diff){
+  const moves = diff.moved || [];
+  const lanes = document.getElementById('lanes');
+  const laneEls = lanes.querySelectorAll('.lane');
+  const byPool = {};
+  sn.pools.forEach((p, i)=>{ if (laneEls[i]) byPool[p.pool_id] = {el: laneEls[i], p}; });
+  const token = ++animToken;
+  let n = 0;
+  for (const m of moves){
+    const ctx = byPool[m.new_pool];
+    if (!ctx) continue;
+    const blk = ctx.el.querySelector('div[data-oid="' + m.object_id + '"]');
+    if (!blk) continue;
+    if (!m.invariants_ok){ blk.classList.add('bad'); n++; continue; }
+    if (m.old_pool === m.new_pool){
+      const px = (m.old_offset - m.new_offset) *
+                 (ctx.el.clientWidth / (ctx.p.capacity || 1));
+      if (Math.abs(px) < 1) continue;
+      n++;
+      blk.classList.add('moving');
+      blk.style.transition = 'none';
+      blk.style.transform = 'translateX(' + px.toFixed(1) + 'px)';
+      // double rAF: the start transform must be committed before the
+      // transition to identity is, or the browser collapses both writes
+      requestAnimationFrame(()=>requestAnimationFrame(()=>{
+        if (token !== animToken) return;
+        blk.style.transition = 'transform .9s cubic-bezier(.25,.1,.25,1)';
+        blk.style.transform = 'translateX(0)';
+      }));
+    } else {
+      n++;
+      blk.classList.add('arriving');
+    }
+  }
+  if (!n) return;
+  animating = true;
+  const box = document.getElementById('diff');
+  const restore = diffData ? ('整理前后对比 — ' + diffData) : null;
+  box.style.display = 'block';
+  box.textContent = '⏳ 整理中：' + n + ' 个对象正在沿库的真实搬移路径滑动' +
+                    '（搬迁不变量已由服务器校验：generation 与摘要不变、epoch 递增）…';
+  setTimeout(()=>{
+    if (token !== animToken) return;
+    animating = false;
+    lanes.querySelectorAll('.blk.moving,.blk.arriving,.blk.bad').forEach(b=>{
+      b.classList.remove('moving','arriving','bad');
+      b.style.transition = '';
+      b.style.transform = '';
+    });
+    if (restore !== null){
+      box.textContent = restore;
+    } else {
+      box.style.display = 'none';
+    }
+  }, 950);
 }
 function renderAdvice(sn){
   const adv = document.getElementById('advice');
