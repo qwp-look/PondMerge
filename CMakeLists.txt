@@ -136,20 +136,37 @@ if(ESP_PLATFORM)
     target_compile_options(${COMPONENT_LIB} PRIVATE
         -Wall -Wextra -Wno-unused-parameter
         $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>)
+    # PM_ESP32 stays PRIVATE: it selects the port layer the CORE is built with
+    # (pm_port.h is internal), and no consumer TU should see it.
     target_compile_definitions(${COMPONENT_LIB} PRIVATE PM_ESP32)
 
-    # Sizing is NOT hardcoded here. A consuming project may set any of these as
-    # plain CMake variables before the component is processed, which is the
-    # intended way to fit the metadata budget of a small target:
+    # Sizing is NOT hardcoded here. Two override paths, in precedence order:
     #
-    #   set(PM_MAX_OBJECTS 256)      # ~30 KiB (30,729 B on ESP32-S3) instead of ~113.5 KiB (116,236 B)
-    #   set(PM_MAX_POOLS 4)
+    #   1. a plain CMake variable set before the component is processed:
+    #        set(PM_MAX_OBJECTS 256)
+    #   2. the Kconfig options in this component's Kconfig file
+    #      (CONFIG_PM_* via menuconfig/sdkconfig.defaults).
     #
-    # Anything not set falls through to the core defaults in pm_config.h.
+    # Anything not set either way falls through to the core defaults in
+    # pm_config.h.
+    #
+    # The definitions are PUBLIC on purpose: the header-only parts of the API
+    # (pm_ptr, pm_access, Result, the PM_ASSERT wiring) and any static_assert a
+    # consumer writes against PM_MAX_OBJECTS must be compiled with the SAME
+    # values as core.cpp -- a mismatch is an ODR violation (different object
+    # layout) that no linker will report, so it must not be left to the
+    # consumer's memory. (Before v1.2 these were PRIVATE, which made the
+    # consumer's own -D copies load-bearing and silently out of sync-able.)
     foreach(_pm_var PM_MAX_OBJECTS PM_MAX_POOLS PM_MAX_SEGMENTS PM_SL_COUNT PM_FL_MAX PM_DEBUG)
         if(DEFINED ${_pm_var})
-            target_compile_definitions(${COMPONENT_LIB} PRIVATE ${_pm_var}=${${_pm_var}})
+            set(_pm_val ${${_pm_var}})
+        elseif(DEFINED CONFIG_${_pm_var})
+            set(_pm_val ${CONFIG_${_pm_var}})
+        else()
+            continue()
         endif()
+        target_compile_definitions(${COMPONENT_LIB} PUBLIC ${_pm_var}=${_pm_val})
+        unset(_pm_val)
     endforeach()
 
 endif() # ESP_PLATFORM

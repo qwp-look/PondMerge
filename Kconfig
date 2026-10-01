@@ -1,0 +1,66 @@
+# PondMerge compile-time sizing, exposed to menuconfig when this repository is
+# consumed as an ESP-IDF component (the repo root added to
+# EXTRA_COMPONENT_DIRS, or via the component registry). These only take effect
+# through the CMake interface in CMakeLists.txt (FORM 2): a CONFIG_PM_* option
+# is applied when no plain CMake variable of the same name was set, and
+# anything unset falls through to the core defaults in pm_config.h.
+#
+# A plain CMake variable wins over sdkconfig ON PURPOSE: it is the escape hatch
+# for projects that generate their configuration rather than running
+# menuconfig.
+#
+# Metadata cost is dominated by PM_MAX_OBJECTS: at the 4-byte-pointer target
+# layout roughly 40 B per descriptor slot plus the plan scratch. See the
+# metadata budget table in README.md before raising these on a small part.
+
+menu "PondMerge"
+
+    config PM_MAX_OBJECTS
+        int "Maximum live object descriptors (PM_MAX_OBJECTS)"
+        default 1024
+        range 1 65534
+        help
+            Dominant driver of static RAM. The descriptor table is
+            PM_MAX_OBJECTS entries; the maintenance scratch scales with it.
+
+    config PM_MAX_POOLS
+        int "Maximum number of pools (PM_MAX_POOLS)"
+        default 16
+        range 1 65535
+        help
+            The pool table size. Pools are cheap; objects are what costs.
+
+    config PM_MAX_SEGMENTS
+        int "Maximum Auto Zone segments (PM_MAX_SEGMENTS)"
+        default 64
+        range 1 65535
+        help
+            Upper bound on zone_size / segment_size at init(). Must stay
+            <= 65535 (pool segment fields are 16-bit).
+
+    config PM_SL_COUNT
+        int "TLSF second-level bin count (PM_SL_COUNT)"
+        default 4
+        range 2 16
+        help
+            Must be a power of two: 2, 4, 8 or 16. More bins, better fit,
+            larger bitmap.
+
+    config PM_FL_MAX
+        int "TLSF first-level ceiling exponent (PM_FL_MAX)"
+        default 24
+        range 5 31
+        help
+            Block sizes are tracked up to 2^PM_FL_MAX; init() refuses a zone
+            whose rounded size reaches that bound, so the Auto Zone must stay
+            below it.
+
+    config PM_DEBUG
+        int "Assertion level (PM_DEBUG)"
+        default 1
+        range 0 1
+        help
+            1 = Debug: asserts abort with the refusing status, the advice
+            owner gate is active. 0 = Release: assertions compile out.
+
+endmenu

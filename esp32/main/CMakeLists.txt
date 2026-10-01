@@ -12,14 +12,18 @@ set(PM_DEVICE_SRCS
     "../../tests/suite.cpp")
 
 idf_component_register(SRCS ${PM_DEVICE_SRCS}
-                       INCLUDE_DIRS "../../tests" "../../include" "../components/pondmerge")
+                       INCLUDE_DIRS "../../tests"
+                       REQUIRES pondmerge)
+# REQUIRES pondmerge brings in the public include dir AND the PUBLIC PM_*
+# sizing definitions (PM_MAX_OBJECTS=256 et al. come from the wrapper
+# component) -- do not re-state them here; a private -D copy would override
+# the propagated value and reintroduce an ODR mismatch.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Wno-unused-parameter)
 # PM_DEVICE_BUILD: model.cpp reuses the shared zone buffer instead of its own
 # static one (device DRAM budget), and main.cpp sizes the model run for the
 # device (round-5 guide section 7). PM_TEST_SEG_BYTES is the fixture geometry
 # knob that tests/suite.cpp derives its whole zone from.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
-    PM_MAX_OBJECTS=256
     PM_DEVICE_BUILD=1
     PM_TEST_SEG_BYTES=1024)
 # The zone attribute stays available to the build system (see tests/suite.cpp)
