@@ -53,6 +53,7 @@
 
 #if defined(PM_ESP32)
 #include "esp_cpu.h"
+#include "esp_timer.h"
 #include "sdkconfig.h"
 #endif
 
@@ -69,6 +70,20 @@ inline uint64_t g_hz = 0;
 // It is 32-bit and wraps every ~17.9 s at 240 MHz, so it is accumulated into a
 // 64-bit cycle total; the unsigned delta makes the accumulation wrap-safe.
 //
+// WRAP-SAFETY BOUND, enforced rather than assumed: the unsigned delta is only
+// faithful while two calls are less than one wrap period apart (2^32 cycles,
+// ~17.9 s at 240 MHz). A longer gap silently loses whole laps and every later
+// interval comes out short. now_ns() therefore also reads the free-running
+// 64-bit esp_timer and, when the observed delta is larger than half a wrap
+// period (~8.9 s -- no benchmark batch is ever legitimately that long), it
+// bridges the gap from the wall clock instead (elapsed_us * MHz; the RC
+// oscillator drift of esp_timer is negligible at measurement scale). The
+// bridge path is one branch on the hot path and prints once if it ever fires.
+//
+// Single-threaded by contract: the statics are the measurement stream of ONE
+// bench task. A second caller would corrupt the accumulation -- keep it that
+// way (the bench firmware never calls these from two tasks).
+//
 // The conversion deliberately avoids a 128-bit multiply. The ESP32-S3 is Xtensa,
 // and the Xtensa toolchain has no TImode, so __uint128_t does not exist there --
 // a fact this file learned from a failed build, not from documentation. Instead
@@ -82,16 +97,36 @@ inline const char* backend_name() { return "esp_cpu_get_cycle_count (mcycle)"; }
 inline uint64_t now_ns() {
     static uint32_t last = 0;
     static uint64_t cycles = 0;
+    static int64_t last_us = 0;
     static bool started = false;
+    static bool bridged_once = false;
     uint32_t const c = (uint32_t)raw_now();
+    int64_t const us = (int64_t)esp_timer_get_time();
     if (!started) {
         started = true;
         last = c;
+        last_us = us;
         g_hz = (uint64_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000ull;
         g_name = backend_name();
     }
-    cycles += (uint32_t)(c - last); // unsigned delta: wrap-safe
+    uint32_t const delta = (uint32_t)(c - last); // unsigned delta: wrap-safe
+    int64_t const elapsed_us = us - last_us;
+    // delta >= half a wrap period means the two reads are farther apart than
+    // any benchmark batch: the 32-bit counter cannot be trusted across the
+    // gap, so count the elapsed wall time instead.
+    if (delta > (1ull << 31) && elapsed_us > 0) {
+        cycles += (uint64_t)elapsed_us * (uint64_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+        if (!bridged_once) {
+            bridged_once = true;
+            std::printf("pm_bench: mcycle gap of %lld s bridged from esp_timer "
+                        "(delta loses whole 17.9 s wraps)\n",
+                        (long long)(elapsed_us / 1000000));
+        }
+    } else {
+        cycles += delta;
+    }
     last = c;
+    last_us = us;
     return cycles * 1000ull / (uint64_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
 }
 

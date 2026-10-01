@@ -17,7 +17,7 @@
 // churn_overhead.cpp's row A.
 //
 // Build:
-//   g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -DPM_MAX_OBJECTS=256 \
+//   g++ -std=c++17 -O2 -DNDEBUG -DPM_DEBUG=0 -DPM_MAX_OBJECTS=256
 //       -Iinclude -Isrc bench/host_insn.cpp src/core.cpp -o /tmp/host_insn
 //   for n in 4096 8192; do
 //     valgrind --tool=callgrind --callgrind-out-file=/tmp/cg_$n.out
