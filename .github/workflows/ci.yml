@@ -83,6 +83,8 @@ jobs:
       # closest host-side proxy).
       - name: Build and run the config smoke with -m32
         run: |
+          # build/ is gitignored: a fresh checkout does not have it.
+          mkdir -p build
           g++ -m32 -std=c++17 -Wall -Wextra -Werror -O1 -DPM_DEBUG=1 \
               -Iinclude -Isrc src/core.cpp tests/config_smoke.cpp \
               -o build/config_smoke_m32
