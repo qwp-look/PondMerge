@@ -978,7 +978,14 @@ uint32_t s_free_off[kFreeOffCap];
 // Address-order stable packing with pinned barriers; plan fully before any
 // move (doc sections 8.1-8.3). This function NEVER publishes pool state: the
 // caller commits Running/structure_epoch under the lock (round-3 guide 8).
-Status compact_impl(Pool& P, CompactionRequest const* req) {
+//
+// `met_out` (may be null) reports whether the plan reached its TARGET: true
+// when it stopped at a prefix after which an allocation of requested_size/
+// alignment would succeed, or when there is no target at all (req == nullptr
+// or requested_size == 0 -- a full compaction cannot miss one). Any other
+// ending -- budget spent, a pinned barrier, or the plan running to completion
+// without the target check ever firing -- leaves it false.
+Status compact_impl(Pool& P, CompactionRequest const* req, bool* met_out) {
     GlobalState& G = g();
     if (P.borrow_count != 0) return Status::Busy;
     uint64_t t0 = pm_port_ticks_us();
@@ -987,6 +994,7 @@ Status compact_impl(Pool& P, CompactionRequest const* req) {
     Status st = Status::Ok;
     PoolId const pid = (PoolId)(&P - G.pools);
     uint32_t nslot = 0, nbar = 0, nplan = 0;
+    bool met = false;
 
     // Gate every memmove on a full descriptor audit; it also produces the
     // address-ordered slot array, and every later loop iterates THAT array
@@ -1030,6 +1038,9 @@ Status compact_impl(Pool& P, CompactionRequest const* req) {
         budget_b = req->max_move_bytes;
         budget_o = req->max_move_objects;
     }
+    // No target (full form or requested_size == 0): the report is vacuously
+    // true -- a full compaction cannot miss a target it was not given.
+    met = (need == 0);
 
     {
         uint8_t* cursor = start;
@@ -1083,7 +1094,7 @@ Status compact_impl(Pool& P, CompactionRequest const* req) {
                     (uint64_t)(uintptr_t)bstart - (uint64_t)(uintptr_t)cursor;
                 uint64_t best = walked_gap > (uint64_t)s_ord_key[i]
                                     ? walked_gap : (uint64_t)s_ord_key[i];
-                if (best >= need) break; // target reached without this move
+                if (best >= need) { met = true; break; } // target reached without this move
             }
             // Budget check BEFORE the move: block granularity, no overshoot.
             if ((budget_b != 0 && moved_b + bsize > budget_b) ||
@@ -1122,6 +1133,7 @@ Status compact_impl(Pool& P, CompactionRequest const* req) {
     if (moved_bytes > G.max_bytes_moved) G.max_bytes_moved = moved_bytes;
     if (P.compact_time_us > G.max_compact_time_us) G.max_compact_time_us = P.compact_time_us;
     if (P.fragment_bytes > G.max_fragment_bytes) G.max_fragment_bytes = P.fragment_bytes;
+    if (met_out) *met_out = met;
     return Status::Ok;
 }
 
@@ -1524,6 +1536,23 @@ Status alloc(PoolId pool_id, uint32_t size, uint32_t alignment, uint16_t flags,
         bool const consistent = bins_bitmap_consistent(*P);
         slot_release(slot);
         return consistent ? Status::NoSpace : Status::CorruptMetadata;
+    }
+    // bins_find proves its cursor is inside the ZONE, not inside this POOL --
+    // it has no pool context. A bin head damaged by an external writer could
+    // therefore hand this pool a block that belongs to another pool's window,
+    // and the split/header writes below would corrupt it. Re-prove the window
+    // (and the free bit) here, exactly like free()'s free_block_binned() does
+    // for its cursors; check_ref()'s pool-range proof would only catch the
+    // damage on the NEXT borrow, after the write happened.
+    {
+        uint64_t const blk_off = (uint64_t)off_of(blk);
+        uint64_t const pstart = pool_start_off(*P);
+        uint64_t const pend = pstart + (uint64_t)pool_capacity(*P);
+        if (blk_off < pstart || blk_off + BLOCK_HEADER_SIZE > pend ||
+            !blk_is_free(blk)) {
+            slot_release(slot);
+            return Status::CorruptMetadata;
+        }
     }
     if (blk_size_of(blk) < need) {
         slot_release(slot);
@@ -2095,9 +2124,10 @@ Status compact(PoolId id) {
     return compact(id, nullptr);
 }
 
-Status compact(PoolId id, CompactionRequest const* req) {
+Status compact(PoolId id, CompactionRequest const* req, bool* target_met) {
     GlobalState const& G = g();
     Pool* P = pool_at(id);
+    if (target_met) *target_met = false; // written on every return
     if (!G.initialized) return Status::NotInitialized;
     if (!P) return Status::InvalidPool;
     // Decide the whole state transition under the same lock borrow_begin
@@ -2121,7 +2151,8 @@ Status compact(PoolId id, CompactionRequest const* req) {
     }
     PM_UNLOCK();
     if (st != Status::Ok) return st;
-    Status r = compact_impl(*P, req);
+    bool met = false;
+    Status r = compact_impl(*P, req, &met);
     // Final commit under the same lock class borrow_begin uses (round-3
     // guide 8): the pool is published Running -- and only then -- after the
     // whole maintenance body succeeded. A planning failure restores the
@@ -2134,6 +2165,7 @@ Status compact(PoolId id, CompactionRequest const* req) {
         P->state = was_paused ? PoolState::Paused : PoolState::Running;
     }
     PM_UNLOCK();
+    if (r == Status::Ok && target_met) *target_met = met;
     return r;
 }
 

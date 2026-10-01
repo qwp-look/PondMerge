@@ -9,7 +9,20 @@ int pondmerge_run_tests(uint32_t stress_ops);
 uint32_t pondmerge_run_model(uint32_t zone_bytes, uint32_t ops);
 
 int main(int argc, char** argv) {
-    uint32_t ops = argc > 1 ? (uint32_t)atoi(argv[1]) : 10000;
+    uint32_t ops = 10000;
+    if (argc > 1) {
+        // A non-numeric argument (e.g. a flag meant for run_host.sh, such as
+        // --seg1024 before that runner learned it) would parse as 0 and
+        // silently shrink the stress and model work to nothing while still
+        // exiting 0. Refuse it instead of reporting a false green.
+        char* end = nullptr;
+        long const v = strtol(argv[1], &end, 10);
+        if (end == argv[1] || *end != '\0' || v <= 0) {
+            fprintf(stderr, "usage: %s [stress ops > 0]\n", argv[0]);
+            return 2;
+        }
+        ops = (uint32_t)v;
+    }
     int rc = pondmerge_run_tests(ops);
 
     // The model test has its own fixed seed and its own check counter; scale

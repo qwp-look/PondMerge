@@ -5310,6 +5310,196 @@ static void test_partial_target_and_budget() {
 }
 
 // ---------------------------------------------------------------------------
+// (R61) A4-11: alloc's SUCCESS path must re-prove the bin head's window.
+// bins_find() screens its cursors against the ZONE only -- it has no pool
+// context -- so a bin head damaged by an external writer could hand this
+// pool a block from ANOTHER pool's window (in-zone, out-of-pool), and the
+// split/header writes of a successful alloc would corrupt it. The damage
+// would only be named by check_ref()'s pool-range proof on the NEXT borrow,
+// after the write happened. alloc now refuses with CorruptMetadata, the
+// output ref stays cleared and no descriptor slot is consumed.
+//   (a) head aimed at a free block of another pool,
+//   (b) head aimed at this pool's own LIVE block (free bit proves it).
+// ---------------------------------------------------------------------------
+static void test_alloc_foreign_bin_head() {
+    printf("  [R61] alloc refuses bin heads outside its pool / in-use blocks\n");
+    using namespace pm::internal;
+
+    // The exact bin a probe of 16 B payload selects: need = 16 + 8 header.
+    uint32_t const probe_size = 16;
+    uint32_t const need = probe_size + BLOCK_HEADER_SIZE; // already 8-aligned
+    uint32_t const f = fl_index(need) - MIN_FL;
+    uint32_t const s = sl_index(need, fl_index(need));
+
+    // (a) foreign pool's free block.
+    fresh();
+    pm::PoolId a{}, b{};
+    CHECK_ST(pm::create_pool(a, 2), pm::Status::Ok);
+    CHECK_ST(pm::create_pool(b, 2), pm::Status::Ok);
+    pm::RawRef ob{};
+    CHECK_ST(pm::alloc(b, 100, 8, 0, 1, ob), pm::Status::Ok);
+    fill(ob, 100, 1);
+    Pool& Pa = g().pools[a];
+    Pool& Pb = g().pools[b];
+    // B's one live object leaves exactly one binned free block; find it.
+    uint32_t bfree_off = NULL_OFF;
+    for (uint32_t ff = 0; ff < FL_COUNT && bfree_off == NULL_OFF; ++ff)
+        for (uint32_t ss = 0; ss < SL_COUNT && bfree_off == NULL_OFF; ++ss)
+            if (Pb.bins.head[ff][ss] != NULL_OFF) bfree_off = Pb.bins.head[ff][ss];
+    CHECK(bfree_off != NULL_OFF);
+    CHECK(bfree_off >= (uint32_t)Pb.segment_first * g().segment_size); // sanity: it IS B's
+    uint32_t const saved_head = Pa.bins.head[f][s];
+    uint16_t const saved_sl = Pa.bins.sl_bitmap[f];
+    uint32_t const saved_fl = Pa.bins.fl_bitmap;
+    Pa.bins.head[f][s] = bfree_off;
+    Pa.bins.sl_bitmap[f] = (uint16_t)(Pa.bins.sl_bitmap[f] | (1u << s));
+    Pa.bins.fl_bitmap |= 1u << f;
+    uint16_t const slot_head0 = g().free_slot_head;
+    pm::RawRef r{};
+    CHECK_ST(pm::alloc(a, probe_size, 8, 0, 1, r), pm::Status::CorruptMetadata);
+    CHECK(r.generation == 0 && r.index == 0);          // output stayed cleared
+    CHECK(g().free_slot_head == slot_head0);           // no slot was consumed
+    CHECK_ST(pm::validate(b), pm::Status::Ok);         // B is untouched
+    verify(ob, 100, 1);
+    // Restore A's bin so the pool stays consistent for the next sub-case.
+    Pa.bins.head[f][s] = saved_head;
+    Pa.bins.sl_bitmap[f] = saved_sl;
+    Pa.bins.fl_bitmap = saved_fl;
+    VALIDATE(a);
+    CHECK_ST(pm::free(ob), pm::Status::Ok);
+    done();
+
+    // (b) same pool, but the aimed head is this pool's own LIVE block.
+    fresh();
+    CHECK_ST(pm::create_pool(a, 2), pm::Status::Ok);
+    pm::RawRef ob2{};
+    CHECK_ST(pm::alloc(a, 100, 8, 0, 2, ob2), pm::Status::Ok);
+    fill(ob2, 100, 2);
+    Pool& Pa2 = g().pools[a];
+    uint32_t const live_off = off_of(g().objects[ob2.index].address) -
+                              BLOCK_HEADER_SIZE;
+    Pa2.bins.head[f][s] = live_off;
+    Pa2.bins.sl_bitmap[f] = (uint16_t)(Pa2.bins.sl_bitmap[f] | (1u << s));
+    Pa2.bins.fl_bitmap |= 1u << f;
+    pm::RawRef r2{};
+    CHECK_ST(pm::alloc(a, probe_size, 8, 0, 3, r2), pm::Status::CorruptMetadata);
+    CHECK(r2.generation == 0 && r2.index == 0);
+    verify(ob2, 100, 2);                               // the live block is intact
+    CHECK_ST(pm::free(ob2), pm::Status::Ok);
+    done();
+
+    // A fresh system behaves normally afterwards.
+    fresh();
+    CHECK_ST(pm::create_pool(a, 4), pm::Status::Ok);
+    CHECK_ST(pm::alloc(a, probe_size, 8, 0, 4, r), pm::Status::Ok);
+    CHECK_ST(pm::free(r), pm::Status::Ok);
+    VALIDATE(a);
+    done();
+}
+
+// ---------------------------------------------------------------------------
+// (R62) compact()'s optional target report: *target_met is written on EVERY
+// return. true = the plan stopped at a prefix after which the requested
+// allocation would succeed (including "already satisfiable, zero moves" and
+// the target-less full form). false = the plan ended another way -- budget
+// spent, malformed request, unknown pool -- without confirming the target.
+// false is a plan outcome, not a failure: bytes_moved still applies.
+// ---------------------------------------------------------------------------
+static void test_compact_target_met_report() {
+    printf("  [R62] compact target_met report\n");
+    fresh();
+    const uint32_t TILE = PM_TEST_SEG_BYTES / 4 - 8;
+    pm::PoolId pool{};
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    pm::RawRef o[16];
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK_ST(pm::alloc(pool, TILE, 8, 0, i, o[i]), pm::Status::Ok);
+        fill(o[i], TILE, 600 + i);
+    }
+    bool met = false;
+
+    // (a) packed pool, full compact: no target to miss -> true, zero work.
+    CHECK_ST(pm::compact(pool, nullptr, &met), pm::Status::Ok);
+    CHECK(met == true);
+    CHECK(pm::get_stats(pool).bytes_moved == 0);
+
+    // (b) one hole, target fits it exactly: true with zero moves (R59 shape).
+    CHECK_ST(pm::free(o[0]), pm::Status::Ok);
+    pm::CompactionRequest fit{};
+    fit.requested_size = TILE;
+    fit.requested_alignment = 8;
+    met = false;
+    CHECK_ST(pm::compact(pool, &fit, &met), pm::Status::Ok);
+    CHECK(met == true);
+    CHECK(pm::get_stats(pool).bytes_moved == 0);
+
+    // (c) budget spent before the target: Ok, but NOT met (R60's tight case).
+    CHECK_ST(pm::free(o[2]), pm::Status::Ok);
+    pm::CompactionRequest tight{};
+    tight.requested_size = 2 * (TILE + 8);
+    tight.requested_alignment = 8;
+    tight.max_move_bytes = TILE + 8 - 1;              // cannot afford any move
+    met = true;
+    CHECK_ST(pm::compact(pool, &tight, &met), pm::Status::Ok);
+    CHECK(met == false);
+    CHECK(pm::get_stats(pool).bytes_moved == 0);
+    VALIDATE(pool);
+
+    // (d) malformed request: failure returns always write false.
+    pm::CompactionRequest bad{};
+    bad.requested_size = TILE;
+    bad.requested_alignment = 3;
+    met = true;
+    CHECK_ST(pm::compact(pool, &bad, &met), pm::Status::InvalidRequest);
+    CHECK(met == false);
+    met = true;
+    CHECK_ST(pm::compact((pm::PoolId)99, nullptr, &met), pm::Status::InvalidPool);
+    CHECK(met == false);
+
+    // (e) the target IS reached after real work: true, and the requested
+    // allocation then succeeds.
+    met = false;
+    pm::CompactionRequest reach{};
+    reach.requested_size = TILE + 8;                  // needs the merged gap
+    reach.requested_alignment = 8;
+    CHECK_ST(pm::compact(pool, &reach, &met), pm::Status::Ok);
+    CHECK(met == true);
+    pm::RawRef rr{};
+    CHECK_ST(pm::alloc(pool, TILE, 8, 0, 99, rr), pm::Status::Ok);
+    fill(rr, TILE, 999);
+    CHECK_ST(pm::free(rr), pm::Status::Ok);
+    VALIDATE(pool);
+    for (uint32_t i = 1; i < 16; ++i) {
+        if (i == 2) continue; // freed above
+        pm::RawRef c = o[i]; c.pool_hint = pm::CROSS_HINT;
+        CHECK_ST(pm::free(c), pm::Status::Ok);
+    }
+    done();
+
+    // (f) no holes at all, target larger than anything free: the plan runs to
+    // completion, moves nothing, succeeds -- and reports false.
+    fresh();
+    CHECK_ST(pm::create_pool(pool, 4), pm::Status::Ok);
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK_ST(pm::alloc(pool, TILE, 8, 0, i, o[i]), pm::Status::Ok);
+        fill(o[i], TILE, 700 + i);
+    }
+    pm::CompactionRequest big{};
+    big.requested_size = 2 * (TILE + 8);
+    big.requested_alignment = 8;
+    met = true;
+    CHECK_ST(pm::compact(pool, &big, &met), pm::Status::Ok);
+    CHECK(met == false);
+    CHECK(pm::get_stats(pool).bytes_moved == 0);
+    VALIDATE(pool);
+    for (uint32_t i = 0; i < 16; ++i) {
+        pm::RawRef c = o[i]; c.pool_hint = pm::CROSS_HINT;
+        CHECK_ST(pm::free(c), pm::Status::Ok);
+    }
+    done();
+}
+
+// ---------------------------------------------------------------------------
 // (R46) A4-07: exhaustion matrix. (a) all PM_MAX_OBJECTS descriptor slots go
 // live; a further alloc is NoSpace while old refs stay freeable and the slot
 // chain recycles LIFO. (b) pool-table exhaustion (16 pools with segments
@@ -5502,6 +5692,8 @@ int pondmerge_run_tests(uint32_t stress_ops) {
     run("R58_partial_budget", test_partial_budget);
     run("R59_partial_target_satisfied", test_partial_target_satisfied);
     run("R60_partial_target_and_budget", test_partial_target_and_budget);
+    run("R61_alloc_foreign_bin_head", test_alloc_foreign_bin_head);
+    run("R62_compact_target_met", test_compact_target_met_report);
 
     printf("\n%u checks, %u failures\n", (unsigned)g_checks, (unsigned)g_fails);
     return g_fails == 0 ? 0 : 1;

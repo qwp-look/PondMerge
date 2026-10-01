@@ -294,7 +294,18 @@ Status compact(PoolId pool);
 // The packing-impossible cases that make full compact refuse (an object that
 // cannot fit below the next pinned barrier) simply END a partial plan instead.
 struct CompactionRequest; // defined in the advice section below
-Status compact(PoolId pool, CompactionRequest const* req);
+// The three-argument form adds an OPTIONAL target report: when
+// `target_met` is non-null it is written on EVERY return. true means the plan
+// stopped at a prefix after which an allocation of requested_size/alignment
+// would succeed -- including "the target was already satisfiable with zero
+// moves", and including req == nullptr / requested_size == 0 (no target: a
+// full compaction cannot miss one). false means the plan ended some other way
+// -- the budget was spent first, a pinned barrier ended the plan, or the pool
+// packed out without the target check ever firing. false is NOT a failure:
+// the compaction still succeeded and moved what it moved; it only means the
+// target is not confirmed, so re-run analyze_compaction or simply attempt the
+// allocation. Failure returns (Busy/CorruptMetadata/...) always write false.
+Status compact(PoolId pool, CompactionRequest const* req, bool* target_met = nullptr);
 Status merge(PoolId source, PoolId target);
 // Splits `source` after `new_pool_segments` segments; the new pool owns the
 // upper range. Crossing movable objects are relocated; crossing pinned objects
